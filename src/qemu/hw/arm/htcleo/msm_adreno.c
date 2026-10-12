@@ -400,6 +400,9 @@ static void adreno_reg_write(MsmAdrenoState *s, uint32_t reg, uint32_t val)
         return;
     }
     r[reg] = val;
+    if (reg >= A2_SQ_CONSTANT_0 && reg < A2_SQ_CONSTANT_0 + 512 * 4) {
+        s->const_dirty = true;
+    }
     /* scratch registers: SCRATCH_UMSK selects the ones mirrored in memory */
     if (reg >= A2_SCRATCH_REG0 && reg < A2_SCRATCH_REG0 + 8) {
         unsigned n = reg - A2_SCRATCH_REG0;
@@ -887,6 +890,8 @@ static void cp_run_ring(MsmAdrenoState *s)
     if (r[A2_CP_ME_CNTL] & (1u << 28)) {
         return;     /* micro engine halted */
     }
+    /* the CPU may have written what the commands use */
+    s->mem_epoch++;
     rb.base = r[A2_CP_RB_BASE];
     rb.size = size;
     rb.pos = r[A2_CP_RB_RPTR] % size;
@@ -1066,6 +1071,10 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     s->gmem = g_malloc0(ADRENO_GMEM_SIZE);
     s->pkt = g_new(uint32_t, 0x4000 + 1);
 
+    s->const_dirty = true;
+    if (!s->backend) {
+        s->backend = g_strdup("gl");
+    }
     /* worker 0 is the vCPU thread itself; the rest are rasterizer threads */
     s->nthreads = MAX(1, MIN(s->nthreads, ADRENO_MAX_THREADS));
     s->workers = g_new0(AdrenoWorker, s->nthreads);
@@ -1099,6 +1108,8 @@ static void adreno_unrealize(DeviceState *dev)
 static const Property adreno_props[] = {
     /* rasterizer threads, the vCPU's included */
     DEFINE_PROP_UINT32("threads", MsmAdrenoState, nthreads, 6),
+    /* "gl": the host GPU (OpenGL 4.5 with interlock), "soft": the CPU */
+    DEFINE_PROP_STRING("backend", MsmAdrenoState, backend),
 };
 
 static void adreno_class_init(ObjectClass *klass, const void *data)

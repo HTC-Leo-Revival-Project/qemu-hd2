@@ -30,7 +30,7 @@
  */
 #include "qemu/osdep.h"
 #include <math.h>
-#include "msm_adreno.h"
+#include "msm_adreno_gl.h"
 
 #define SUBPIX      16
 #define MAX_CLIPPED 12
@@ -39,11 +39,7 @@
 /* Colour formats                                                      */
 /* ------------------------------------------------------------------ */
 
-typedef struct ColorFmt {
-    uint8_t bpp;        /* bytes per pixel */
-    uint8_t bits[4];    /* channel widths from bit 0 */
-    uint8_t kind;       /* 0 unorm, 1 snorm, 2 float16, 3 float32 */
-} ColorFmt;
+typedef AdrenoColorFmt ColorFmt;
 
 static const ColorFmt color_fmts[16] = {
     [0]  = { 2, { 4, 4, 4, 4 }, 0 },     /* COLORX_4_4_4_4 */
@@ -63,6 +59,11 @@ static const ColorFmt color_fmts[16] = {
     [14] = { 3, { 8, 8, 8, 0 }, 0 },     /* COLORX_8_8_8 */
     [15] = { 4, { 8, 8, 8, 8 }, 0 },
 };
+
+const AdrenoColorFmt *adreno_color_fmt(unsigned fmt)
+{
+    return &color_fmts[fmt & 15];
+}
 
 uint16_t adreno_float_to_half(float f)
 {
@@ -355,6 +356,11 @@ typedef struct DrawCtx {
     uint32_t nprims, cap;
     int64_t area;                   /* sum of bounding boxes */
     uint32_t nthreads;
+    bool persp;
+    /* host GPU backend: screen-space triangles instead of prims */
+    bool gl;
+    float *glv;
+    uint32_t glv_n, glv_cap;
 } DrawCtx;
 
 static Prim *new_prim(DrawCtx *d)
@@ -466,6 +472,40 @@ static void to_screen(DrawCtx *d, const AdrenoVertex *v, SVert *o)
 /* Primitive setup                                                     */
 /* ------------------------------------------------------------------ */
 
+/* a triangle for the host GPU (see AdrenoGlDraw) */
+static void gl_emit(DrawCtx *d, const SVert *const v[3], const int64_t x[3],
+                    const int64_t y[3], const SVert *prov, bool backface)
+{
+    int nf = ADRENO_GL_VTX_VEC4(d->ninterp) * 4;
+
+    if (d->glv_n + 3 > d->glv_cap) {
+        d->glv_cap = MAX(d->glv_cap * 2, 96);
+        d->glv = g_renew(float, d->glv, (size_t)d->glv_cap * nf);
+    }
+    for (int i = 0; i < 3; i++) {
+        float *o = d->glv + (size_t)d->glv_n++ * nf;
+        float rhw = d->persp ? v[i]->rhw : 1.0f;
+
+        o[0] = x[i] / (float)SUBPIX;
+        o[1] = y[i] / (float)SUBPIX;
+        o[2] = v[i]->z;
+        o[3] = rhw;
+        o[4] = v[i]->pc[0];
+        o[5] = v[i]->pc[1];
+        o[6] = backface;
+        o[7] = 0.0f;
+        for (int n = 0; n < d->ninterp; n++) {
+            if (d->flat_mask & (1u << n)) {
+                memcpy(o + 8 + 4 * n, prov->v->interp[n], 16);
+            } else {
+                for (int k = 0; k < 4; k++) {
+                    o[8 + 4 * n + k] = v[i]->v->interp[n][k] * rhw;
+                }
+            }
+        }
+    }
+}
+
 static void setup_triangle(DrawCtx *d, const SVert *a, const SVert *b,
                            const SVert *c, const SVert *prov, bool cull)
 {
@@ -474,6 +514,7 @@ static void setup_triangle(DrawCtx *d, const SVert *a, const SVert *b,
     int64_t x[3], y[3];
     int64_t area;
     int64_t cofs = llrintf(d->pix_center * SUBPIX);
+    int minx, maxx, miny, maxy;
     bool cw, backface;
     Prim *p;
 
@@ -508,20 +549,27 @@ static void setup_triangle(DrawCtx *d, const SVert *a, const SVert *b,
         area = -area;
     }
 
-    p = new_prim(d);
-    p->backface = backface;
-    p->minx = MAX(d->clip_x0,
-                  (int)((MIN(MIN(x[0], x[1]), x[2]) - cofs) / SUBPIX) - 1);
-    p->maxx = MIN(d->clip_x1 - 1,
-                  (int)((MAX(MAX(x[0], x[1]), x[2]) - cofs) / SUBPIX) + 1);
-    p->miny = MAX(d->clip_y0,
-                  (int)((MIN(MIN(y[0], y[1]), y[2]) - cofs) / SUBPIX) - 1);
-    p->maxy = MIN(d->clip_y1 - 1,
-                  (int)((MAX(MAX(y[0], y[1]), y[2]) - cofs) / SUBPIX) + 1);
-    if (p->minx > p->maxx || p->miny > p->maxy) {
-        d->nprims--;
+    minx = MAX(d->clip_x0,
+               (int)((MIN(MIN(x[0], x[1]), x[2]) - cofs) / SUBPIX) - 1);
+    maxx = MIN(d->clip_x1 - 1,
+               (int)((MAX(MAX(x[0], x[1]), x[2]) - cofs) / SUBPIX) + 1);
+    miny = MAX(d->clip_y0,
+               (int)((MIN(MIN(y[0], y[1]), y[2]) - cofs) / SUBPIX) - 1);
+    maxy = MIN(d->clip_y1 - 1,
+               (int)((MAX(MAX(y[0], y[1]), y[2]) - cofs) / SUBPIX) + 1);
+    if (minx > maxx || miny > maxy) {
         return;
     }
+    if (d->gl) {
+        gl_emit(d, v, x, y, prov, backface);
+        return;
+    }
+    p = new_prim(d);
+    p->backface = backface;
+    p->minx = minx;
+    p->maxx = maxx;
+    p->miny = miny;
+    p->maxy = maxy;
     d->area += (int64_t)(p->maxx - p->minx + 1) * (p->maxy - p->miny + 1);
     p->inv_area = 1.0f / (float)area;
     for (int i = 0; i < 3; i++) {
@@ -794,8 +842,7 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
     uint32_t dc = r[A2_RB_DEPTHCONTROL];
     bool stencil_en = dc & 1, z_en = dc & 2, z_write = dc & 4;
     uint8_t buf[4];
-    uint32_t raw, stored_z, sten;
-    float dz;
+    uint32_t raw, stored_z, sten, zq;
     bool pass = true, zpass = true;
     bool bf = backface && (dc & (1 << 7));
     uint32_t refmask = r[bf ? A2_RB_STENCILREFMASK_BF : A2_RB_STENCILREFMASK];
@@ -813,12 +860,10 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
         raw = ldl_le_p(buf);
         stored_z = raw >> 8;
         sten = raw & 0xff;
-        dz = stored_z / 16777215.0f;
     } else {
         raw = lduw_le_p(buf);
         stored_z = raw;
         sten = 0;
-        dz = stored_z / 65535.0f;
     }
     if (bf) {
         sfunc = (dc >> 20) & 7;
@@ -834,8 +879,11 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
     if (stencil_en) {
         pass = compare(sfunc, ref & mask, sten & mask);
     }
+    zq = d->depth_24 ? (uint32_t)lrintf(clamp01(z) * 16777215.0f)
+                     : (uint32_t)lrintf(clamp01(z) * 65535.0f);
     if (pass && z_en) {
-        zpass = compare((dc >> 4) & 7, clamp01(z), dz);
+        /* in the buffer's fixed point */
+        zpass = compare((dc >> 4) & 7, zq, stored_z);
     }
     if (stencil_en && d->depth_24) {
         uint32_t ns;
@@ -850,8 +898,7 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
         sten = (sten & ~wmask) | (ns & wmask);
     }
     if (pass && zpass && z_en && z_write) {
-        stored_z = d->depth_24 ? (uint32_t)lrintf(clamp01(z) * 16777215.0f)
-                               : (uint32_t)lrintf(clamp01(z) * 65535.0f);
+        stored_z = zq;
     }
     if (stencil_en || (z_en && z_write)) {
         if (d->depth_24) {
@@ -948,7 +995,7 @@ static void shade_block(DrawCtx *d, AdrenoWorker *w, const Prim *p,
     AdrenoLanes *L = &w->lanes;
     const uint32_t *r = d->r;
     uint32_t cc = r[A2_RB_COLORCONTROL];
-    bool persp = !(r[A2_PA_SU_SC_MODE_CNTL] & (1 << 20));
+    bool persp = d->persp;
     float z[AL];
     uint32_t exec = 0;
 
@@ -1000,12 +1047,12 @@ static void shade_block(DrawCtx *d, AdrenoWorker *w, const Prim *p,
 
             L->r[d->param_gen_reg][0][l] = p->backface ? -fx : fx;
             L->r[d->param_gen_reg][1][l] = (by + lane_y[l] - d->win_y) + 0.5f;
-            L->r[d->param_gen_reg][2][l] = pw[0] * p->pc[0][0] +
-                                           pw[1] * p->pc[1][0] +
-                                           pw[2] * p->pc[2][0];
-            L->r[d->param_gen_reg][3][l] = pw[0] * p->pc[0][1] +
-                                           pw[1] * p->pc[1][1] +
-                                           pw[2] * p->pc[2][1];
+            L->r[d->param_gen_reg][2][l] = b0 * p->pc[0][0] +
+                                           b1 * p->pc[1][0] +
+                                           b2 * p->pc[2][0];
+            L->r[d->param_gen_reg][3][l] = b0 * p->pc[0][1] +
+                                           b1 * p->pc[1][1] +
+                                           b2 * p->pc[2][1];
         }
     }
     if (!cover) {
@@ -1470,6 +1517,7 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     /* PARAM_SHADE: 1 = interpolated (Gouraud), 0 = flat */
     d->flat_mask = ~r[A2_SQ_INTERPOLATOR_CNTL] & 0xffff;
     d->provoking_last = r[A2_PA_SU_SC_MODE_CNTL] & (1 << 19);
+    d->persp = !(r[A2_PA_SU_SC_MODE_CNTL] & (1 << 20));
     d->pix_center = (r[A2_PA_SU_VTX_CNTL] & 1) ? 0.5f : 0.0f;
     d->win_x = sextract32(r[A2_PA_SC_WINDOW_OFFSET], 0, 15);
     d->win_y = sextract32(r[A2_PA_SC_WINDOW_OFFSET], 16, 15);
@@ -1546,7 +1594,13 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         for (uint32_t i = 0; i < n; i++) {
             rv[i] = verts[slot[i]];
         }
+        /* GMEM to memory: the CPU's copy, and back when cleared */
+        adreno_gl_gmem_to_cpu(s);
         resolve(d, rv, n);
+        if (r[A2_RB_COPY_CONTROL] & 0xf8) {
+            adreno_gl_gmem_from_cpu(s);
+        }
+        s->mem_epoch++;
         return;
     }
 
@@ -1557,6 +1611,15 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         /* depth/stencil before shading when nothing can drop the pixel */
         d->early_z = (dc & 3) && !d->ps->kills && !d->ps->exports_depth &&
                      !(r[A2_RB_COLORCONTROL] & (3 << 3));
+        /*
+         * The host GPU renders to GMEM; render targets in memory (the
+         * blob's texture copies) are drawn here.
+         */
+        d->gl = (!d->color_write || d->color.host) &&
+                (!(dc & 3) || d->depth.host) && adreno_gl_available(s);
+        if (!d->gl) {
+            adreno_gl_gmem_to_cpu(s);
+        }
     }
 
 #define V(i) (&verts[slot[(i)]])
@@ -1617,7 +1680,38 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         break;
     }
 #undef V
-    raster_run(d);
+    if (d->gl) {
+        AdrenoGlDraw g = {
+            .ps = d->ps,
+            .ninterp = d->ninterp,
+            .flat_mask = d->flat_mask,
+            .param_gen = d->param_gen,
+            .param_gen_reg = d->param_gen_reg,
+            .win_x = d->win_x,
+            .win_y = d->win_y,
+            .pix_ofs = 0.5f - d->pix_center,
+            .clip_x0 = d->clip_x0, .clip_y0 = d->clip_y0,
+            .clip_x1 = d->clip_x1, .clip_y1 = d->clip_y1,
+            .color_off = d->color.offset,
+            .depth_off = d->depth.offset,
+            .pitch = d->color.pitch,
+            .sx = d->color.sx, .sy = d->color.sy,
+            .color_fmt = d->color_fmt,
+            .color_swap = d->color_swap,
+            .color_write = d->color_write,
+            .depth_24 = d->depth_24,
+            .verts = d->glv,
+            .nverts = d->glv_n,
+        };
+
+        adreno_gl_draw(s, &g);
+        g_free(d->glv);
+    } else {
+        raster_run(d);
+        /* the CPU drew into GMEM or memory */
+        adreno_gl_gmem_from_cpu(s);
+        s->mem_epoch++;
+    }
     g_free(d->prims);
     (void)index_size;
 }

@@ -22,7 +22,7 @@
  */
 #include "qemu/osdep.h"
 #include <math.h>
-#include "msm_adreno.h"
+#include "msm_adreno_gl.h"
 
 enum { FMT_ETC1_RGBA_INTERP = 46, FMT_ETC1_RGB = 47, FMT_ETC1_RGBA = 48 };
 
@@ -421,8 +421,9 @@ static float srgb_to_linear(float c)
 }
 
 /* texel (x, y) of a level, wrapped/clamped already; raw XYZW */
-static void tex_texel(AdrenoLanes *L, const TexDesc *t, const TexLevel *lv,
-                      int x, int y, uint32_t face, float out[4])
+static void tex_texel(MsmAdrenoState *s, AdrenoTlb *tlb, const TexDesc *t,
+                      const TexLevel *lv, int x, int y, uint32_t face,
+                      float out[4])
 {
     uint32_t bw = t->tf.bw;
     uint32_t bx = x / bw + lv->ox, by = y / bw + lv->oy;
@@ -435,9 +436,9 @@ static void tex_texel(AdrenoLanes *L, const TexDesc *t, const TexLevel *lv,
                                          t->bpb_log2)
                    : (by * lv->pitch + bx) << t->bpb_log2;
     addr = lv->base + face * t->face_size + off;
-    p = adreno_host_ptr(L->s, L->tlb, addr);
+    p = adreno_host_ptr(s, tlb, addr);
     if (!p || ((addr & 0xfff) + t->tf.bpb > 0x1000)) {
-        adreno_tlb_read(L->s, L->tlb, addr, blk, t->tf.bpb);
+        adreno_tlb_read(s, tlb, addr, blk, t->tf.bpb);
         p = blk;
     }
     if (t->tf.kind == 3) {
@@ -599,7 +600,8 @@ static const uint8_t *cached_texel(AdrenoLanes *L, const TexDesc *t,
                 float c[4];
                 uint8_t *o = &tile->rgba[(j * 32 + i) * 4];
 
-                tex_texel(L, t, lv, (tx << 5) + i, (ty << 5) + j, face, c);
+                tex_texel(L->s, L->tlb, t, lv, (tx << 5) + i, (ty << 5) + j,
+                          face, c);
                 for (int k = 0; k < 4; k++) {
                     o[k] = (uint8_t)lrintf(c[k] * 255.0f);
                 }
@@ -627,7 +629,7 @@ static inline void fetch_texel(AdrenoLanes *L, const TexDesc *t,
         out[2] = u8f[c[2]];
         out[3] = u8f[c[3]];
     } else {
-        tex_texel(L, t, lv, x, y, face, out);
+        tex_texel(L->s, L->tlb, t, lv, x, y, face, out);
     }
 }
 
@@ -846,6 +848,165 @@ void adreno_sample(AdrenoLanes *L, const AdrenoTexArgs *a,
             unsigned sel = (t.swz >> (3 * k)) & 7;
 
             out[k][l] = sel < 4 ? raw[sel] : (sel == 5 ? 1.0f : 0.0f);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Textures for the host GPU backend                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The host GPU samples a copy of the texture, decoded to RGBA8 (formats
+ * whose texels fit it exactly) or RGBA32F, with the fetch constant's
+ * swizzle and exponent left to the shader.  The copy is redone when the
+ * memory under the texture hashes differently.
+ */
+bool adreno_tex_image(MsmAdrenoState *s, unsigned idx, AdrenoTexImage *im)
+{
+    TexDesc t;
+    const uint32_t *fc;
+    unsigned maxbits = 0;
+
+    memset(im, 0, sizeof(*im));
+    if (!tex_desc(s, idx, &t)) {
+        return false;
+    }
+    fc = t.fc;
+    for (int k = 0; k < 4; k++) {
+        maxbits = MAX(maxbits, t.tf.bits[k]);
+    }
+    im->w = t.w0;
+    im->h = t.h0;
+    im->levels = t.nlevels;
+    im->layers = t.dim == 3 ? 6 : 1;
+    im->is_float = !(t.tf.kind == 3 || (t.fast && maxbits <= 8));
+    im->clamp[0] = t.clamp[0];
+    im->clamp[1] = t.clamp[1];
+    im->mag = (fc[3] >> 19) & 3;
+    im->min = (fc[3] >> 21) & 3;
+    im->mip = (fc[3] >> 23) & 3;
+    im->min_level = MIN((int)((fc[4] >> 2) & 0xf), t.nlevels - 1);
+    im->max_level = t.nlevels - 1;
+    im->lod_bias = (((int32_t)(fc[4] << 10)) >> 22) / 32.0f;
+    memcpy(im->border, t.border, sizeof(im->border));
+    for (int k = 0; k < 4; k++) {
+        im->swz[k] = (t.swz >> (3 * k)) & 7;
+    }
+    im->exp_adj = t.exp_adj;
+    return true;
+}
+
+static inline float clamp_unit(float f)
+{
+    return f > 1.0f ? 1.0f : (f >= 0.0f ? f : 0.0f);
+}
+
+/* a fast 64-bit hash of host memory, four lanes at a time */
+static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
+{
+    const uint64_t k1 = 0x9e3779b97f4a7c15ull, k2 = 0xc2b2ae3d27d4eb4full;
+    uint64_t a = h, b = h ^ k1, c = h ^ k2, d = h + k1;
+
+    while (n >= 32) {
+        a = rol64((a ^ ldq_le_p(p)) * k1, 31);
+        b = rol64((b ^ ldq_le_p(p + 8)) * k1, 31);
+        c = rol64((c ^ ldq_le_p(p + 16)) * k1, 31);
+        d = rol64((d ^ ldq_le_p(p + 24)) * k1, 31);
+        p += 32;
+        n -= 32;
+    }
+    while (n--) {
+        a = (a ^ *p++) * k2;
+    }
+    h = rol64(a, 1) + rol64(b, 7) + rol64(c, 12) + rol64(d, 18);
+    return (h ^ (h >> 29)) * k2;
+}
+
+static uint64_t hash_range(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t va,
+                           uint32_t len, uint64_t h)
+{
+    uint8_t buf[0x1000];
+
+    while (len) {
+        uint32_t chunk = MIN(len, 0x1000 - (va & 0xfff));
+        const uint8_t *p = adreno_host_ptr(s, tlb, va);
+
+        if (!p) {
+            adreno_tlb_read(s, tlb, va, buf, chunk);
+            p = buf;
+        }
+        h = hash_bytes(p, chunk, h);
+        va += chunk;
+        len -= chunk;
+    }
+    return h;
+}
+
+uint64_t adreno_tex_hash(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx)
+{
+    TexDesc t;
+    uint64_t h = 0x243f6a8885a308d3ull;
+    int layers;
+
+    if (!tex_desc(s, idx, &t)) {
+        return 0;
+    }
+    layers = t.dim == 3 ? 6 : 1;
+    for (int layer = 0; layer < layers; layer++) {
+        for (int level = 0; level < t.nlevels; level++) {
+            TexLevel lv;
+            uint32_t rows, bytes;
+
+            /* the levels of a packed mip tail share its tile */
+            if (level > t.packed_level) {
+                break;
+            }
+            tex_level(&t, level, &lv);
+            rows = DIV_ROUND_UP(lv.h, t.tf.bw) + lv.oy;
+            if (t.tiled) {
+                bytes = (ROUND_UP(lv.pitch, 32) * ROUND_UP(rows, 32)) <<
+                        t.bpb_log2;
+            } else {
+                bytes = (lv.pitch * rows) << t.bpb_log2;
+            }
+            h = hash_range(s, tlb, lv.base + layer * t.face_size,
+                           MIN(bytes, 64u << 20), h);
+        }
+    }
+    return h;
+}
+
+void adreno_tex_decode(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx,
+                       int level, int layer, void *out)
+{
+    TexDesc t;
+    TexLevel lv;
+    bool fl;
+    unsigned maxbits = 0;
+
+    if (!tex_desc(s, idx, &t)) {
+        return;
+    }
+    for (int k = 0; k < 4; k++) {
+        maxbits = MAX(maxbits, t.tf.bits[k]);
+    }
+    fl = !(t.tf.kind == 3 || (t.fast && maxbits <= 8));
+    tex_level(&t, level, &lv);
+    for (uint32_t y = 0; y < lv.h; y++) {
+        for (uint32_t x = 0; x < lv.w; x++) {
+            float c[4];
+
+            tex_texel(s, tlb, &t, &lv, x, y, layer, c);
+            if (fl) {
+                memcpy((float *)out + (y * lv.w + x) * 4, c, sizeof(c));
+            } else {
+                uint8_t *o = (uint8_t *)out + (y * lv.w + x) * 4;
+
+                for (int k = 0; k < 4; k++) {
+                    o[k] = (uint8_t)lrintf(clamp_unit(c[k]) * 255.0f);
+                }
+            }
         }
     }
 }

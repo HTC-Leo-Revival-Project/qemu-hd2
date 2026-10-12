@@ -270,6 +270,8 @@ typedef struct AdrenoWorker {
     uint64_t pixels;
 } AdrenoWorker;
 
+typedef struct AdrenoGl AdrenoGl;
+
 struct MsmAdrenoState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -305,6 +307,14 @@ struct MsmAdrenoState {
     /* draw statistics */
     uint64_t draws, pixels;
     uint32_t texgen;            /* texture cache generation, per draw */
+
+    /* host GPU backend (msm_adreno_gl.c) */
+    char *backend;              /* "gl" or "soft" */
+    AdrenoGl *gl;
+    bool gl_failed;
+    bool const_dirty;           /* ALU constants changed since uploaded */
+    uint32_t mem_epoch;         /* memory may have changed: new commands,
+                                   or the GPU wrote it */
 
     char *trace_path;
     FILE *trace;
@@ -343,6 +353,13 @@ static inline uint32_t adreno_u(float f)
 }
 
 /* msm_adreno_draw.c */
+typedef struct AdrenoColorFmt {
+    uint8_t bpp;        /* bytes per pixel */
+    uint8_t bits[4];    /* channel widths from bit 0 */
+    uint8_t kind;       /* 0 unorm, 1 snorm, 2 float16, 3 float32 */
+} AdrenoColorFmt;
+
+const AdrenoColorFmt *adreno_color_fmt(unsigned fmt);
 void adreno_draw(MsmAdrenoState *s, uint32_t initiator, uint32_t num_indices,
                  uint32_t index_base, uint32_t index_size,
                  const uint32_t *immediate, uint32_t immediate_dwords);
@@ -355,6 +372,7 @@ uint16_t adreno_float_to_half(float f);
 /* msm_adreno_sq.c */
 struct AdrenoProgram {
     int type;
+    uint64_t hash;          /* of the microcode, the program cache's key */
     uint32_t ncf;
     struct SqCf *cf;
     struct SqInsn *insn;
