@@ -110,6 +110,34 @@ arm_common_ss.add(when: 'CONFIG_SX1', if_true: files('omap_sx1.c'))
 arm_common_ss.add(when: 'CONFIG_VERSATILE', if_true: files('versatilepb.c'))
 arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
 
+arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
+  'htcleo/htcleo.c',
+  'htcleo/msm_vic.c',
+  'htcleo/msm_csr.c',
+  'htcleo/msm_gpio.c',
+  'htcleo/msm_uart.c',
+  'htcleo/msm_regfile.c',
+  'htcleo/msm_nand.c',
+  'htcleo/msm_adm.c',
+  'htcleo/msm_mdp.c',
+  'htcleo/msm_mdp_ppp.c',
+  'htcleo/msm_modem.c',
+  'htcleo/msm_rpc.c',
+  'htcleo/msm_i2c.c',
+  'htcleo/htcleo_i2cdev.c',
+  'htcleo/msm_qdsp6.c',
+  'htcleo/msm_sdcc.c',
+  'htcleo/msm_hsusb.c',
+  'htcleo/bcm4329.c',
+  'htcleo/msm_atmodem.c',
+  'htcleo/msm_gps.c',
+  'htcleo/msm_uartdm.c',
+  'htcleo/bcm4329_bt.c',
+  'htcleo/bcm4329_fm.c',
+  'htcleo/msm_modem_lle.c',
+  'htcleo/msm_mtmr.c',
+))
+
 arm_common_ss.add(files('boot.c'))
 
 hw_common_arch += {'arm': arm_common_ss}

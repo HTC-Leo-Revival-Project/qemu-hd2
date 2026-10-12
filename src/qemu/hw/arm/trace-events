@@ -96,3 +96,13 @@ z2_aer915_event(int8_t event, int8_t len) "i2c event =0x%x len=%d bytes"
 
 # bcm2838.c
 bcm2838_gic_set_irq(int irq, int level) "gic irq:%d lvl:%d"
+
+# htcleo/msm_sdcc.c
+msm_sdcc_write(uint64_t off, uint64_t val) "reg 0x%02" PRIx64 " = 0x%" PRIx64
+msm_sdcc_command(uint32_t cmd, uint32_t arg, size_t rlen) "CMD%u arg 0x%08x resp %zu bytes"
+msm_sdcc_status(uint32_t status, uint32_t remain) "status 0x%08x remain %u"
+
+# htcleo/msm_adm.c
+msm_adm_execute(int dom, int chn, uint32_t cmdptr) "domain %d channel %d cmd_ptr 0x%08x"
+msm_adm_resume(int dom, int chn, uint64_t desc) "domain %d channel %d resumes at desc 0x%08" PRIx64
+msm_adm_desc(uint64_t a, uint32_t cmd, uint32_t src, uint32_t dst, uint32_t len) "desc @0x%08" PRIx64 " cmd 0x%08x src 0x%08x dst 0x%08x len 0x%08x"

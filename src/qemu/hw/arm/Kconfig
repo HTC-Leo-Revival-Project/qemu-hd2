@@ -725,3 +725,11 @@ config ARMSSE
     select UNIMP
     select SSE_COUNTER
     select SSE_TIMER
+
+config HTCLEO
+    bool
+    default y
+    depends on TCG && ARM
+    select UNIMP
+    select SD
+    select I2C
