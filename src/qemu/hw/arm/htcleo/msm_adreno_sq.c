@@ -75,8 +75,7 @@ typedef struct SqState {
     uint32_t loop_const[4];
     int call_depth;
     uint32_t call_ret[4];
-    uint32_t vfetch_full[3];    /* last full vertex fetch (for mini fetch) */
-    uint32_t vfetch_addr;       /* its address in bytes */
+    uint32_t vfetch_addr;       /* vertex address in bytes */
 } SqState;
 
 static inline float flush_denorm(float f)
@@ -728,9 +727,13 @@ static void unpack_fixed(const uint32_t *dw, int nc, const uint8_t *bits,
 static void exec_vfetch(SqState *st, const uint32_t *w)
 {
     MsmAdrenoState *s = st->c->s;
-    bool mini = (w[1] >> 30) & 1;
-    const uint32_t *full = mini ? st->vfetch_full : w;
-    uint32_t cidx = ((full[0] >> 20) & 0x1f) * 3 + ((full[0] >> 25) & 3);
+    /*
+     * Xenos has "mini fetches" (dword 1 bit 30) that reuse the previous
+     * fetch's constant and address.  The Adreno 200 blob sets that bit on
+     * fetches that name their own constant, stride and index, and
+     * freedreno documents it as reserved: every fetch is a full one.
+     */
+    uint32_t cidx = ((w[0] >> 20) & 0x1f) * 3 + ((w[0] >> 25) & 3);
     uint32_t fc0 = s->regs[A2_SQ_FETCH_0 + cidx * 2];
     uint32_t fc1 = s->regs[A2_SQ_FETCH_0 + cidx * 2 + 1];
     uint32_t fmt = (w[1] >> 16) & 0x3f;
@@ -742,7 +745,7 @@ static void exec_vfetch(SqState *st, const uint32_t *w)
     float v[4] = {0, 0, 0, 1};
     int ndw;
 
-    if (!mini) {
+    {
         float *src = temp_reg(st, (w[0] >> 5) & 0x3f, (w[0] >> 11) & 1);
         float idx = src[(w[0] >> 30) & 3];
         uint32_t stride = w[2] & 0xff;
@@ -751,7 +754,6 @@ static void exec_vfetch(SqState *st, const uint32_t *w)
             idx += 0.5f;
         }
         /* unlike Xenos, a2xx strides and offsets are in bytes */
-        memcpy(st->vfetch_full, w, 12);
         st->vfetch_addr = (fc0 & ~3u) + stride * (uint32_t)(int)floorf(idx);
     }
 

@@ -251,6 +251,7 @@ struct MsmAdrenoState {
 
     char *trace_path;
     FILE *trace;
+    uint64_t trace_vtx_draws;   /* trace vertices up to this draw */
 };
 
 /* GPU virtual address space (MH MMU) */

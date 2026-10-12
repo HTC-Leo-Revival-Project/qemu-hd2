@@ -7,9 +7,10 @@
  * copied from GMEM to RB_COPY_DEST_* in memory and optionally cleared.
  *
  * Render targets live in GMEM when their base falls in RB_EDRAM_INFO's
- * range, else in memory (GPU addresses).  Surfaces are linear with
- * RB_SURFACE_INFO's pitch: GMEM is invisible to the CPU, so its layout
- * only has to agree with itself.
+ * range, else in memory (GPU addresses; tiled unless RB_COLOR_INFO.LINEAR,
+ * the blob renders into tiled textures that way).  GMEM surfaces are
+ * linear with RB_SURFACE_INFO's pitch: GMEM is invisible to the CPU, so
+ * its layout only has to agree with itself.
  *
  * Colour formats pack channels from bit 0 up (R, G, B, A); SWAP exchanges
  * R and B.  Texture formats likewise pack X, Y, Z, W from bit 0 and the
@@ -184,6 +185,24 @@ static void color_pack(unsigned fmt, const float c[4], uint8_t *p)
 /* Surfaces                                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Byte offset of block (x, y) in a tiled 2D surface: the Xenos layout
+ * Adreno 200 inherited (32x32 macro tiles, bank and pipe interleave), as in
+ * Xenia's texture_address.h.  pitch is in blocks, a multiple of 32.
+ */
+static uint32_t tiled_offset(int x, int y, uint32_t pitch, unsigned bpb_log2)
+{
+    uint32_t outer = (((y >> 5) * (pitch >> 5)) + (x >> 5)) << 6;
+    uint32_t inner = (((y >> 1) & 7) << 3) | (x & 7);
+    uint32_t oib = (outer | inner) << bpb_log2;
+    uint32_t bank = (y >> 4) & 1;
+    uint32_t pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1);
+
+    return ((y & 1) << 4) | (pipe << 6) | (bank << 11) | (oib & 0xf) |
+           (((oib >> 4) & 1) << 5) | (((oib >> 5) & 7) << 8) |
+           ((oib >> 8) << 12);
+}
+
 typedef struct Surface {
     uint8_t *host;      /* GMEM, or NULL for memory */
     uint32_t gpuaddr;   /* memory surfaces */
@@ -191,11 +210,20 @@ typedef struct Surface {
     uint32_t pitch;     /* pixels */
     uint32_t bpp;
     uint32_t limit;     /* bytes addressable from the base */
+    uint8_t sx, sy;     /* MSAA sample grid per pixel */
+    bool tiled;         /* memory surfaces: tiled unless LINEAR */
 } Surface;
 
+/*
+ * A surface with MSAA_SAMPLES 2X/4X is laid out as a 2x1/2x2 grid of
+ * samples per pixel, so pixel rows are 2x wider (the driver's fast clears
+ * draw to a 4X surface of a quarter the pitch to cover a bin quickly).
+ */
 static void surface_setup(MsmAdrenoState *s, Surface *sf, uint32_t base,
-                          uint32_t pitch, uint32_t bpp)
+                          uint32_t pitch, uint32_t bpp, bool linear)
 {
+    unsigned msaa = (s->regs[A2_RB_SURFACE_INFO] >> 14) & 3;
+
     uint32_t info = s->regs[A2_RB_EDRAM_INFO];
     uint32_t ebase = info & 0xffffc000;
     uint32_t esize = (16 * 1024) << (info & 0xf);
@@ -203,27 +231,34 @@ static void surface_setup(MsmAdrenoState *s, Surface *sf, uint32_t base,
     esize = MIN(esize, ADRENO_GMEM_SIZE);
     sf->pitch = pitch;
     sf->bpp = bpp;
+    sf->sx = msaa ? 2 : 1;
+    sf->sy = msaa >= 2 ? 2 : 1;
+    sf->tiled = false;
     if (base - ebase < esize) {
         sf->host = s->gmem;
         sf->offset = base - ebase;
         sf->limit = ADRENO_GMEM_SIZE - sf->offset;
     } else {
+        /* rendering straight to memory, e.g. to a (tiled) texture */
         sf->host = NULL;
         sf->gpuaddr = base;
         sf->offset = 0;
         sf->limit = UINT32_MAX;
+        sf->tiled = !linear && is_power_of_2(bpp);
     }
 }
 
-static bool surface_rw(MsmAdrenoState *s, Surface *sf, int x, int y,
-                       uint8_t *buf, bool write)
+static bool surface_rw1(MsmAdrenoState *s, Surface *sf, int x, int y,
+                        uint8_t *buf, bool write)
 {
     uint64_t off;
 
-    if (x < 0 || y < 0) {
-        return false;
+    if (sf->tiled) {
+        off = tiled_offset(x, y, ROUND_UP(sf->pitch * sf->sx, 32),
+                           ctz32(sf->bpp));
+    } else {
+        off = ((uint64_t)y * sf->pitch * sf->sx + x) * sf->bpp;
     }
-    off = ((uint64_t)y * sf->pitch + x) * sf->bpp;
     if (off + sf->bpp > sf->limit) {
         return false;
     }
@@ -245,9 +280,31 @@ static bool surface_rw(MsmAdrenoState *s, Surface *sf, int x, int y,
     return true;
 }
 
+/* read sample 0, or write every sample of the pixel */
+static bool surface_rw(MsmAdrenoState *s, Surface *sf, int x, int y,
+                       uint8_t *buf, bool write)
+{
+    if (x < 0 || y < 0) {
+        return false;
+    }
+    if (!write || (sf->sx == 1 && sf->sy == 1)) {
+        return surface_rw1(s, sf, x * sf->sx, y * sf->sy, buf, write);
+    }
+    for (int j = 0; j < sf->sy; j++) {
+        for (int i = 0; i < sf->sx; i++) {
+            if (!surface_rw1(s, sf, x * sf->sx + i, y * sf->sy + j, buf,
+                             true)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Textures                                                            */
 /* ------------------------------------------------------------------ */
+
 
 typedef struct TexFmt {
     uint8_t bpp;
@@ -353,14 +410,18 @@ static void tex_texel(MsmAdrenoState *s, const uint32_t *fc, int x, int y,
     TexFmt tf;
     uint8_t px[8] = {0};
 
+    bool tiled = fc[0] >> 31;
+
     if (!pitch) {
         pitch = width;
     }
     if (fmt == 47 || fmt == 46 || fmt == 48) {     /* ETC1 */
         uint32_t bw = (pitch + 3) / 4;
         uint8_t blk[8];
+        uint32_t off = tiled ? tiled_offset(x / 4, y / 4, ROUND_UP(bw, 32), 3)
+                             : ((y / 4) * bw + x / 4) * 8;
 
-        adreno_read(s, base + ((y / 4) * bw + x / 4) * 8, blk, 8);
+        adreno_read(s, base + off, blk, 8);
         etc1_texel(blk, x & 3, y & 3, out);
         return;
     }
@@ -368,7 +429,12 @@ static void tex_texel(MsmAdrenoState *s, const uint32_t *fc, int x, int y,
         out[0] = out[1] = out[2] = out[3] = 0;
         return;
     }
-    adreno_read(s, base + (y * pitch + x) * tf.bpp, px, tf.bpp);
+    if (tiled && is_power_of_2(tf.bpp)) {
+        adreno_read(s, base + tiled_offset(x, y, ROUND_UP(pitch, 32),
+                                           ctz32(tf.bpp)), px, tf.bpp);
+    } else {
+        adreno_read(s, base + (y * pitch + x) * tf.bpp, px, tf.bpp);
+    }
     {
         uint64_t v = ldq_le_p(px);
         bool sign = (fc[0] >> 2) & 3;   /* sign of X; all alike in practice */
@@ -1028,6 +1094,12 @@ static void draw_triangle(DrawCtx *d, const AdrenoVertex *a,
     }
     for (int i = 0; i < n; i++) {
         to_screen(d, &buf[cur][i], &sv[i]);
+        if (d->s->trace && d->s->draws < d->s->trace_vtx_draws) {
+            adreno_trace(d->s, "    vtx %.2f,%.2f,%.3f rhw %.3f  i0 %.3f %.3f "
+                         "%.3f %.3f\n", sv[i].x, sv[i].y, sv[i].z, sv[i].rhw,
+                         buf[cur][i].interp[0][0], buf[cur][i].interp[0][1],
+                         buf[cur][i].interp[0][2], buf[cur][i].interp[0][3]);
+        }
     }
     for (int i = 1; i + 1 < n; i++) {
         raster_triangle(d, &sv[0], &sv[i], &sv[i + 1]);
@@ -1127,7 +1199,7 @@ static void resolve(DrawCtx *d, const AdrenoVertex **vs, int nv)
         return;
     }
     surface_setup(s, &src, ci & 0xfffff000,
-                  r[A2_RB_SURFACE_INFO] & 0x3fff, sf->bpp);
+                  r[A2_RB_SURFACE_INFO] & 0x3fff, sf->bpp, ci & (1 << 6));
     if (s->trace && src.host) {
         hwaddr pa = 0;
         uint32_t nz = 0;
@@ -1150,19 +1222,36 @@ static void resolve(DrawCtx *d, const AdrenoVertex **vs, int nv)
     if (!dpitch) {
         dpitch = src.pitch;
     }
-    if (!(dinfo & (1 << 3))) {
-        static bool warned;
-
-        if (!warned) {
-            warned = true;
-            adreno_trace(s, "resolve: tiled destination treated as linear\n");
-        }
-    }
     row = g_malloc((x1 - x0) * MAX(sf->bpp, df->bpp));
     for (int y = y0; y < y1; y++) {
         uint32_t daddr = dbase + ((y - ry0 + offy) * dpitch +
                                   (x0 - rx0 + offx)) * df->bpp;
+        bool tiled = !(dinfo & (1 << 3)) && is_power_of_2(df->bpp);
 
+        if (tiled) {
+            /* a tiled destination (a texture): pixel by pixel */
+            for (int x = x0; x < x1; x++) {
+                uint8_t px[16] = {0};
+                uint32_t dx = x - rx0 + offx, dy = y - ry0 + offy;
+                float c[4];
+
+                surface_rw(s, &src, x, y, px, false);
+                if (!raw) {
+                    color_unpack(sfmt, px, c);
+                    if (sswap != dswap && (sswap == 1 || dswap == 1)) {
+                        float t = c[0];
+
+                        c[0] = c[2];
+                        c[2] = t;
+                    }
+                    color_pack(dfmt, c, px);
+                }
+                adreno_write(s, dbase + tiled_offset(dx, dy, dpitch,
+                                                     ctz32(df->bpp)),
+                             px, df->bpp);
+            }
+            continue;
+        }
         if (raw && src.host) {
             uint64_t off = src.offset + ((uint64_t)y * src.pitch + x0) *
                            sf->bpp;
@@ -1214,9 +1303,7 @@ static void resolve(DrawCtx *d, const AdrenoVertex **vs, int nv)
             }
             color_pack(dfmt, c, row + (x - x0) * df->bpp);
         }
-        if (!(raw && src.host)) {
-            adreno_write(s, daddr, row, (x1 - x0) * df->bpp);
-        }
+        adreno_write(s, daddr, row, (x1 - x0) * df->bpp);
     }
 
     /* clear the source after the copy */
@@ -1247,7 +1334,7 @@ static void resolve(DrawCtx *d, const AdrenoVertex **vs, int nv)
         uint8_t px[4];
 
         surface_setup(s, &ds, di & 0xfffff000, src.pitch,
-                      (di & 1) ? 4 : 2);
+                      (di & 1) ? 4 : 2, true);
         stl_le_p(px, r[A2_RB_DEPTH_CLEAR]);
         for (int y = y0; y < y1; y++) {
             for (int x = x0; x < x1; x++) {
@@ -1323,7 +1410,8 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     d->s = s;
     d->prog_cntl = r[A2_SQ_PROGRAM_CNTL];
     d->ninterp = MIN(((d->prog_cntl >> 20) & 0xf) + 1, A2_MAX_INTERP);
-    d->flat_mask = r[A2_SQ_INTERPOLATOR_CNTL] & 0xffff;
+    /* PARAM_SHADE: 1 = interpolated (Gouraud), 0 = flat */
+    d->flat_mask = ~r[A2_SQ_INTERPOLATOR_CNTL] & 0xffff;
     d->provoking_last = r[A2_PA_SU_SC_MODE_CNTL] & (1 << 19);
     d->pix_center = (r[A2_PA_SU_VTX_CNTL] & 1) ? 0.5f : 0.0f;
     d->win_x = sextract32(r[A2_PA_SC_WINDOW_OFFSET], 0, 15);
@@ -1360,10 +1448,10 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         d->color_fmt = ci & 0xf;
         d->color_swap = (ci >> 9) & 3;
         surface_setup(s, &d->color, ci & 0xfffff000, pitch,
-                      color_fmts[d->color_fmt].bpp);
+                      color_fmts[d->color_fmt].bpp, ci & (1 << 6));
         d->depth_24 = di & 1;
         surface_setup(s, &d->depth, di & 0xfffff000, pitch,
-                      d->depth_24 ? 4 : 2);
+                      d->depth_24 ? 4 : 2, true);
         d->color_write = mode == A2_EDRAM_COLOR_DEPTH;
         d->depth_enabled = true;
         if (pitch) {

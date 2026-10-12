@@ -18,7 +18,8 @@
  * GMEM (256 KiB of on-chip render memory) sits at GPU address 0 as
  * RB_EDRAM_INFO says; the CPU never sees it, so its layout is our own.
  *
- * -global msm-adreno.trace=FILE logs every packet the CP executes.
+ * -global msm-adreno.trace=FILE logs every packet the CP executes and the
+ * draws (qom-set /machine/gpu trace FILE at run time, "" to stop).
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -899,6 +900,62 @@ static void adreno_reset(DeviceState *dev)
     adreno_update_irq(s);
 }
 
+/* "trace" can be changed at run time: qom-set /machine/gpu trace FILE */
+static char *adreno_get_trace(Object *obj, Error **errp)
+{
+    return g_strdup(MSM_ADRENO(obj)->trace_path ?: "");
+}
+
+static void adreno_set_trace(Object *obj, const char *value, Error **errp)
+{
+    MsmAdrenoState *s = MSM_ADRENO(obj);
+
+    if (s->trace) {
+        fclose(s->trace);
+        s->trace = NULL;
+    }
+    g_free(s->trace_path);
+    s->trace_path = g_strdup(value);
+    if (*value) {
+        /* the vertices of the next 2000 draws too */
+        s->trace_vtx_draws = s->draws + 2000;
+        s->trace = fopen(value, "w");
+        if (!s->trace) {
+            error_setg_errno(errp, errno, "msm-adreno: cannot open %s", value);
+        }
+    }
+}
+
+/* debugging: qom-set /machine/gpu dump "GPUADDR,SIZE,FILE" */
+static void adreno_set_dump(Object *obj, const char *value, Error **errp)
+{
+    MsmAdrenoState *s = MSM_ADRENO(obj);
+    g_auto(GStrv) f = g_strsplit(value, ",", 3);
+    g_autofree uint8_t *buf = NULL;
+    uint32_t va, size;
+
+    if (!f[0] || !f[1] || !f[2]) {
+        error_setg(errp, "msm-adreno: dump wants GPUADDR,SIZE,FILE");
+        return;
+    }
+    va = strtoul(f[0], NULL, 0);
+    size = MIN(strtoul(f[1], NULL, 0), 64 * 1024 * 1024);
+    buf = g_malloc(size);
+    if (va == 0xffffffff) {
+        memcpy(buf, s->gmem, MIN(size, ADRENO_GMEM_SIZE));
+    } else {
+        /* translate even while KGSL has the GPU (and its MMU) powered down */
+        uint32_t cfg = s->regs[A2_MH_MMU_CONFIG];
+
+        s->regs[A2_MH_MMU_CONFIG] |= 1;
+        adreno_read(s, va, buf, size);
+        s->regs[A2_MH_MMU_CONFIG] = cfg;
+    }
+    if (!g_file_set_contents(f[2], (char *)buf, size, NULL)) {
+        error_setg(errp, "msm-adreno: cannot write %s", f[2]);
+    }
+}
+
 static void adreno_realize(DeviceState *dev, Error **errp)
 {
     MsmAdrenoState *s = MSM_ADRENO(dev);
@@ -909,18 +966,7 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     s->gmem = g_malloc0(ADRENO_GMEM_SIZE);
     s->pkt = g_new(uint32_t, 0x4000 + 1);
-    if (s->trace_path && *s->trace_path) {
-        s->trace = fopen(s->trace_path, "w");
-        if (!s->trace) {
-            error_setg_errno(errp, errno, "msm-adreno: cannot open %s",
-                             s->trace_path);
-        }
-    }
 }
-
-static const Property adreno_props[] = {
-    DEFINE_PROP_STRING("trace", MsmAdrenoState, trace_path),
-};
 
 static void adreno_class_init(ObjectClass *klass, const void *data)
 {
@@ -928,7 +974,9 @@ static void adreno_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = adreno_realize;
     device_class_set_legacy_reset(dc, adreno_reset);
-    device_class_set_props(dc, adreno_props);
+    object_class_property_add_str(klass, "trace", adreno_get_trace,
+                                  adreno_set_trace);
+    object_class_property_add_str(klass, "dump", NULL, adreno_set_dump);
 }
 
 static const TypeInfo adreno_info = {
