@@ -14,6 +14,10 @@
  *   0x594 + 4n        writing 1 interrupts another processor ("m2a" out
  *                     n): n = 0..6 the apps core's INT_A9_M2A_n, 7 the
  *                     QDSP6 (AMSS's HAL out ids 72-79)
+ *   0x510..0x520      second-level interrupt controller 7 ("sub7" inputs
+ *                     0-14, output "sub7-irq" to modem VIC line 37):
+ *                     0x510 clear (write 1), 0x514 enable, 0x518 status
+ *                     (input level or latched edge); bit 3 is the UIM
  * Everything else is kept as plain registers and logged as unimplemented.
  *
  * This code is licensed under the GNU GPL v2 or later.
@@ -40,6 +44,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMtmrState, MSM_MTMR)
 #define R_DOG_KICK      0x10c
 #define R_IRQ_OUT       0x594
 #define IRQ_OUT_NUM     8
+#define R_SUB7_CLEAR    0x510
+#define R_SUB7_ENABLE   0x514
+#define R_SUB7_STATUS   0x518
+#define SUB7_INPUTS     15
 
 struct MsmMtmrState {
     SysBusDevice parent_obj;
@@ -47,6 +55,8 @@ struct MsmMtmrState {
     qemu_irq tick_irq;
     qemu_irq sleep_irq;
     qemu_irq irq_out[IRQ_OUT_NUM];
+    qemu_irq sub7_irq;
+    uint32_t sub7_level, sub7_latch;
     QEMUTimer *tick_timer;
     QEMUTimer *sleep_timer;
 
@@ -104,11 +114,38 @@ static void mtmr_sleep(void *opaque)
     qemu_irq_pulse(s->sleep_irq);
 }
 
+static uint32_t sub7_status(MsmMtmrState *s)
+{
+    return s->sub7_level | s->sub7_latch;
+}
+
+static void sub7_update(MsmMtmrState *s)
+{
+    qemu_set_irq(s->sub7_irq,
+                 !!(sub7_status(s) & s->regs[R_SUB7_ENABLE / 4]));
+}
+
+static void sub7_set(void *opaque, int n, int level)
+{
+    MsmMtmrState *s = opaque;
+    uint32_t bit = 1u << n;
+
+    if (level && !(s->sub7_level & bit)) {
+        s->sub7_latch |= bit;
+    }
+    s->sub7_level = level ? s->sub7_level | bit : s->sub7_level & ~bit;
+    sub7_update(s);
+}
+
 static uint64_t mtmr_read(void *opaque, hwaddr off, unsigned size)
 {
     MsmMtmrState *s = opaque;
 
     switch (off) {
+    case R_SUB7_STATUS:
+        return sub7_status(s);
+    case R_SUB7_ENABLE:
+        return s->regs[off / 4];
     case R_TICK_COUNT:
         if (!(s->regs[R_TICK_EN / 4] & 1)) {
             return 0;
@@ -152,6 +189,13 @@ static void mtmr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     case R_DOG_BASE ... R_DOG_KICK:
         return;
+    case R_SUB7_CLEAR:
+        s->sub7_latch &= ~val;
+        sub7_update(s);
+        return;
+    case R_SUB7_ENABLE:
+        sub7_update(s);
+        return;
     case R_IRQ_OUT ... R_IRQ_OUT + 4 * (IRQ_OUT_NUM - 1):
         if (val & 1) {
             qemu_irq_pulse(s->irq_out[(off - R_IRQ_OUT) / 4]);
@@ -174,6 +218,8 @@ static void mtmr_reset(DeviceState *dev)
     MsmMtmrState *s = MSM_MTMR(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->sub7_latch = 0;
+    sub7_update(s);
     timer_del(s->tick_timer);
     timer_del(s->sleep_timer);
 }
@@ -188,6 +234,8 @@ static void mtmr_init(Object *obj)
     sysbus_init_irq(sbd, &s->tick_irq);
     sysbus_init_irq(sbd, &s->sleep_irq);
     qdev_init_gpio_out_named(DEVICE(obj), s->irq_out, "m2a", IRQ_OUT_NUM);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->sub7_irq, "sub7-irq", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), sub7_set, "sub7", SUB7_INPUTS);
     s->tick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtmr_tick, s);
     s->sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtmr_sleep, s);
 }

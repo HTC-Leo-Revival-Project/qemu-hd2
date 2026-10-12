@@ -53,6 +53,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmModemLleState, MSM_MODEM_LLE)
 #define MODEM_TMR_PHYS  0xB8000000
 #define MODEM_VIC_PHYS  0xB8001000
 #define MIRQ_TICK       32
+#define MIRQ_TIMER      34      /* timer match: AMSS's timer service */
 #define MODEM_RAM9C_PHYS 0x9C000000
 #define MODEM_RAM9C_SIZE 0x00100000
 #define MODEM_IMEM_PHYS 0xFFFC0000
@@ -472,9 +473,15 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->tmr = lle_private_device(s, TYPE_MSM_MTMR, MODEM_TMR_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->tmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_TICK));
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->tmr), 1,
+                       qdev_get_gpio_in(s->vic, MIRQ_TIMER));
 
     /* the modem's interrupts to the other processors: "m2a" 0-7 */
     qdev_pass_gpios(s->tmr, DEVICE(s), "m2a");
+    /* second-level interrupt controller 7 (UIM ...) on VIC line 37 */
+    qdev_connect_gpio_out_named(s->tmr, "sub7-irq", 0,
+                                qdev_get_gpio_in(s->vic, MIRQ_SUB7));
+    qdev_pass_gpios(s->tmr, DEVICE(s), "sub7");
 
     /*
      * SSBI controllers (msm_ssbi.c): two sit inside the timer block, so

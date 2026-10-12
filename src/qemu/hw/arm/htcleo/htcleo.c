@@ -845,6 +845,17 @@ static void htcleo_init(MachineState *machine)
     sysbus_mmio_map(sbd, 0, MSM_UART1_PHYS);
     sysbus_connect_irq(sbd, 0, sirc_in[SIRC_UART1]);
     for (int i = 1; i < 3; i++) {
+        if (i == 1 && s->lle) {
+            /* UART2 is AMSS's smart card interface: the UIM with the SIM */
+            dev = qdev_new(TYPE_MSM_UIM);
+            object_property_add_child(OBJECT(machine), "uim", OBJECT(dev));
+            sbd = SYS_BUS_DEVICE(dev);
+            sysbus_realize_and_unref(sbd, &error_fatal);
+            sysbus_mmio_map(sbd, 0, MSM_UART2_PHYS);
+            sysbus_connect_irq(sbd, 0, qdev_get_gpio_in_named(s->lle, "sub7",
+                                                             MIRQ_SUB7_UIM));
+            continue;
+        }
         dev = qdev_new(TYPE_MSM_UART);
         sbd = SYS_BUS_DEVICE(dev);
         sysbus_realize_and_unref(sbd, &error_fatal);

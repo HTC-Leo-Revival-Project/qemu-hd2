@@ -174,6 +174,7 @@
 #define TYPE_MSM_MTMR       "msm-mtmr"
 #define TYPE_MSM_MDSP       "msm-mdsp"
 #define TYPE_MSM_SSBI       "msm-ssbi"
+#define TYPE_MSM_UIM        "msm-uim"
 #define MSM_SSBI_NUM        6   /* SSBI controllers, see msm_ssbi.c */
 void msm_ssbi_pmic_set_vbus(DeviceState *dev, bool present);
 void msm_ssbi_pmic_set_power_key(DeviceState *dev, bool pressed);

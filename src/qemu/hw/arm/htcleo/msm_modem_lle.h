@@ -26,6 +26,8 @@
  */
 #define MIRQ_GPIO_GROUP1    44  /* tramp 60 */
 #define MIRQ_GPIO_GROUP2    45  /* tramp 61 */
+#define MIRQ_SUB7           37  /* second-level controller 7 */
+#define MIRQ_SUB7_UIM       3   /* its input for the UIM (UART2) */
 #define MIRQ_A2M_0          56
 #define MIRQ_A2M_NUM        7
 
