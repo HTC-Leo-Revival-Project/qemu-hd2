@@ -42,6 +42,94 @@ void hex_tlbw(CPUHexagonState *env, uint32_t index, uint64_t value)
     hex_log_tlbw(myidx, value);
 }
 
+/*
+ * QDSP6 V2 TLB, from how the QSD8x50 DSP firmware's kernel uses it: the
+ * entry being written or read is in two system registers, the index in a
+ * third, and tlbw/tlbr/tlbp take no operands.
+ *   s21 (vid)  TLBHI  [29] valid  [28] global  [25:20] ASID  [19:0] VPN
+ *   s22        TLBLO  [31:23] permissions and cache attributes (not
+ *                     decoded yet: entries allow every access)
+ *                     [22:20] page size, 4K << 2n (as V5: 0 = 4K ... 7 = 64M)
+ *                     [19:0] PPN
+ *   s23        TLBIDX index; tlbp returns the match or bit 31 = no match
+ * The entries are kept in V5 form for the MMU code, plus the words as
+ * written so tlbr gives back what software wrote.
+ */
+#define V2_TLBHI    HEX_SREG_VID
+#define V2_TLBLO    HEX_SREG_VID1
+#define V2_TLBIDX   HEX_SREG_BESTWAIT
+
+static uint64_t hex_v2_to_v5(uint32_t hi, uint32_t lo)
+{
+    uint32_t size = extract32(lo, 20, 3);
+    uint32_t ppn = extract32(lo, 0, 20) & ~((1u << (2 * size)) - 1);
+    uint64_t entry;
+
+    if (!extract32(hi, 29, 1)) {
+        return 0;
+    }
+    entry = ((uint64_t)ppn << 1) | (1u << size);
+    entry = deposit64(entry, 24, 4, extract32(lo, 24, 4));  /* cache */
+    entry = deposit64(entry, 28, 4, 0xf);                   /* U R W X */
+    entry = deposit64(entry, 32, 20, extract32(hi, 0, 20));
+    entry = deposit64(entry, 52, 7, extract32(hi, 20, 6));
+    entry = deposit64(entry, 62, 1, extract32(hi, 28, 1));
+    entry = deposit64(entry, 63, 1, 1);
+    return entry;
+}
+
+static uint32_t hex_v2_greg(CPUHexagonState *env, int reg)
+{
+    return hexagon_globalreg_read(env_archcpu(env)->globalregs, reg,
+                                  env->threadId);
+}
+
+static void hex_v2_set_greg(CPUHexagonState *env, int reg, uint32_t val)
+{
+    hexagon_globalreg_write(env_archcpu(env)->globalregs, reg, val,
+                            env->threadId);
+}
+
+void hex_v2_tlbw(CPUHexagonState *env)
+{
+    HexagonTLBState *tlb = env_archcpu(env)->tlb;
+    uint32_t hi = hex_v2_greg(env, V2_TLBHI);
+    uint32_t lo = hex_v2_greg(env, V2_TLBLO);
+    uint32_t idx = fTLB_NONPOW2WRAP(fTLB_IDXMASK(hex_v2_greg(env, V2_TLBIDX)));
+    CPUState *cs;
+
+    hexagon_tlb_v2_write(tlb, idx, hi, lo);
+    hexagon_tlb_write(tlb, idx, hex_v2_to_v5(hi, lo));
+    qemu_log_mask(CPU_LOG_MMU, "v2 tlbw[%02u]: hi %08x lo %08x\n", idx, hi,
+                  lo);
+    /* the TLB is shared by the hardware threads */
+    CPU_FOREACH(cs) {
+        tlb_flush(cs);
+    }
+}
+
+void hex_v2_tlbr(CPUHexagonState *env)
+{
+    HexagonTLBState *tlb = env_archcpu(env)->tlb;
+    uint32_t idx = fTLB_NONPOW2WRAP(fTLB_IDXMASK(hex_v2_greg(env, V2_TLBIDX)));
+    uint32_t hi, lo;
+
+    hexagon_tlb_v2_read(tlb, idx, &hi, &lo);
+    hex_v2_set_greg(env, V2_TLBHI, hi);
+    hex_v2_set_greg(env, V2_TLBLO, lo);
+}
+
+void hex_v2_tlbp(CPUHexagonState *env)
+{
+    HexagonTLBState *tlb = env_archcpu(env)->tlb;
+    uint32_t hi = hex_v2_greg(env, V2_TLBHI);
+    int cause = 0;
+    uint32_t idx = hexagon_tlb_lookup(tlb, extract32(hi, 20, 6),
+                                      extract32(hi, 0, 20) << 12, &cause);
+
+    hex_v2_set_greg(env, V2_TLBIDX, idx);
+}
+
 void hex_mmu_on(CPUHexagonState *env)
 {
     CPUState *cs = env_cpu(env);

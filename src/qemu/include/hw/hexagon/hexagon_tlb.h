@@ -21,6 +21,7 @@ struct HexagonTLBState {
 
     uint32_t num_entries;
     uint64_t *entries;
+    uint32_t *v2_hi, *v2_lo;    /* QDSP6 V2: entries as software wrote them */
 };
 
 uint64_t hexagon_tlb_read(HexagonTLBState *tlb, uint32_t index);
@@ -42,5 +43,11 @@ void hexagon_tlb_dump(Monitor *mon, HexagonTLBState *tlb);
 bool hexagon_tlb_dump_entry(Monitor *mon, uint64_t entry);
 
 uint32_t hexagon_tlb_get_num_entries(HexagonTLBState *tlb);
+
+/* QDSP6 V2 TLB entries (TLBHI, TLBLO) */
+void hexagon_tlb_v2_write(HexagonTLBState *tlb, uint32_t index, uint32_t hi,
+                          uint32_t lo);
+void hexagon_tlb_v2_read(HexagonTLBState *tlb, uint32_t index, uint32_t *hi,
+                         uint32_t *lo);
 
 #endif /* HW_HEXAGON_TLB_H */

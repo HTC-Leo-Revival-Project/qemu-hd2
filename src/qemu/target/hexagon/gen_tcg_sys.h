@@ -95,8 +95,52 @@
         gen_helper_stop(tcg_env); \
     } while (0)
 
+/*
+ * TLB access.  QDSP6 V2 has the same encodings without operands: the entry
+ * is in vid/s22 and the index in s23, so the GPR operands the V5 decoding
+ * finds are left as they are.
+ */
+#define fGEN_TCG_Y2_tlbw(SHORTCODE) \
+    do { \
+        if (ctx->is_v2) { \
+            gen_helper_v2_tlbw(tcg_env); \
+        } else { \
+            gen_helper_tlbw(tcg_env, RssV, RtV); \
+        } \
+    } while (0)
+
+#define fGEN_TCG_Y2_tlbr(SHORTCODE) \
+    do { \
+        if (ctx->is_v2) { \
+            gen_helper_v2_tlbr(tcg_env); \
+            tcg_gen_concat_i32_i64(RddV, hex_gpr[RddN], hex_gpr[RddN + 1]); \
+        } else { \
+            gen_helper_tlbr(RddV, tcg_env, RsV); \
+        } \
+    } while (0)
+
+#define fGEN_TCG_Y2_tlbp(SHORTCODE) \
+    do { \
+        if (ctx->is_v2) { \
+            gen_helper_v2_tlbp(tcg_env); \
+            tcg_gen_mov_tl(RdV, hex_gpr[RdN]); \
+        } else { \
+            gen_helper_tlbp(RdV, tcg_env, RsV); \
+        } \
+    } while (0)
+
 #define fGEN_TCG_Y2_tfrscrr(SHORTCODE) \
-    tcg_gen_mov_tl(RdV, SsV)
+    do { \
+        if (ctx->is_v2 && SsN == HEX_SREG_SSR) { \
+            TCGv_i32 hi = tcg_temp_new_i32(); \
+            tcg_gen_ld_i32(hi, tcg_env, \
+                           offsetof(CPUHexagonState, v2_ssr_hi)); \
+            tcg_gen_andi_tl(RdV, SsV, 0x0007ffff); \
+            tcg_gen_or_tl(RdV, RdV, hi); \
+        } else { \
+            tcg_gen_mov_tl(RdV, SsV); \
+        } \
+    } while (0)
 
 #define fGEN_TCG_Y2_tfrsrcr(SHORTCODE) \
     tcg_gen_mov_tl(SdV, RsV)
@@ -133,7 +177,7 @@
                            reg_field_info[SSR_EX].offset, \
                            reg_field_info[SSR_EX].width); \
         gen_log_sreg_write(ctx, HEX_SREG_SSR, new_ssr); \
-        gen_jumpr(ctx, hex_t_sreg[HEX_SREG_ELR]); \
+        gen_jumpr(ctx, hex_t_sreg[ctx->is_v2 ? HEX_SREG_BADVA1 : HEX_SREG_ELR]); \
     } while (0)
 
 #endif

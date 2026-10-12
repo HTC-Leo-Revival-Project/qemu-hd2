@@ -20,6 +20,7 @@
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/probe.h"
+#include "exec/cputlb.h"
 #include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -1562,9 +1563,25 @@ void HELPER(raise_stack_overflow)(CPUHexagonState *env, uint32_t slot,
     cpu_loop_exit_restore(cs, 0);
 }
 
+/* clear interrupt auto-disable: the interrupts in mask can be taken again */
 void HELPER(ciad)(CPUHexagonState *env, uint32_t mask)
 {
-    g_assert_not_reached();
+    uint32_t ipendad;
+    uint32_t iad;
+    HexagonCPU *cpu;
+
+    BQL_LOCK_GUARD();
+    cpu = env_archcpu(env);
+    ipendad = cpu->globalregs ?
+        hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
+                               env->threadId) : 0;
+    iad = fGET_FIELD(ipendad, IPENDAD_IAD);
+    fSET_FIELD(ipendad, IPENDAD_IAD, iad & ~mask);
+    if (cpu->globalregs) {
+        hexagon_globalreg_write(cpu->globalregs, HEX_SREG_IPENDAD,
+                                ipendad, env->threadId);
+    }
+    hex_interrupt_update(env);
 }
 
 void HELPER(siad)(CPUHexagonState *env, uint32_t mask)
@@ -1784,6 +1801,38 @@ static inline QEMU_ALWAYS_INLINE void resched(CPUHexagonState *env)
 void HELPER(resched)(CPUHexagonState *env)
 {
     resched(env);
+}
+
+/* TLB management: the V5+ forms take their operands in registers */
+void HELPER(tlbw)(CPUHexagonState *env, uint64_t entry, uint32_t index)
+{
+    fTLBW(index, entry);
+}
+
+uint64_t HELPER(tlbr)(CPUHexagonState *env, uint32_t index)
+{
+    return fTLBR(index);
+}
+
+uint32_t HELPER(tlbp)(CPUHexagonState *env, uint32_t tlbhi)
+{
+    return fTLBP(tlbhi);
+}
+
+/* V2: through vid (TLBHI), s22 (TLBLO) and s23 (TLBIDX), see hex_mmu.c */
+void HELPER(v2_tlbw)(CPUHexagonState *env)
+{
+    hex_v2_tlbw(env);
+}
+
+void HELPER(v2_tlbr)(CPUHexagonState *env)
+{
+    hex_v2_tlbr(env);
+}
+
+void HELPER(v2_tlbp)(CPUHexagonState *env)
+{
+    hex_v2_tlbp(env);
 }
 
 void HELPER(wait)(CPUHexagonState *env, uint32_t PC)

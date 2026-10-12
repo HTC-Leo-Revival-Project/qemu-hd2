@@ -389,6 +389,15 @@ void hexagon_cpu_soft_reset(CPUHexagonState *env)
     hexagon_ssr_set_cause(env, HEX_CAUSE_RESET);
 
     cpu = env_archcpu(env);
+    if (HEXAGON_CPU_GET_CLASS(cpu)->hex_def->hex_version == HEX_VER_V2) {
+        /*
+         * QDSP6 V2 leaves reset outside exception mode, and has the
+         * hardware thread number in SSR[21:19] (its kernel picks each
+         * thread's stack from it)
+         */
+        SET_SYSTEM_FIELD(env, HEX_SREG_SSR, SSR_EX, 0);
+        env->v2_ssr_hi = env->threadId << 19;
+    }
     if (cpu->globalregs) {
         uint32_t evb =
             hexagon_globalreg_read(cpu->globalregs, HEX_SREG_EVB,
@@ -585,6 +594,23 @@ static void set_badva_regs(CPUHexagonState *env, uint32_t VA, int slot,
                            MMUAccessType access_type)
 {
     env->t_sreg[HEX_SREG_BADVA] = VA;
+
+    if (HEXAGON_CPU_GET_CLASS(env_archcpu(env))->hex_def->hex_version ==
+        HEX_VER_V2) {
+        /* QDSP6 V2: data faults in BADVA0, instruction fetches in BADVA1 */
+        if (access_type == MMU_INST_FETCH) {
+            /* the fetch address ends up in s5, the return address */
+            SET_SSR_FIELD(env, SSR_V0, 0);
+            SET_SSR_FIELD(env, SSR_V1, 1);
+            SET_SSR_FIELD(env, SSR_BVS, 1);
+        } else {
+            env->t_sreg[HEX_SREG_BADVA0] = VA;
+            SET_SSR_FIELD(env, SSR_V0, 1);
+            SET_SSR_FIELD(env, SSR_V1, 0);
+            SET_SSR_FIELD(env, SSR_BVS, 0);
+        }
+        return;
+    }
 
     if (access_type == MMU_INST_FETCH || slot == 0) {
         env->t_sreg[HEX_SREG_BADVA0] = VA;
@@ -844,6 +870,7 @@ static const TypeInfo hexagon_cpu_type_infos[] = {
         .class_init = hexagon_cpu_class_init,
         .class_base_init = hexagon_cpu_class_base_init,
     },
+    DEFINE_CPU(TYPE_HEXAGON_CPU_V2,               HEX_VER_V2),
     DEFINE_CPU(TYPE_HEXAGON_CPU_V5,               HEX_VER_V5),
     DEFINE_CPU(TYPE_HEXAGON_CPU_V55,              HEX_VER_V55),
     DEFINE_CPU(TYPE_HEXAGON_CPU_V60,              HEX_VER_V60),

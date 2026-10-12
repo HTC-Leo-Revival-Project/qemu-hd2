@@ -143,6 +143,7 @@ typedef struct CPUArchState {
     hex_lock_state_t k0_lock_state;
     uint32_t tlb_lock_count;
     uint32_t k0_lock_count;
+    uint32_t v2_ssr_hi;     /* QDSP6 V2: SSR[31:19], thread number and flags */
     uint64_t t_cycle_count;
 #endif
     uint32_t next_PC;

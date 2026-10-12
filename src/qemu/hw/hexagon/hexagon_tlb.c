@@ -298,6 +298,22 @@ void hexagon_tlb_write(HexagonTLBState *tlb, uint32_t index, uint64_t value)
     tlb->entries[index] = value;
 }
 
+void hexagon_tlb_v2_write(HexagonTLBState *tlb, uint32_t index, uint32_t hi,
+                          uint32_t lo)
+{
+    g_assert(index < tlb->num_entries);
+    tlb->v2_hi[index] = hi;
+    tlb->v2_lo[index] = lo;
+}
+
+void hexagon_tlb_v2_read(HexagonTLBState *tlb, uint32_t index, uint32_t *hi,
+                         uint32_t *lo)
+{
+    g_assert(index < tlb->num_entries);
+    *hi = tlb->v2_hi[index];
+    *lo = tlb->v2_lo[index];
+}
+
 bool hexagon_tlb_find_match(HexagonTLBState *tlb, uint32_t asid,
                             uint32_t VA, MMUAccessType access_type,
                             hwaddr *PA, int *prot, uint64_t *size,
@@ -404,6 +420,8 @@ static void hexagon_tlb_realize(DeviceState *dev, Error **errp)
         return;
     }
     s->entries = g_new0(uint64_t, s->num_entries);
+    s->v2_hi = g_new0(uint32_t, s->num_entries);
+    s->v2_lo = g_new0(uint32_t, s->num_entries);
 }
 
 static void hexagon_tlb_unrealize(DeviceState *dev)
@@ -411,6 +429,9 @@ static void hexagon_tlb_unrealize(DeviceState *dev)
     HexagonTLBState *s = HEXAGON_TLB(dev);
     g_free(s->entries);
     s->entries = NULL;
+    g_free(s->v2_hi);
+    g_free(s->v2_lo);
+    s->v2_hi = s->v2_lo = NULL;
 }
 
 static void hexagon_tlb_reset_hold(Object *obj, ResetType type)
@@ -418,6 +439,8 @@ static void hexagon_tlb_reset_hold(Object *obj, ResetType type)
     HexagonTLBState *s = HEXAGON_TLB(obj);
     if (s->entries) {
         memset(s->entries, 0, sizeof(uint64_t) * s->num_entries);
+        memset(s->v2_hi, 0, sizeof(uint32_t) * s->num_entries);
+        memset(s->v2_lo, 0, sizeof(uint32_t) * s->num_entries);
     }
 }
 

@@ -33,7 +33,12 @@ static void set_addresses(CPUHexagonState *env, uint32_t pc_offset,
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_EVB,
                                env->threadId) :
         cpu->boot_addr;
-    env->t_sreg[HEX_SREG_ELR] = env->gpr[HEX_REG_PC] + pc_offset;
+    if (HEXAGON_CPU_GET_CLASS(cpu)->hex_def->hex_version == HEX_VER_V2) {
+        /* QDSP6 V2: the return address is in s5, where V5 has BADVA1 */
+        env->t_sreg[HEX_SREG_BADVA1] = env->gpr[HEX_REG_PC] + pc_offset;
+    } else {
+        env->t_sreg[HEX_SREG_ELR] = env->gpr[HEX_REG_PC] + pc_offset;
+    }
     env->gpr[HEX_REG_PC] = evb | (exception_index << 2);
 }
 
@@ -74,10 +79,12 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
     BQL_LOCK_GUARD();
 
     qemu_log_mask(CPU_LOG_INT,
-                  "\t%s: event 0x%02x:%s, cause 0x%" PRIx32 "(%" PRIu32 ")\n",
+                  "\t%s: event 0x%02x:%s, cause 0x%" PRIx32 "(%" PRIu32 ")"
+                  " ssr 0x%08" PRIx32 " elr 0x%08" PRIx32 " stid 0x%08" PRIx32 "\n",
                   __func__, (unsigned)cs->exception_index,
                   event_name[cs->exception_index], env->cause_code,
-                  env->cause_code);
+                  env->cause_code, env->t_sreg[HEX_SREG_SSR],
+                  env->t_sreg[HEX_SREG_ELR], env->t_sreg[HEX_SREG_STID]);
 
     env->llsc_addr = ~0;
 

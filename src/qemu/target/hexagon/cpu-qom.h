@@ -13,6 +13,7 @@
 
 typedef enum {
     HEX_VER_NONE = 0x00,
+    HEX_VER_V2 = 0x02,      /* QDSP6 V2 (QSD8x50): V2 MMU and system registers */
     HEX_VER_V5 = 0x04,
     HEX_VER_V55 = 0x05,
     HEX_VER_V60 = 0x60,
@@ -37,6 +38,7 @@ typedef struct {
 #define HEXAGON_CPU_TYPE_SUFFIX "-" TYPE_HEXAGON_CPU
 #define HEXAGON_CPU_TYPE_NAME(name) (name HEXAGON_CPU_TYPE_SUFFIX)
 
+#define TYPE_HEXAGON_CPU_V2 HEXAGON_CPU_TYPE_NAME("v2")
 #define TYPE_HEXAGON_CPU_V5 HEXAGON_CPU_TYPE_NAME("v5")
 #define TYPE_HEXAGON_CPU_V55 HEXAGON_CPU_TYPE_NAME("v55")
 #define TYPE_HEXAGON_CPU_V60 HEXAGON_CPU_TYPE_NAME("v60")

@@ -175,6 +175,9 @@ uint32_t hexagon_globalreg_masked_value(HexagonGlobalRegState *s, uint32_t reg,
     g_assert(reg < NUM_SREGS);
     g_assert(reg >= HEX_SREG_GLB_START);
     reg_mask = global_sreg_immut_masks[reg];
+    if (s->qdsp6_v2 && reg >= HEX_SREG_VID && reg <= HEX_SREG_BESTWAIT) {
+        reg_mask = 0;               /* TLBHI, TLBLO, TLBIDX */
+    }
     return reg_mask == IMMUTABLE ?
             s->regs[reg] :
             apply_write_mask(value, s->regs[reg], reg_mask);
@@ -279,6 +282,7 @@ static const Property hexagon_globalreg_properties[] = {
     DEFINE_PROP_UINT64("config-table-addr", HexagonGlobalRegState,
                        config_table_addr, 0xffffffffULL),
     DEFINE_PROP_UINT32("dsp-rev", HexagonGlobalRegState, dsp_rev, 0),
+    DEFINE_PROP_BOOL("qdsp6-v2", HexagonGlobalRegState, qdsp6_v2, false),
     DEFINE_PROP_BOOL("isdben-etm-enable", HexagonGlobalRegState,
                      isdben_etm_enable, false),
     DEFINE_PROP_BOOL("isdben-dfd-enable", HexagonGlobalRegState,

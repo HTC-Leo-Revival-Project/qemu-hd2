@@ -194,7 +194,27 @@ static const uint32_t sreg_immut_masks[NUM_SREGS] = {
 G_GNUC_UNUSED
 static void gen_log_sreg_write(DisasContext *ctx, int rnum, TCGv_i32 val)
 {
-    const uint32_t reg_mask = sreg_immut_masks[rnum];
+    /* QDSP6 V2's s6 (decoded as STID, see decode.c) has no fixed bits */
+    const uint32_t reg_mask = (ctx->is_v2 && rnum == HEX_SREG_STID) ? 0 :
+                              sreg_immut_masks[rnum];
+
+    if (ctx->is_v2 && rnum == HEX_SREG_SSR) {
+        /*
+         * V2's SSR has the thread number (read only) and flags of its own
+         * in [31:19], where V5 keeps state QEMU acts on: keep them apart
+         */
+        TCGv_i32 hi = tcg_temp_new_i32();
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        tcg_gen_ld_i32(hi, tcg_env, offsetof(CPUHexagonState, v2_ssr_hi));
+        tcg_gen_andi_i32(hi, hi, 0x00380000);
+        tcg_gen_andi_i32(t, val, 0xffc00000);
+        tcg_gen_or_i32(hi, hi, t);
+        tcg_gen_st_i32(hi, tcg_env, offsetof(CPUHexagonState, v2_ssr_hi));
+        t = tcg_temp_new_i32();
+        tcg_gen_andi_i32(t, val, 0x0007ffff);
+        val = t;
+    }
 
     if (reg_mask != IMMUTABLE) {
         if (rnum < HEX_SREG_GLB_START) {
@@ -849,8 +869,9 @@ static void gen_call(DisasContext *ctx, int pc_off)
 static void gen_callr(DisasContext *ctx, TCGv new_pc)
 {
     TCGv lr = get_result_gpr(ctx, HEX_REG_LR);
-    tcg_gen_movi_tl(lr, ctx->next_PC);
+    /* the target is read before LR is written: callr r31 is legal */
     gen_write_new_pc_addr(ctx, new_pc, TCG_COND_ALWAYS, NULL);
+    tcg_gen_movi_tl(lr, ctx->next_PC);
 }
 
 static void gen_cond_call(DisasContext *ctx, TCGv pred,

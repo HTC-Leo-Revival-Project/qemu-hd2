@@ -837,8 +837,8 @@ static void gen_sreg_writes(DisasContext *ctx)
                                ctx->t_sreg_new_value[reg_num]);
             }
             gen_helper_pending_interrupt(tcg_env);
-        } else if ((reg_num == HEX_SREG_BESTWAIT) ||
-                   (reg_num == HEX_SREG_SCHEDCFG)) {
+        } else if (((reg_num == HEX_SREG_BESTWAIT) ||
+                    (reg_num == HEX_SREG_SCHEDCFG)) && !ctx->is_v2) {
             gen_helper_resched(tcg_env);
         } else if (ctx->need_commit && reg_num < HEX_SREG_GLB_START) {
             tcg_gen_mov_tl(hex_t_sreg[reg_num], ctx->t_sreg_new_value[reg_num]);
@@ -1211,6 +1211,7 @@ static void hexagon_tr_init_disas_context(DisasContextBase *dcbase,
     ctx->is_tight_loop = FIELD_EX32(hex_flags, TB_FLAGS, IS_TIGHT_LOOP);
     ctx->short_circuit = hex_cpu->short_circuit;
     ctx->hex_def = HEXAGON_CPU_GET_CLASS(hex_cpu)->hex_def;
+    ctx->is_v2 = ctx->hex_def->hex_version == HEX_VER_V2;
 #ifndef CONFIG_USER_ONLY
     ctx->num_cycles = 0;
     ctx->pcycle_enabled = FIELD_EX32(hex_flags, TB_FLAGS, PCYCLE_ENABLED);

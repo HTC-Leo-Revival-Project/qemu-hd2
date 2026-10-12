@@ -11,6 +11,9 @@
 #include "monitor/monitor.h"
 
 extern void hex_tlbw(CPUHexagonState *env, uint32_t index, uint64_t value);
+void hex_v2_tlbw(CPUHexagonState *env);
+void hex_v2_tlbr(CPUHexagonState *env);
+void hex_v2_tlbp(CPUHexagonState *env);
 extern uint32_t hex_tlb_lookup(CPUHexagonState *env, uint32_t ssr, uint32_t VA);
 extern void hex_mmu_on(CPUHexagonState *env);
 extern void hex_mmu_off(CPUHexagonState *env);

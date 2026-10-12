@@ -89,6 +89,7 @@ typedef struct DisasContext {
     TCGv dczero_addr;
     bool pcycle_enabled;
     uint32_t num_cycles;
+    bool is_v2;                 /* QDSP6 V2 system architecture */
 } DisasContext;
 
 bool is_gather_store_insn(DisasContext *ctx);

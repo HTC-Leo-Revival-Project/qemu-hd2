@@ -147,7 +147,12 @@ static uint32_t get_prio(CPUHexagonState *env)
 
 static void set_elr(CPUHexagonState *env, uint32_t val)
 {
-    env->t_sreg[HEX_SREG_ELR] = val;
+    if (HEXAGON_CPU_GET_CLASS(env_archcpu(env))->hex_def->hex_version ==
+        HEX_VER_V2) {
+        env->t_sreg[HEX_SREG_BADVA1] = val;     /* V2's return address */
+    } else {
+        env->t_sreg[HEX_SREG_ELR] = val;
+    }
 }
 
 static bool get_schedcfgen(CPUHexagonState *env)

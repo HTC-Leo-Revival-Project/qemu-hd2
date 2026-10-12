@@ -787,6 +787,25 @@ int decode_packet(DisasContext *ctx, int max_words, const uint32_t *words,
         }
     }
 
+#ifndef CONFIG_USER_ONLY
+    /*
+     * QDSP6 V2 has its SSR in s2 and something else in s6, where V5 has
+     * STID and SSR: swap them so the V5 SSR machinery acts on V2's SSR
+     */
+    if (ctx->hex_def->hex_version == HEX_VER_V2) {
+        for (i = 0; i < num_insns; i++) {
+            Insn *insn = &pkt->insn[i];
+            int op = insn->opcode == Y2_tfrsrcr ? 0 :
+                     insn->opcode == Y2_tfrscrr ? 1 : -1;
+
+            if (op >= 0 && (insn->regno[op] == HEX_SREG_STID ||
+                            insn->regno[op] == HEX_SREG_SSR)) {
+                insn->regno[op] ^= HEX_SREG_STID ^ HEX_SREG_SSR;
+            }
+        }
+    }
+#endif
+
     pkt->encod_pkt_size_in_bytes = words_read * 4;
     pkt->pkt_has_hvx = false;
     for (i = 0; i < num_insns; i++) {

@@ -29,6 +29,7 @@ struct HexagonGlobalRegState {
     uint32_t boot_evb;           /* Boot Exception Vector Base (HEX_SREG_EVB) */
     uint64_t config_table_addr;  /* Configuration table base */
     uint32_t dsp_rev;           /* DSP revision register (HEX_SREG_REV) */
+    bool qdsp6_v2;              /* s21-s23 are V2's TLB registers */
 
     /* ISDB properties */
     bool isdben_etm_enable;     /* ISDB ETM enable bit */
