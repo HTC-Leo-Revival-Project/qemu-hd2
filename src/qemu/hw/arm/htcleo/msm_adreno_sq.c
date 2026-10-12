@@ -7,12 +7,18 @@
  * vector operation (srcs 1-2[-3]) and a scalar operation (src 3); both
  * write temporaries or, with export_data set, the shader's outputs.
  *
+ * Programs are decoded once and cached by content.  They run on AL lanes
+ * at once (vertices, or a 4x4 block of pixels as four 2x2 quads), with a
+ * mask of active lanes: predicated instructions and clauses narrow it,
+ * loops drop the lanes that break, and a predicated jump or call that
+ * splits the lanes runs both paths to the end separately.
+ *
  * Formats and semantics follow freedreno (src/freedreno/ir2/instr-a2xx.h,
  * disasm-a2xx.c) and Xenia's Xenos interpreter (the Xbox 360 GPU is the
  * same design): src/xenia/gpu/ucode.h, shader_interpreter.cc.
  *
  * Exports: vertex shader 0-15 interpolators, 62 position, 63 point size;
- * pixel shader 0-3 colours, 61 depth.
+ * pixel shader 0 colour, 61 depth.
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -53,7 +59,7 @@ enum {
     S_SIN, S_COS, S_RETAIN_PREV,
 };
 
-/* operand components the vector opcodes read, per source */
+/* sources the vector opcodes read */
 static const uint8_t vec_srcs[32] = {
     [V_ADD] = 2, [V_MUL] = 2, [V_MAX] = 2, [V_MIN] = 2, [V_SETE] = 2,
     [V_SETGT] = 2, [V_SETGTE] = 2, [V_SETNE] = 2, [V_FRAC] = 1,
@@ -65,23 +71,355 @@ static const uint8_t vec_srcs[32] = {
     [V_KILLGTE] = 2, [V_KILLNE] = 2, [V_DST] = 2, [V_MOVA] = 2,
 };
 
-typedef struct SqState {
-    AdrenoShaderCtx *c;
-    bool pred;
-    int a0;
-    float prev;
+/* ------------------------------------------------------------------ */
+/* Decoded program                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct SqSrc {
+    uint8_t reg;            /* temporary 0-63 or constant 0-255 */
+    bool temp, rel;         /* rel: temporary + aL */
+    bool absv, neg;
+    bool addressed, a0rel;  /* constants: + a0 or + aL */
+    uint8_t swz[4];
+} SqSrc;
+
+typedef struct SqAlu {
+    uint8_t vop, sop, nvsrc;
+    bool vrun;              /* the vector op writes or changes state */
+    uint8_t skind;          /* 0 none, 1 src3 .w/.x, 2 c#.w and r#.x */
+    uint8_t vdst, sdst;
+    bool vdst_rel, sdst_rel, export, vclamp, sclamp;
+    uint8_t vres, sres, c0, c1;     /* write masks */
+    SqSrc src[3];
+    SqSrc sconst;           /* skind 2 */
+    uint8_t streg, stcomp;
+    bool sneg;
+} SqAlu;
+
+typedef struct SqFetch {
+    bool vtx;
+    uint8_t op;
+    uint8_t dst, src;
+    bool dst_rel, src_rel;
+    uint8_t dswz[4];        /* 0-3 component, 4 zero, 5 one, 7 keep */
+    /* vertex */
+    uint16_t vconst;
+    uint8_t fmt, scomp, stride;
+    bool sign, norm, round;
+    int8_t exp_adj;
+    int32_t offset;
+    /* texture */
+    uint8_t sswz[3];
+    AdrenoTexArgs tex;
+} SqFetch;
+
+typedef struct SqInsn {
+    bool valid, fetch, predicated, pred_cond;
+    union {
+        SqAlu alu;
+        SqFetch f;
+    };
+} SqInsn;
+
+typedef struct SqCf {
+    uint8_t op;
+    uint16_t addr;
+    uint8_t count;
+    uint16_t seq;
+    uint8_t bool_addr, loop_id;
+    bool cond, repeat, pred_break, uncond, predicated;
+} SqCf;
+
+static void decode_src(SqSrc *sr, const uint32_t *w, int n)
+{
+    uint32_t reg = (w[2] >> (8 * (3 - n))) & 0xff;
+    uint32_t swiz = (w[1] >> (8 * (3 - n))) & 0xff;
+    bool t1 = (w[2] >> 31) & 1, t2 = (w[2] >> 30) & 1;
+
+    memset(sr, 0, sizeof(*sr));
+    sr->temp = (w[2] >> (32 - n)) & 1;
+    sr->neg = (w[1] >> (27 - n)) & 1;
+    if (sr->temp) {
+        sr->reg = reg & 0x3f;
+        sr->rel = reg & 0x40;
+        sr->absv = reg & 0x80;
+    } else {
+        sr->reg = reg;
+        sr->absv = (w[0] >> 7) & 1;
+        /* const_0_rel_abs for the first constant, const_1 for later ones */
+        switch (n) {
+        case 1:
+            sr->addressed = (w[1] >> 31) & 1;
+            break;
+        case 2:
+            sr->addressed = t1 ? (w[1] >> 31) & 1 : (w[1] >> 30) & 1;
+            break;
+        default:
+            sr->addressed = (t1 && t2) ? (w[1] >> 31) & 1 : (w[1] >> 30) & 1;
+            break;
+        }
+        sr->a0rel = (w[1] >> 29) & 1;
+    }
+    for (int k = 0; k < 4; k++) {
+        sr->swz[k] = ((swiz >> (2 * k)) + k) & 3;
+    }
+}
+
+static void decode_alu(SqAlu *a, const uint32_t *w)
+{
+    uint32_t vmask = (w[0] >> 16) & 0xf, smask = (w[0] >> 20) & 0xf;
+
+    a->vop = (w[2] >> 24) & 0x1f;
+    a->sop = (w[0] >> 26) & 0x3f;
+    a->export = (w[0] >> 15) & 1;
+    a->vdst = w[0] & 0x3f;
+    a->vdst_rel = (w[0] >> 6) & 1;
+    a->sdst = (w[0] >> 8) & 0x3f;
+    a->sdst_rel = (w[0] >> 14) & 1;
+    a->vclamp = (w[0] >> 24) & 1;
+    a->sclamp = (w[0] >> 25) & 1;
+    a->vres = a->export ? vmask & ~smask : vmask;
+    a->sres = a->export ? smask & ~vmask : smask;
+    a->c1 = a->export ? vmask & smask : 0;
+    a->c0 = (a->export && a->sdst_rel) ? 0xf & ~(vmask | smask) : 0;
+    a->nvsrc = vec_srcs[a->vop];
+    a->vrun = a->vres || (a->vop >= V_PRED_SETE_PUSH && a->vop <= V_KILLNE) ||
+              a->vop == V_MOVA;
+    for (int n = 1; n <= 3; n++) {
+        decode_src(&a->src[n - 1], w, n);
+    }
+    if (a->sop >= S_MUL_CONST_0 && a->sop <= S_SUB_CONST_1) {
+        uint32_t swiz = w[1] & 0xff;
+        bool both_temp = ((w[2] >> 31) & 1) && ((w[2] >> 30) & 1);
+
+        a->skind = 2;
+        memset(&a->sconst, 0, sizeof(a->sconst));
+        a->sconst.reg = w[2] & 0xff;
+        a->sconst.addressed = both_temp ? (w[1] >> 31) & 1 : (w[1] >> 30) & 1;
+        a->sconst.a0rel = (w[1] >> 29) & 1;
+        a->sconst.swz[3] = ((swiz >> 6) + 3) & 3;
+        a->streg = (a->sop & 1) | (((w[2] >> 29) & 1) << 1) | (swiz & 0x3c);
+        a->stcomp = swiz & 3;
+        a->sneg = (w[1] >> 24) & 1;
+    } else if (a->sop == S_PRED_SET_CLR || a->sop == S_RETAIN_PREV ||
+               a->sop == S_41 || a->sop > S_RETAIN_PREV) {
+        a->skind = 0;
+    } else {
+        a->skind = 1;
+    }
+}
+
+static void decode_fetch(SqFetch *f, const uint32_t *w)
+{
+    uint32_t dswz = w[1] & 0xfff;
+
+    memset(f, 0, sizeof(*f));
+    f->op = w[0] & 0x1f;
+    f->vtx = f->op == 0;
+    f->src = (w[0] >> 5) & 0x3f;
+    f->src_rel = (w[0] >> 11) & 1;
+    f->dst = (w[0] >> 12) & 0x3f;
+    f->dst_rel = (w[0] >> 18) & 1;
+    for (int k = 0; k < 4; k++) {
+        f->dswz[k] = (dswz >> (3 * k)) & 7;
+    }
+    if (f->vtx) {
+        /*
+         * Xenos has "mini fetches" (dword 1 bit 30) that reuse the
+         * previous fetch's constant and address.  The Adreno 200 blob sets
+         * that bit on fetches that name their own constant, stride and
+         * index, and freedreno documents it as reserved: every fetch is a
+         * full one.  Strides and offsets are bytes, not dwords.
+         */
+        f->vconst = ((w[0] >> 20) & 0x1f) * 3 + ((w[0] >> 25) & 3);
+        f->scomp = (w[0] >> 30) & 3;
+        f->sign = (w[1] >> 12) & 1;
+        f->norm = !((w[1] >> 13) & 1);
+        f->round = (w[1] >> 15) & 1;
+        f->fmt = (w[1] >> 16) & 0x3f;
+        f->exp_adj = ((int32_t)(w[1] << 2)) >> 26;
+        f->stride = w[2] & 0xff;
+        f->offset = ((int32_t)(w[2] << 1)) >> 9;
+    } else {
+        uint32_t sswz = (w[0] >> 26) & 0x3f;
+
+        for (int k = 0; k < 3; k++) {
+            f->sswz[k] = (sswz >> (2 * k)) & 3;
+        }
+        f->tex.const_idx = (w[0] >> 20) & 0x1f;
+        f->tex.unnormalized = (w[0] >> 25) & 1;
+        f->tex.mag = (w[1] >> 12) & 3;
+        f->tex.min = (w[1] >> 14) & 3;
+        f->tex.mip = (w[1] >> 16) & 3;
+        f->tex.use_reg_lod = (w[1] >> 29) & 1;
+        f->tex.lod_bias = (((int32_t)(w[2] << 23)) >> 25) / 16.0f;
+        f->tex.offset[0] = (((int32_t)(w[2] << 11)) >> 27) * 0.5f;
+        f->tex.offset[1] = (((int32_t)(w[2] << 6)) >> 27) * 0.5f;
+        f->tex.offset[2] = (((int32_t)(w[2] << 1)) >> 27) * 0.5f;
+    }
+}
+
+static AdrenoProgram *decode_program(const uint32_t *code, uint32_t size,
+                                     int type)
+{
+    AdrenoProgram *p = g_new0(AdrenoProgram, 1);
+    uint32_t ninsn = MIN(size / 3 + 1, ADRENO_IMEM_INSNS);
+    uint32_t ncf_max = 2 * ninsn;
+
+    p->type = type;
+    p->ninsn = ninsn;
+    p->insn = g_new0(SqInsn, ninsn);
+    p->cf = g_new0(SqCf, ncf_max);
+    for (uint32_t i = 0; i < ncf_max; i++) {
+        const uint32_t *pair = &code[3 * (i >> 1)];
+        uint32_t d0, d1;
+        SqCf *c = &p->cf[i];
+
+        if (i & 1) {
+            d0 = (pair[1] >> 16) | (pair[2] << 16);
+            d1 = pair[2] >> 16;
+        } else {
+            d0 = pair[0];
+            d1 = pair[1] & 0xffff;
+        }
+        c->op = (d1 >> 12) & 0xf;
+        c->cond = (d1 >> 10) & 1;
+        c->bool_addr = (d1 >> 2) & 0xff;
+        p->ncf = i + 1;
+        switch (c->op) {
+        case CF_EXEC: case CF_EXEC_END: case CF_COND_EXEC:
+        case CF_COND_EXEC_END: case CF_COND_PRED_EXEC:
+        case CF_COND_PRED_EXEC_END: case CF_COND_EXEC_PRED_CLEAN:
+        case CF_COND_EXEC_PRED_CLEAN_END:
+            c->addr = d0 & 0xfff;
+            c->count = (d0 >> 12) & 7;
+            c->seq = (d0 >> 16) & 0xfff;
+            for (int k = 0; k < c->count; k++) {
+                uint32_t a = c->addr + k;
+                SqInsn *in;
+                const uint32_t *w;
+
+                if (a >= ninsn) {
+                    break;
+                }
+                in = &p->insn[a];
+                w = &code[3 * a];
+                in->valid = true;
+                in->fetch = (c->seq >> (2 * k)) & 1;
+                if (in->fetch) {
+                    decode_fetch(&in->f, w);
+                    in->predicated = (w[1] >> 31) & 1;
+                    in->pred_cond = (w[2] >> 31) & 1;
+                    if (!in->f.vtx && in->f.op == 1) {
+                        p->tex_mask |= 1u << in->f.tex.const_idx;
+                    }
+                } else {
+                    decode_alu(&in->alu, w);
+                    in->predicated = (w[1] >> 28) & 1;
+                    in->pred_cond = (w[1] >> 27) & 1;
+                    if ((in->alu.vop >= V_KILLE && in->alu.vop <= V_KILLNE) ||
+                        (in->alu.sop >= S_KILLE &&
+                         in->alu.sop <= S_KILLONE)) {
+                        p->kills = true;
+                    }
+                    if (in->alu.export && in->alu.vdst == 61) {
+                        p->exports_depth = true;
+                    }
+                }
+            }
+            /* the CF list ends before the first clause */
+            if (c->addr && 2u * c->addr < ncf_max) {
+                ncf_max = 2 * c->addr;
+            }
+            break;
+        case CF_LOOP_START:
+        case CF_LOOP_END:
+            c->addr = d0 & 0x1fff;
+            c->repeat = (d0 >> 13) & 1;
+            c->loop_id = (d0 >> 16) & 0x1f;
+            c->pred_break = (d0 >> 21) & 1;
+            break;
+        case CF_COND_CALL:
+        case CF_COND_JMP:
+            c->addr = d0 & 0x1fff;
+            c->uncond = (d0 >> 13) & 1;
+            c->predicated = (d0 >> 14) & 1;
+            break;
+        }
+    }
+    return p;
+}
+
+static void free_program(gpointer data)
+{
+    AdrenoProgram *p = data;
+
+    g_free(p->cf);
+    g_free(p->insn);
+    g_free(p);
+}
+
+/* The decoded program in instruction memory of this type, cached */
+const AdrenoProgram *adreno_program(MsmAdrenoState *s, int type)
+{
+    const uint32_t *code = s->imem[type];
+    uint32_t size = s->imem_size[type];
+    uint64_t h = 0xcbf29ce484222325ull ^ ((uint64_t)type << 40) ^ size;
+    AdrenoProgram *p;
+
+    for (uint32_t i = 0; i < size; i++) {
+        h = (h ^ code[i]) * 0x100000001b3ull;
+    }
+    if (!s->programs) {
+        s->programs = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                            g_free, free_program);
+    }
+    p = g_hash_table_lookup(s->programs, &h);
+    if (!p) {
+        uint64_t *key = g_new(uint64_t, 1);
+
+        if (g_hash_table_size(s->programs) > 512) {
+            g_hash_table_remove_all(s->programs);
+        }
+        p = decode_program(code, size, type);
+        *key = h;
+        g_hash_table_insert(s->programs, key, p);
+    }
+    return p;
+}
+
+void adreno_programs_free(MsmAdrenoState *s)
+{
+    if (s->programs) {
+        g_hash_table_destroy(s->programs);
+        s->programs = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Execution                                                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct SqExec {
+    AdrenoLanes *L;
+    const AdrenoProgram *p;
+    const uint32_t *regs;
+    uint32_t cbase;         /* SQ_VS_CONST / SQ_PS_CONST base */
+    uint32_t pred;          /* per-lane predicate */
+    int a0[AL];
+    float prev[AL];
+} SqExec;
+
+typedef struct SqCtl {
     int loop_depth;
     int loop_iter[4];
     uint32_t loop_const[4];
+    uint32_t loop_mask[4];
     int call_depth;
     uint32_t call_ret[4];
-    uint32_t vfetch_addr;       /* vertex address in bytes */
-} SqState;
+} SqCtl;
 
-static inline float flush_denorm(float f)
-{
-    return fpclassify(f) == FP_SUBNORMAL ? copysignf(0.0f, f) : f;
-}
+#define LANES(l) for (int l = 0; l < AL; l++)
 
 static inline float sat(float f)
 {
@@ -94,604 +432,524 @@ static inline float mul0(float a, float b)
     return (a != 0.0f && b != 0.0f) ? a * b : 0.0f;
 }
 
-static int loop_al(SqState *st)
+static int loop_al(const SqCtl *ctl)
 {
-    if (!st->loop_depth) {
+    uint32_t lc;
+
+    if (!ctl->loop_depth) {
         return 0;
     }
-    uint32_t lc = st->loop_const[st->loop_depth - 1];
-    int start = (lc >> 8) & 0xff;
-    int step = (int8_t)(lc >> 16);
-    return start + st->loop_iter[st->loop_depth - 1] * step;
+    lc = ctl->loop_const[ctl->loop_depth - 1];
+    return (int)((lc >> 8) & 0xff) +
+           ctl->loop_iter[ctl->loop_depth - 1] * (int8_t)(lc >> 16);
 }
 
-static float *temp_reg(SqState *st, uint32_t reg, bool rel)
+static inline const float *const_ptr(SqExec *X, int idx)
 {
-    int i = reg & 0x3f;
-
-    if (rel) {
-        i += loop_al(st);
-    }
-    return st->c->r[i & 63];
+    return (const float *)&X->regs[A2_SQ_CONSTANT_0 +
+                                   ((idx + X->cbase) & 511) * 4];
 }
 
-static void const_reg(SqState *st, uint32_t idx, bool addressed, bool a0rel,
-                      float out[4])
+static void read_src(SqExec *X, const SqSrc *sr, int al, float out[4][AL])
 {
-    MsmAdrenoState *s = st->c->s;
-    int i = idx;
-    uint32_t base;
+    AdrenoLanes *L = X->L;
 
-    if (addressed) {
-        i += a0rel ? st->a0 : loop_al(st);
+    if (sr->temp) {
+        int idx = (sr->reg + (sr->rel ? al : 0)) & 63;
+
+        for (int k = 0; k < 4; k++) {
+            memcpy(out[k], L->r[idx][sr->swz[k]], sizeof(float) * AL);
+        }
+    } else if (!sr->addressed || !sr->a0rel) {
+        const float *c = const_ptr(X, sr->reg + (sr->addressed ? al : 0));
+
+        for (int k = 0; k < 4; k++) {
+            float v = c[sr->swz[k]];
+
+            LANES(l) {
+                out[k][l] = v;
+            }
+        }
+    } else {
+        LANES(l) {
+            const float *c = const_ptr(X, sr->reg + X->a0[l]);
+
+            for (int k = 0; k < 4; k++) {
+                out[k][l] = c[sr->swz[k]];
+            }
+        }
     }
-    base = s->regs[st->c->type == A2_SHADER_VS ? A2_SQ_VS_CONST
-                                               : A2_SQ_PS_CONST] & 0x1ff;
-    i = (i + base) & 511;
+    if (sr->absv) {
+        for (int k = 0; k < 4; k++) {
+            LANES(l) {
+                out[k][l] = fabsf(out[k][l]);
+            }
+        }
+    }
+    if (sr->neg) {
+        for (int k = 0; k < 4; k++) {
+            LANES(l) {
+                out[k][l] = -out[k][l];
+            }
+        }
+    }
+}
+
+static void write_lanes(float dst[4][AL], const float v[4][AL], uint32_t cm,
+                        uint32_t mask)
+{
     for (int k = 0; k < 4; k++) {
-        out[k] = adreno_f(s->regs[A2_SQ_CONSTANT_0 + i * 4 + k]);
+        if (!(cm & (1 << k))) {
+            continue;
+        }
+        if (mask == (1u << AL) - 1) {
+            memcpy(dst[k], v[k], sizeof(float) * AL);
+        } else {
+            LANES(l) {
+                if (mask & (1u << l)) {
+                    dst[k][l] = v[k][l];
+                }
+            }
+        }
     }
 }
 
-static bool bool_const(SqState *st, uint32_t addr)
+static void do_export(SqExec *X, uint32_t reg, const float v[4][AL],
+                      uint32_t cm, uint32_t mask)
 {
-    uint32_t w = st->c->s->regs[A2_SQ_CF_BOOLEANS + (addr >> 5)];
+    AdrenoLanes *L = X->L;
 
-    return (w >> (addr & 31)) & 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Exports                                                             */
-/* ------------------------------------------------------------------ */
-
-static void do_export(SqState *st, uint32_t reg, const float v[4],
-                      uint32_t mask)
-{
-    AdrenoShaderCtx *c = st->c;
-    float *dst = NULL;
-    float tmp[4];
-
-    if (c->type == A2_SHADER_VS) {
-        AdrenoVertex *o = c->vout;
-
+    if (X->p->type == A2_SHADER_VS) {
         if (reg == 62) {
-            dst = o->pos;
+            write_lanes(L->pos, v, cm, mask);
         } else if (reg == 63) {
-            dst = tmp;
-            memset(tmp, 0, sizeof(tmp));
+            if (cm & 1) {
+                LANES(l) {
+                    if (mask & (1u << l)) {
+                        L->psize[l] = v[0][l];
+                    }
+                }
+            }
         } else if (reg < A2_MAX_INTERP) {
-            dst = o->interp[reg];
+            write_lanes(L->interp[reg], v, cm, mask);
         }
-        if (dst) {
-            for (int k = 0; k < 4; k++) {
-                if (mask & (1 << k)) {
-                    dst[k] = v[k];
-                }
+    } else if (reg == 0) {
+        write_lanes(L->color, v, cm, mask);
+    } else if (reg == 61 && (cm & 1)) {
+        LANES(l) {
+            if (mask & (1u << l)) {
+                L->depth[l] = v[0][l];
             }
-        }
-        if (reg == 63 && (mask & 1)) {
-            o->psize = v[0];
-        }
-    } else {
-        AdrenoPixelOut *o = c->pout;
-
-        if (reg < 4) {
-            dst = o->color[reg];
-            for (int k = 0; k < 4; k++) {
-                if (mask & (1 << k)) {
-                    dst[k] = v[k];
-                }
-            }
-        } else if (reg == 61 && (mask & 1)) {
-            o->depth = v[0];
-            o->depth_written = true;
         }
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* ALU                                                                 */
-/* ------------------------------------------------------------------ */
-
-static void alu_src(SqState *st, const uint32_t *w, int n, float out[4])
+/* lanes where v is == 0 (0), != 0 (1), > 0 (2), >= 0 (3) */
+static uint32_t lanes_where(const float *v, int op)
 {
-    /* n = 1..3 */
-    uint32_t reg = (w[2] >> (8 * (3 - n))) & 0xff;
-    uint32_t swiz = (w[1] >> (8 * (3 - n))) & 0xff;
-    bool is_temp = (w[2] >> (32 - n)) & 1;
-    bool neg = (w[1] >> (27 - n)) & 1;
-    bool absv;
-    float v[4];
+    uint32_t m = 0;
 
-    if (is_temp) {
-        memcpy(v, temp_reg(st, reg, reg & 0x40), sizeof(v));
-        absv = reg & 0x80;
-    } else {
-        /* const_0_rel_abs for the first constant, const_1 for later ones */
-        bool addressed;
-        bool t1 = (w[2] >> 31) & 1, t2 = (w[2] >> 30) & 1;
+    LANES(l) {
+        bool b;
 
-        switch (n) {
-        case 1:
-            addressed = (w[1] >> 31) & 1;
-            break;
-        case 2:
-            addressed = t1 ? (w[1] >> 31) & 1 : (w[1] >> 30) & 1;
-            break;
-        default:
-            addressed = (t1 && t2) ? (w[1] >> 31) & 1 : (w[1] >> 30) & 1;
-            break;
+        switch (op) {
+        case 0: b = v[l] == 0.0f; break;
+        case 1: b = v[l] != 0.0f; break;
+        case 2: b = v[l] > 0.0f; break;
+        default: b = v[l] >= 0.0f; break;
         }
-        const_reg(st, reg, addressed, (w[1] >> 29) & 1, v);
-        absv = (w[0] >> 7) & 1;
+        m |= (uint32_t)b << l;
     }
-    for (int k = 0; k < 4; k++) {
-        float f = flush_denorm(v[(((swiz >> (2 * k)) + k) & 3)]);
-
-        if (absv) {
-            f = fabsf(f);
-        }
-        out[k] = neg ? -f : f;
-    }
+    return m;
 }
 
-static void exec_alu(SqState *st, const uint32_t *w)
+static void exec_vector(SqExec *X, const SqAlu *a, int al, uint32_t mask,
+                        float vr[4][AL])
 {
-    AdrenoShaderCtx *c = st->c;
-    uint32_t vop = (w[2] >> 24) & 0x1f;
-    uint32_t sop = (w[0] >> 26) & 0x3f;
-    uint32_t vmask = (w[0] >> 16) & 0xf;
-    uint32_t smask = (w[0] >> 20) & 0xf;
-    bool export = (w[0] >> 15) & 1;
-    float a[4] = {0}, b[4] = {0}, cc[4] = {0}, vr[4] = {0};
-    float sa = 0, sb = 0, sr;
+    AdrenoLanes *L = X->L;
+    float s[3][4][AL];
     bool replicate = false;
-    uint32_t vres_mask = export ? vmask & ~smask : vmask;
-    uint32_t sres_mask = export ? smask & ~vmask : smask;
 
-    /* vector operation */
-    if (vres_mask || (vop >= V_PRED_SETE_PUSH && vop <= V_KILLNE) ||
-        vop == V_MOVA) {
-        int ns = vec_srcs[vop];
-
-        if (ns >= 1) {
-            alu_src(st, w, 1, a);
+    for (int n = 0; n < a->nvsrc; n++) {
+        read_src(X, &a->src[n], al, s[n]);
+    }
+    switch (a->vop) {
+#define VOP(expr) for (int k = 0; k < 4; k++) LANES(l) vr[k][l] = (expr)
+    case V_ADD:  VOP(s[0][k][l] + s[1][k][l]); break;
+    case V_MUL:  VOP(mul0(s[0][k][l], s[1][k][l])); break;
+    case V_MAX:  VOP(s[0][k][l] >= s[1][k][l] ? s[0][k][l] : s[1][k][l]);
+        break;
+    case V_MIN:  VOP(s[0][k][l] < s[1][k][l] ? s[0][k][l] : s[1][k][l]);
+        break;
+    case V_SETE:  VOP(s[0][k][l] == s[1][k][l]); break;
+    case V_SETGT: VOP(s[0][k][l] > s[1][k][l]); break;
+    case V_SETGTE: VOP(s[0][k][l] >= s[1][k][l]); break;
+    case V_SETNE: VOP(s[0][k][l] != s[1][k][l]); break;
+    case V_FRAC:  VOP(s[0][k][l] - floorf(s[0][k][l])); break;
+    case V_TRUNC: VOP(truncf(s[0][k][l])); break;
+    case V_FLOOR: VOP(floorf(s[0][k][l])); break;
+    case V_MULADD: VOP(mul0(s[0][k][l], s[1][k][l]) + s[2][k][l]); break;
+    case V_CNDE:  VOP(s[0][k][l] == 0.0f ? s[1][k][l] : s[2][k][l]); break;
+    case V_CNDGTE: VOP(s[0][k][l] >= 0.0f ? s[1][k][l] : s[2][k][l]); break;
+    case V_CNDGT: VOP(s[0][k][l] > 0.0f ? s[1][k][l] : s[2][k][l]); break;
+    case V_DOT4:
+        LANES(l) {
+            vr[0][l] = mul0(s[0][0][l], s[1][0][l]) +
+                       mul0(s[0][1][l], s[1][1][l]) +
+                       mul0(s[0][2][l], s[1][2][l]) +
+                       mul0(s[0][3][l], s[1][3][l]);
         }
-        if (ns >= 2) {
-            alu_src(st, w, 2, b);
+        replicate = true;
+        break;
+    case V_DOT3:
+        LANES(l) {
+            vr[0][l] = mul0(s[0][0][l], s[1][0][l]) +
+                       mul0(s[0][1][l], s[1][1][l]) +
+                       mul0(s[0][2][l], s[1][2][l]);
         }
-        if (ns >= 3) {
-            alu_src(st, w, 3, cc);
+        replicate = true;
+        break;
+    case V_DOT2ADD:
+        LANES(l) {
+            vr[0][l] = mul0(s[0][0][l], s[1][0][l]) +
+                       mul0(s[0][1][l], s[1][1][l]) + s[2][0][l];
         }
-        switch (vop) {
-        case V_ADD:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] + b[k];
-            break;
-        case V_MUL:
-            for (int k = 0; k < 4; k++) vr[k] = mul0(a[k], b[k]);
-            break;
-        case V_MAX:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] >= b[k] ? a[k] : b[k];
-            break;
-        case V_MIN:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] < b[k] ? a[k] : b[k];
-            break;
-        case V_SETE:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] == b[k];
-            break;
-        case V_SETGT:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] > b[k];
-            break;
-        case V_SETGTE:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] >= b[k];
-            break;
-        case V_SETNE:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] != b[k];
-            break;
-        case V_FRAC:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] - floorf(a[k]);
-            break;
-        case V_TRUNC:
-            for (int k = 0; k < 4; k++) vr[k] = truncf(a[k]);
-            break;
-        case V_FLOOR:
-            for (int k = 0; k < 4; k++) vr[k] = floorf(a[k]);
-            break;
-        case V_MULADD:
-            for (int k = 0; k < 4; k++) vr[k] = mul0(a[k], b[k]) + cc[k];
-            break;
-        case V_CNDE:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] == 0.0f ? b[k] : cc[k];
-            break;
-        case V_CNDGTE:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] >= 0.0f ? b[k] : cc[k];
-            break;
-        case V_CNDGT:
-            for (int k = 0; k < 4; k++) vr[k] = a[k] > 0.0f ? b[k] : cc[k];
-            break;
-        case V_DOT4:
-            vr[0] = mul0(a[0], b[0]) + mul0(a[1], b[1]) + mul0(a[2], b[2]) +
-                    mul0(a[3], b[3]);
-            replicate = true;
-            break;
-        case V_DOT3:
-            vr[0] = mul0(a[0], b[0]) + mul0(a[1], b[1]) + mul0(a[2], b[2]);
-            replicate = true;
-            break;
-        case V_DOT2ADD:
-            vr[0] = mul0(a[0], b[0]) + mul0(a[1], b[1]) + cc[0];
-            replicate = true;
-            break;
-        case V_CUBE: {
+        replicate = true;
+        break;
+    case V_CUBE:
+        LANES(l) {
             /* operand a is .zzxy */
-            float x = a[2], y = a[3], z = a[0];
+            float x = s[0][2][l], y = s[0][3][l], z = s[0][0][l];
             float ax = fabsf(x), ay = fabsf(y), az = fabsf(z);
 
             if (az >= ax && az >= ay) {
-                vr[0] = -y;
-                vr[1] = z < 0 ? -x : x;
-                vr[2] = z;
-                vr[3] = z < 0 ? 5.0f : 4.0f;
+                vr[0][l] = -y;
+                vr[1][l] = z < 0 ? -x : x;
+                vr[2][l] = 2 * z;
+                vr[3][l] = z < 0 ? 5.0f : 4.0f;
             } else if (ay >= ax) {
-                vr[0] = y < 0 ? -z : z;
-                vr[1] = x;
-                vr[2] = y;
-                vr[3] = y < 0 ? 3.0f : 2.0f;
+                vr[0][l] = y < 0 ? -z : z;
+                vr[1][l] = x;
+                vr[2][l] = 2 * y;
+                vr[3][l] = y < 0 ? 3.0f : 2.0f;
             } else {
-                vr[0] = -y;
-                vr[1] = x < 0 ? z : -z;
-                vr[2] = x;
-                vr[3] = x < 0 ? 1.0f : 0.0f;
+                vr[0][l] = -y;
+                vr[1][l] = x < 0 ? z : -z;
+                vr[2][l] = 2 * x;
+                vr[3][l] = x < 0 ? 1.0f : 0.0f;
             }
-            vr[2] *= 2.0f;
-            break;
         }
-        case V_MAX4:
-            vr[0] = MAX(MAX(a[0], a[1]), MAX(a[2], a[3]));
-            replicate = true;
-            break;
-        case V_PRED_SETE_PUSH:
-            st->pred = a[3] == 0.0f && b[3] == 0.0f;
-            vr[0] = (a[0] == 0.0f && b[0] == 0.0f) ? 0.0f : a[0] + 1.0f;
-            replicate = true;
-            break;
-        case V_PRED_SETNE_PUSH:
-            st->pred = a[3] == 0.0f && b[3] != 0.0f;
-            vr[0] = (a[0] == 0.0f && b[0] != 0.0f) ? 0.0f : a[0] + 1.0f;
-            replicate = true;
-            break;
-        case V_PRED_SETGT_PUSH:
-            st->pred = a[3] == 0.0f && b[3] > 0.0f;
-            vr[0] = (a[0] == 0.0f && b[0] > 0.0f) ? 0.0f : a[0] + 1.0f;
-            replicate = true;
-            break;
-        case V_PRED_SETGTE_PUSH:
-            st->pred = a[3] == 0.0f && b[3] >= 0.0f;
-            vr[0] = (a[0] == 0.0f && b[0] >= 0.0f) ? 0.0f : a[0] + 1.0f;
-            replicate = true;
-            break;
-        case V_KILLE:
-        case V_KILLGT:
-        case V_KILLGTE:
-        case V_KILLNE: {
-            bool kill = false;
+        break;
+    case V_MAX4:
+        LANES(l) {
+            vr[0][l] = MAX(MAX(s[0][0][l], s[0][1][l]),
+                           MAX(s[0][2][l], s[0][3][l]));
+        }
+        replicate = true;
+        break;
+    case V_PRED_SETE_PUSH:
+    case V_PRED_SETNE_PUSH:
+    case V_PRED_SETGT_PUSH:
+    case V_PRED_SETGTE_PUSH: {
+        uint32_t p = 0;
 
-            for (int k = 0; k < 4; k++) {
-                switch (vop) {
-                case V_KILLE: kill |= a[k] == b[k]; break;
-                case V_KILLGT: kill |= a[k] > b[k]; break;
-                case V_KILLGTE: kill |= a[k] >= b[k]; break;
-                default: kill |= a[k] != b[k]; break;
+        LANES(l) {
+            float b3 = s[1][3][l], b0 = s[1][0][l];
+            bool c3, c0;
+
+            switch (a->vop) {
+            case V_PRED_SETE_PUSH: c3 = b3 == 0; c0 = b0 == 0; break;
+            case V_PRED_SETNE_PUSH: c3 = b3 != 0; c0 = b0 != 0; break;
+            case V_PRED_SETGT_PUSH: c3 = b3 > 0; c0 = b0 > 0; break;
+            default: c3 = b3 >= 0; c0 = b0 >= 0; break;
+            }
+            p |= (uint32_t)(s[0][3][l] == 0.0f && c3) << l;
+            vr[0][l] = (s[0][0][l] == 0.0f && c0) ? 0.0f : s[0][0][l] + 1.0f;
+        }
+        X->pred = (X->pred & ~mask) | (p & mask);
+        replicate = true;
+        break;
+    }
+    case V_KILLE:
+    case V_KILLGT:
+    case V_KILLGTE:
+    case V_KILLNE: {
+        uint32_t kill = 0;
+
+        LANES(l) {
+            bool k = false;
+
+            for (int c = 0; c < 4; c++) {
+                float x = s[0][c][l], y = s[1][c][l];
+
+                switch (a->vop) {
+                case V_KILLE: k |= x == y; break;
+                case V_KILLGT: k |= x > y; break;
+                case V_KILLGTE: k |= x >= y; break;
+                default: k |= x != y; break;
                 }
             }
-            if (kill && c->pout) {
-                c->pout->killed = true;
+            kill |= (uint32_t)k << l;
+            vr[0][l] = k;
+        }
+        L->killed |= kill & mask;
+        replicate = true;
+        break;
+    }
+    case V_DST:
+        LANES(l) {
+            vr[0][l] = 1.0f;
+            vr[1][l] = mul0(s[0][1][l], s[1][1][l]);
+            vr[2][l] = s[0][2][l];
+            vr[3][l] = s[1][3][l];
+        }
+        break;
+    case V_MOVA:
+        LANES(l) {
+            if (mask & (1u << l)) {
+                X->a0[l] = (int)floorf(MIN(MAX(s[0][3][l], -256.0f), 255.0f) +
+                                       0.5f);
             }
-            vr[0] = kill;
-            replicate = true;
-            break;
         }
-        case V_DST:
-            vr[0] = 1.0f;
-            vr[1] = mul0(a[1], b[1]);
-            vr[2] = a[2];
-            vr[3] = b[3];
-            break;
-        case V_MOVA:
-            st->a0 = (int)floorf(MIN(MAX(a[3], -256.0f), 255.0f) + 0.5f);
-            for (int k = 0; k < 4; k++) vr[k] = a[k] >= b[k] ? a[k] : b[k];
-            break;
-        default:
-            break;
-        }
-        if (replicate) {
-            vr[1] = vr[2] = vr[3] = vr[0];
+        VOP(s[0][k][l] >= s[1][k][l] ? s[0][k][l] : s[1][k][l]);
+        break;
+    default:
+        memset(vr, 0, sizeof(float) * 4 * AL);
+        break;
+#undef VOP
+    }
+    if (replicate) {
+        memcpy(vr[1], vr[0], sizeof(vr[0]));
+        memcpy(vr[2], vr[0], sizeof(vr[0]));
+        memcpy(vr[3], vr[0], sizeof(vr[0]));
+    }
+    if (a->vclamp) {
+        for (int k = 0; k < 4; k++) {
+            LANES(l) {
+                vr[k][l] = sat(vr[k][l]);
+            }
         }
     }
+}
 
-    /* scalar operation: src3 .w (and .x), or c#.w and r#.x */
-    if (sop >= S_MUL_CONST_0 && sop <= S_SUB_CONST_1) {
-        uint32_t swiz = w[1] & 0xff;
-        uint32_t creg = w[2] & 0xff;
-        uint32_t treg = (sop & 1) | (((w[2] >> 29) & 1) << 1) | (swiz & 0x3c);
-        bool neg = (w[1] >> 24) & 1;
-        float cv[4];
+static void exec_scalar(SqExec *X, const SqAlu *a, int al, uint32_t mask)
+{
+    AdrenoLanes *L = X->L;
+    float sa[AL], sb[AL], r[AL];
+    float *pv = X->prev;
+    uint32_t pmask = 0;
+    bool sets_pred = false;
 
-        bool both_temp = ((w[2] >> 31) & 1) && ((w[2] >> 30) & 1);
+    if (a->sop == S_RETAIN_PREV || a->sop == S_41 || a->sop > S_RETAIN_PREV) {
+        return;
+    }
+    if (a->skind == 1) {
+        float v[4][AL];
 
-        const_reg(st, creg, both_temp ? (w[1] >> 31) & 1 : (w[1] >> 30) & 1,
-                  (w[1] >> 29) & 1, cv);
-        sa = flush_denorm(cv[((swiz >> 6) + 3) & 3]);
-        sb = flush_denorm(c->r[treg][swiz & 3]);
-        if (neg) {
-            sa = -sa;
-            sb = -sb;
+        read_src(X, &a->src[2], al, v);
+        memcpy(sa, v[3], sizeof(sa));
+        memcpy(sb, v[0], sizeof(sb));
+    } else if (a->skind == 2) {
+        float v[4][AL];
+
+        read_src(X, &a->sconst, al, v);
+        LANES(l) {
+            sa[l] = a->sneg ? -v[3][l] : v[3][l];
+            sb[l] = a->sneg ? -L->r[a->streg][a->stcomp][l]
+                            : L->r[a->streg][a->stcomp][l];
         }
-    } else if (sop != S_PRED_SET_CLR && sop != S_RETAIN_PREV &&
-               sop != S_41 && sop <= S_RETAIN_PREV) {
-        float v[4];
-
-        alu_src(st, w, 3, v);
-        sa = v[3];
-        sb = v[0];
+    } else {
+        memset(sa, 0, sizeof(sa));
+        memset(sb, 0, sizeof(sb));
     }
 
-    switch (sop) {
+    switch (a->sop) {
+#define SOP(expr) LANES(l) r[l] = (expr)
     case S_ADD: case S_ADD_CONST_0: case S_ADD_CONST_1:
-        st->prev = sa + sb;
-        break;
-    case S_ADD_PREV:
-        st->prev = sa + st->prev;
-        break;
+        SOP(sa[l] + sb[l]); break;
+    case S_ADD_PREV: SOP(sa[l] + pv[l]); break;
     case S_MUL: case S_MUL_CONST_0: case S_MUL_CONST_1:
-        st->prev = mul0(sa, sb);
-        break;
-    case S_MUL_PREV:
-        st->prev = mul0(sa, st->prev);
-        break;
+        SOP(mul0(sa[l], sb[l])); break;
+    case S_MUL_PREV: SOP(mul0(sa[l], pv[l])); break;
     case S_MUL_PREV2:
-        if (st->prev == -FLT_MAX || !isfinite(st->prev) || !isfinite(sb) ||
-            sb <= 0.0f) {
-            st->prev = -FLT_MAX;
-        } else {
-            st->prev = mul0(sa, st->prev);
-        }
+        SOP((pv[l] == -FLT_MAX || !isfinite(pv[l]) || !isfinite(sb[l]) ||
+             sb[l] <= 0.0f) ? -FLT_MAX : mul0(sa[l], pv[l]));
         break;
-    case S_MAX:
-        st->prev = sa >= sb ? sa : sb;
-        break;
-    case S_MIN:
-        st->prev = sa < sb ? sa : sb;
-        break;
-    case S_SETE:
-        st->prev = sa == 0.0f;
-        break;
-    case S_SETGT:
-        st->prev = sa > 0.0f;
-        break;
-    case S_SETGTE:
-        st->prev = sa >= 0.0f;
-        break;
-    case S_SETNE:
-        st->prev = sa != 0.0f;
-        break;
-    case S_FRAC:
-        st->prev = sa - floorf(sa);
-        break;
-    case S_TRUNC:
-        st->prev = truncf(sa);
-        break;
-    case S_FLOOR:
-        st->prev = floorf(sa);
-        break;
-    case S_EXP:
-        st->prev = exp2f(sa);
-        break;
-    case S_LOG_CLAMP:
-        st->prev = log2f(sa);
-        if (isinf(st->prev) && st->prev < 0) {
-            st->prev = -FLT_MAX;
-        }
-        break;
-    case S_LOG:
-        st->prev = log2f(sa);
-        break;
+    case S_MAX: SOP(sa[l] >= sb[l] ? sa[l] : sb[l]); break;
+    case S_MIN: SOP(sa[l] < sb[l] ? sa[l] : sb[l]); break;
+    case S_SETE: SOP(sa[l] == 0.0f); break;
+    case S_SETGT: SOP(sa[l] > 0.0f); break;
+    case S_SETGTE: SOP(sa[l] >= 0.0f); break;
+    case S_SETNE: SOP(sa[l] != 0.0f); break;
+    case S_FRAC: SOP(sa[l] - floorf(sa[l])); break;
+    case S_TRUNC: SOP(truncf(sa[l])); break;
+    case S_FLOOR: SOP(floorf(sa[l])); break;
+    case S_EXP: SOP(exp2f(sa[l])); break;
+    case S_LOG_CLAMP: SOP(sa[l] <= 0.0f ? -FLT_MAX : log2f(sa[l])); break;
+    case S_LOG: SOP(log2f(sa[l])); break;
     case S_RECIP_CLAMP:
-        st->prev = 1.0f / sa;
-        if (isinf(st->prev)) {
-            st->prev = st->prev < 0 ? -FLT_MAX : FLT_MAX;
-        }
-        break;
+        SOP(sa[l] == 0.0f ? copysignf(FLT_MAX, sa[l]) : 1.0f / sa[l]); break;
     case S_RECIP_FF:
-        st->prev = 1.0f / sa;
-        if (isinf(st->prev)) {
-            st->prev = st->prev < 0 ? -0.0f : 0.0f;
-        }
-        break;
-    case S_RECIP:
-        st->prev = 1.0f / sa;
-        break;
+        SOP(sa[l] == 0.0f ? copysignf(0.0f, sa[l]) : 1.0f / sa[l]); break;
+    case S_RECIP: SOP(1.0f / sa[l]); break;
     case S_RECIPSQ_CLAMP:
-        st->prev = 1.0f / sqrtf(sa);
-        if (isinf(st->prev)) {
-            st->prev = st->prev < 0 ? -FLT_MAX : FLT_MAX;
-        }
-        break;
-    case S_RECIPSQ_FF:
-        st->prev = 1.0f / sqrtf(sa);
-        if (isinf(st->prev)) {
-            st->prev = st->prev < 0 ? -0.0f : 0.0f;
-        }
-        break;
-    case S_RECIPSQ:
-        st->prev = 1.0f / sqrtf(sa);
-        break;
+        SOP(sa[l] == 0.0f ? FLT_MAX : 1.0f / sqrtf(sa[l])); break;
+    case S_RECIPSQ_FF: SOP(sa[l] == 0.0f ? 0.0f : 1.0f / sqrtf(sa[l])); break;
+    case S_RECIPSQ: SOP(1.0f / sqrtf(sa[l])); break;
     case S_MOVA:
-        st->a0 = (int)floorf(MIN(MAX(sa, -256.0f), 255.0f) + 0.5f);
-        st->prev = sa >= sb ? sa : sb;
-        break;
     case S_MOVA_FLOOR:
-        st->a0 = (int)floorf(MIN(MAX(sa, -256.0f), 255.0f));
-        st->prev = sa >= sb ? sa : sb;
+        LANES(l) {
+            float c = MIN(MAX(sa[l], -256.0f), 255.0f);
+
+            if (mask & (1u << l)) {
+                X->a0[l] = (int)floorf(a->sop == S_MOVA ? c + 0.5f : c);
+            }
+            r[l] = sa[l] >= sb[l] ? sa[l] : sb[l];
+        }
         break;
     case S_SUB: case S_SUB_CONST_0: case S_SUB_CONST_1:
-        st->prev = sa - sb;
-        break;
-    case S_SUB_PREV:
-        st->prev = sa - st->prev;
-        break;
+        SOP(sa[l] - sb[l]); break;
+    case S_SUB_PREV: SOP(sa[l] - pv[l]); break;
     case S_PRED_SETE:
-        st->pred = sa == 0.0f;
-        st->prev = !st->pred;
-        break;
     case S_PRED_SETNE:
-        st->pred = sa != 0.0f;
-        st->prev = !st->pred;
-        break;
     case S_PRED_SETGT:
-        st->pred = sa > 0.0f;
-        st->prev = !st->pred;
-        break;
     case S_PRED_SETGTE:
-        st->pred = sa >= 0.0f;
-        st->prev = !st->pred;
+        pmask = lanes_where(sa, a->sop == S_PRED_SETE ? 0 :
+                                a->sop == S_PRED_SETNE ? 1 :
+                                a->sop == S_PRED_SETGT ? 2 : 3);
+        sets_pred = true;
+        SOP(((pmask >> l) & 1) ? 0.0f : 1.0f);
         break;
     case S_PRED_SET_INV:
-        st->pred = sa == 1.0f;
-        st->prev = st->pred ? 0.0f : (sa == 0.0f ? 1.0f : sa);
-        break;
-    case S_PRED_SET_POP: {
-        float n = sa - 1.0f;
+        LANES(l) {
+            bool p = sa[l] == 1.0f;
 
-        st->pred = n <= 0.0f;
-        st->prev = st->pred ? 0.0f : n;
+            pmask |= (uint32_t)p << l;
+            r[l] = p ? 0.0f : (sa[l] == 0.0f ? 1.0f : sa[l]);
+        }
+        sets_pred = true;
         break;
-    }
+    case S_PRED_SET_POP:
+        LANES(l) {
+            float n = sa[l] - 1.0f;
+            bool p = n <= 0.0f;
+
+            pmask |= (uint32_t)p << l;
+            r[l] = p ? 0.0f : n;
+        }
+        sets_pred = true;
+        break;
     case S_PRED_SET_CLR:
-        st->pred = false;
-        st->prev = FLT_MAX;
+        SOP(FLT_MAX);
+        sets_pred = true;
         break;
     case S_PRED_SET_RESTORE:
-        st->pred = sa == 0.0f;
-        st->prev = st->pred ? 0.0f : sa;
+        pmask = lanes_where(sa, 0);
+        sets_pred = true;
+        SOP(((pmask >> l) & 1) ? 0.0f : sa[l]);
         break;
     case S_KILLE: case S_KILLGT: case S_KILLGTE: case S_KILLNE:
     case S_KILLONE: {
-        bool kill;
+        uint32_t kill = 0;
 
-        switch (sop) {
-        case S_KILLE: kill = sa == 0.0f; break;
-        case S_KILLGT: kill = sa > 0.0f; break;
-        case S_KILLGTE: kill = sa >= 0.0f; break;
-        case S_KILLNE: kill = sa != 0.0f; break;
-        default: kill = sa == 1.0f; break;
+        switch (a->sop) {
+        case S_KILLE: kill = lanes_where(sa, 0); break;
+        case S_KILLGT: kill = lanes_where(sa, 2); break;
+        case S_KILLGTE: kill = lanes_where(sa, 3); break;
+        case S_KILLNE: kill = lanes_where(sa, 1); break;
+        default:
+            LANES(l) {
+                kill |= (uint32_t)(sa[l] == 1.0f) << l;
+            }
+            break;
         }
-        if (kill && c->pout) {
-            c->pout->killed = true;
-        }
-        st->prev = kill;
+        L->killed |= kill & mask;
+        SOP((float)((kill >> l) & 1));
         break;
     }
-    case S_SQRT:
-        st->prev = sqrtf(sa);
-        break;
-    case S_SIN:
-        st->prev = sinf(sa);
-        break;
-    case S_COS:
-        st->prev = cosf(sa);
-        break;
-    default:
-        break;
+    case S_SQRT: SOP(sqrtf(sa[l])); break;
+    case S_SIN: SOP(sinf(sa[l])); break;
+    case S_COS: SOP(cosf(sa[l])); break;
+    default: SOP(0.0f); break;
+#undef SOP
     }
-
-    if ((w[0] >> 24) & 1) {
-        for (int k = 0; k < 4; k++) {
-            vr[k] = sat(vr[k]);
+    if (sets_pred) {
+        X->pred = (X->pred & ~mask) | (pmask & mask);
+    }
+    LANES(l) {
+        if (mask & (1u << l)) {
+            pv[l] = r[l];
         }
     }
-    sr = (w[0] >> 25) & 1 ? sat(st->prev) : st->prev;
+}
 
-    if (export) {
-        uint32_t c1 = vmask & smask;
-        uint32_t c0 = ((w[0] >> 14) & 1) ? 0xf & ~(vmask | smask) : 0;
-        float ev[4];
+static void exec_alu(SqExec *X, const SqAlu *a, int al, uint32_t mask)
+{
+    AdrenoLanes *L = X->L;
+    float vr[4][AL];
+    float sr[4][AL];
+
+    if (a->vrun) {
+        exec_vector(X, a, al, mask, vr);
+    }
+    exec_scalar(X, a, al, mask);
+    if (a->sres || a->export) {
+        LANES(l) {
+            float v = a->sclamp ? sat(X->prev[l]) : X->prev[l];
+
+            sr[0][l] = sr[1][l] = sr[2][l] = sr[3][l] = v;
+        }
+    }
+
+    if (a->export) {
+        float ev[4][AL];
 
         for (int k = 0; k < 4; k++) {
             uint32_t bit = 1u << k;
 
-            if (vres_mask & bit) {
-                ev[k] = vr[k];
-            } else if (sres_mask & bit) {
-                ev[k] = sr;
-            } else if (c1 & bit) {
-                ev[k] = 1.0f;
+            if (a->vres & bit) {
+                memcpy(ev[k], vr[k], sizeof(ev[k]));
+            } else if (a->sres & bit) {
+                memcpy(ev[k], sr[k], sizeof(ev[k]));
             } else {
-                ev[k] = 0.0f;
+                float c = (a->c1 & bit) ? 1.0f : 0.0f;
+
+                LANES(l) {
+                    ev[k][l] = c;
+                }
             }
         }
-        do_export(st, w[0] & 0x3f, ev, vres_mask | sres_mask | c0 | c1);
+        do_export(X, a->vdst, (const float (*)[AL])ev,
+                  a->vres | a->sres | a->c0 | a->c1, mask);
         return;
     }
-    if (vres_mask) {
-        float *d = temp_reg(st, w[0] & 0x3f, (w[0] >> 6) & 1);
-
-        for (int k = 0; k < 4; k++) {
-            if (vres_mask & (1 << k)) {
-                d[k] = vr[k];
-            }
-        }
+    if (a->vres) {
+        write_lanes(L->r[(a->vdst + (a->vdst_rel ? al : 0)) & 63],
+                    (const float (*)[AL])vr, a->vres, mask);
     }
-    if (sres_mask) {
-        float *d = temp_reg(st, (w[0] >> 8) & 0x3f, (w[0] >> 14) & 1);
-
-        for (int k = 0; k < 4; k++) {
-            if (sres_mask & (1 << k)) {
-                d[k] = sr;
-            }
-        }
+    if (a->sres) {
+        write_lanes(L->r[(a->sdst + (a->sdst_rel ? al : 0)) & 63],
+                    (const float (*)[AL])sr, a->sres, mask);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Fetch                                                               */
-/* ------------------------------------------------------------------ */
-
-static void fetch_store(SqState *st, const uint32_t *w, const float v[4])
+static void fetch_store(SqExec *X, const SqFetch *f, int al,
+                        const float v[4][AL], uint32_t mask)
 {
-    float *d = temp_reg(st, (w[0] >> 12) & 0x3f, (w[0] >> 18) & 1);
-    uint32_t swiz = w[1] & 0xfff;
+    float (*d)[AL] = X->L->r[(f->dst + (f->dst_rel ? al : 0)) & 63];
 
     for (int k = 0; k < 4; k++) {
-        switch ((swiz >> (3 * k)) & 7) {
-        case 0: case 1: case 2: case 3:
-            d[k] = v[(swiz >> (3 * k)) & 3];
-            break;
-        case 5:
-            d[k] = 1.0f;
-            break;
-        case 7:
-            break;
-        default:
-            d[k] = 0.0f;
-            break;
+        unsigned sel = f->dswz[k];
+
+        if (sel == 7) {
+            continue;
+        }
+        LANES(l) {
+            if (mask & (1u << l)) {
+                d[k][l] = sel < 4 ? v[sel][l] : (sel == 5 ? 1.0f : 0.0f);
+            }
         }
     }
-}
-
-static float half_to_float(uint16_t h)
-{
-    uint32_t sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
-    float f;
-
-    if (exp == 0) {
-        f = ldexpf(man, -24);
-    } else if (exp == 31) {
-        f = man ? NAN : INFINITY;
-    } else {
-        f = ldexpf(man | 0x400, (int)exp - 25);
-    }
-    return sign ? -f : f;
 }
 
 /*
@@ -699,7 +957,7 @@ static float half_to_float(uint16_t h)
  * unsigned/signed, normalized or not.
  */
 static void unpack_fixed(const uint32_t *dw, int nc, const uint8_t *bits,
-                         bool sign, bool norm, float out[4])
+                         bool sign, bool norm, float *out)
 {
     int pos = 0;
 
@@ -712,7 +970,8 @@ static void unpack_fixed(const uint32_t *dw, int nc, const uint8_t *bits,
 
             out[k] = sv;
             if (norm) {
-                out[k] = MAX(-1.0f, out[k] / (float)((1u << (bits[k] - 1)) - 1));
+                out[k] = MAX(-1.0f, out[k] /
+                                    (float)((1u << (bits[k] - 1)) - 1));
             }
         } else {
             out[k] = v;
@@ -724,322 +983,324 @@ static void unpack_fixed(const uint32_t *dw, int nc, const uint8_t *bits,
     }
 }
 
-static void exec_vfetch(SqState *st, const uint32_t *w)
+static int vfetch_dwords(unsigned fmt)
 {
-    MsmAdrenoState *s = st->c->s;
-    /*
-     * Xenos has "mini fetches" (dword 1 bit 30) that reuse the previous
-     * fetch's constant and address.  The Adreno 200 blob sets that bit on
-     * fetches that name their own constant, stride and index, and
-     * freedreno documents it as reserved: every fetch is a full one.
-     */
-    uint32_t cidx = ((w[0] >> 20) & 0x1f) * 3 + ((w[0] >> 25) & 3);
-    uint32_t fc0 = s->regs[A2_SQ_FETCH_0 + cidx * 2];
-    uint32_t fc1 = s->regs[A2_SQ_FETCH_0 + cidx * 2 + 1];
-    uint32_t fmt = (w[1] >> 16) & 0x3f;
-    bool sign = (w[1] >> 12) & 1;
-    bool norm = !((w[1] >> 13) & 1);
-    int exp_adj = ((int32_t)(w[1] << 2)) >> 26;
-    int32_t offset = ((int32_t)(w[2] << 1)) >> 9;
-    uint32_t dw[5] = {0};
-    float v[4] = {0, 0, 0, 1};
-    int ndw;
-
-    {
-        float *src = temp_reg(st, (w[0] >> 5) & 0x3f, (w[0] >> 11) & 1);
-        float idx = src[(w[0] >> 30) & 3];
-        uint32_t stride = w[2] & 0xff;
-
-        if ((w[1] >> 15) & 1) {
-            idx += 0.5f;
-        }
-        /* unlike Xenos, a2xx strides and offsets are in bytes */
-        st->vfetch_addr = (fc0 & ~3u) + stride * (uint32_t)(int)floorf(idx);
-    }
-
     switch (fmt) {
     case 2: case 10: case 6: case 24: case 25: case 7: case 21: case 16:
     case 30: case 31: case 33: case 36:
-        ndw = 1;
-        break;
+        return 1;
     case 26: case 32: case 34: case 37:
-        ndw = 2;
-        break;
+        return 2;
     case 57:
-        ndw = 3;
-        break;
-    default:
-        ndw = 4;
-        break;
+        return 3;
     }
-    adreno_read(s, st->vfetch_addr + offset, dw, ndw * 4);
-    for (int k = 0; k < ndw; k++) {
-        dw[k] = le32_to_cpu(dw[k]);
-        switch (fc1 & 3) {      /* endian swap */
-        case 1:
-            dw[k] = ((dw[k] & 0x00ff00ff) << 8) | ((dw[k] >> 8) & 0x00ff00ff);
-            break;
-        case 2:
-            dw[k] = bswap32(dw[k]);
-            break;
-        case 3:
-            dw[k] = (dw[k] << 16) | (dw[k] >> 16);
-            break;
-        }
-    }
+    return 4;
+}
 
-    switch (fmt) {
+static void decode_vertex(const SqFetch *f, uint32_t *dw, float *v)
+{
+    switch (f->fmt) {
     case 2:     /* FMT_8 */
-        unpack_fixed(dw, 1, (const uint8_t[]){8}, sign, norm, v);
+        unpack_fixed(dw, 1, (const uint8_t[]){8}, f->sign, f->norm, v);
         break;
     case 10:    /* FMT_8_8 */
-        unpack_fixed(dw, 2, (const uint8_t[]){8, 8}, sign, norm, v);
+        unpack_fixed(dw, 2, (const uint8_t[]){8, 8}, f->sign, f->norm, v);
         break;
     case 16:    /* FMT_8_8_8 */
-        unpack_fixed(dw, 3, (const uint8_t[]){8, 8, 8}, sign, norm, v);
+        unpack_fixed(dw, 3, (const uint8_t[]){8, 8, 8}, f->sign, f->norm, v);
         break;
     case 6:     /* FMT_8_8_8_8 */
-        unpack_fixed(dw, 4, (const uint8_t[]){8, 8, 8, 8}, sign, norm, v);
-        break;
-    case 7:     /* FMT_2_10_10_10 */
-        unpack_fixed(dw, 4, (const uint8_t[]){10, 10, 10, 2}, sign, norm, v);
-        break;
-    case 21:    /* FMT_10_10_10_2 */
-        unpack_fixed(dw, 4, (const uint8_t[]){2, 10, 10, 10}, sign, norm, v);
-        break;
-    case 24:    /* FMT_16 */
-        unpack_fixed(dw, 1, (const uint8_t[]){16}, sign, norm, v);
-        break;
-    case 25:    /* FMT_16_16 */
-        unpack_fixed(dw, 2, (const uint8_t[]){16, 16}, sign, norm, v);
-        break;
-    case 26:    /* FMT_16_16_16_16 */
-        unpack_fixed(dw, 4, (const uint8_t[]){16, 16, 16, 16}, sign, norm,
+        unpack_fixed(dw, 4, (const uint8_t[]){8, 8, 8, 8}, f->sign, f->norm,
                      v);
         break;
+    case 7:     /* FMT_2_10_10_10 */
+        unpack_fixed(dw, 4, (const uint8_t[]){10, 10, 10, 2}, f->sign,
+                     f->norm, v);
+        break;
+    case 21:    /* FMT_10_10_10_2 */
+        unpack_fixed(dw, 4, (const uint8_t[]){2, 10, 10, 10}, f->sign,
+                     f->norm, v);
+        break;
+    case 24:    /* FMT_16 */
+        unpack_fixed(dw, 1, (const uint8_t[]){16}, f->sign, f->norm, v);
+        break;
+    case 25:    /* FMT_16_16 */
+        unpack_fixed(dw, 2, (const uint8_t[]){16, 16}, f->sign, f->norm, v);
+        break;
+    case 26:    /* FMT_16_16_16_16 */
+        unpack_fixed(dw, 4, (const uint8_t[]){16, 16, 16, 16}, f->sign,
+                     f->norm, v);
+        break;
     case 30:    /* FMT_16_FLOAT */
-        v[0] = half_to_float(dw[0]);
+        v[0] = adreno_half_to_float(dw[0]);
         break;
     case 31:    /* FMT_16_16_FLOAT */
-        v[0] = half_to_float(dw[0]);
-        v[1] = half_to_float(dw[0] >> 16);
+        v[0] = adreno_half_to_float(dw[0]);
+        v[1] = adreno_half_to_float(dw[0] >> 16);
         break;
     case 32:    /* FMT_16_16_16_16_FLOAT */
-        v[0] = half_to_float(dw[0]);
-        v[1] = half_to_float(dw[0] >> 16);
-        v[2] = half_to_float(dw[1]);
-        v[3] = half_to_float(dw[1] >> 16);
+        v[0] = adreno_half_to_float(dw[0]);
+        v[1] = adreno_half_to_float(dw[0] >> 16);
+        v[2] = adreno_half_to_float(dw[1]);
+        v[3] = adreno_half_to_float(dw[1] >> 16);
         break;
     case 33: case 34: case 35:  /* FMT_32[_32[_32_32]] */
-        for (int k = 0; k < fmt - 32; k++) {
-            if (sign) {
-                v[k] = (int32_t)dw[k];
-                if (norm) {
-                    v[k] /= 2147483647.0f;
-                }
-            } else {
-                v[k] = dw[k];
-                if (norm) {
-                    v[k] /= 4294967295.0f;
-                }
+        for (int k = 0; k < f->fmt - 32; k++) {
+            v[k] = f->sign ? (float)(int32_t)dw[k] : (float)dw[k];
+            if (f->norm) {
+                v[k] /= f->sign ? 2147483647.0f : 4294967295.0f;
             }
         }
         break;
     case 36: case 37: case 38: case 57:    /* 32-bit floats */
-        for (int k = 0; k < ndw; k++) {
+        for (int k = 0; k < vfetch_dwords(f->fmt); k++) {
             v[k] = adreno_f(dw[k]);
         }
         break;
-    default:
-        adreno_trace(s, "sq: vertex format %u\n", fmt);
-        break;
     }
-    if (exp_adj) {
-        for (int k = 0; k < 4; k++) {
-            v[k] = ldexpf(v[k], exp_adj);
-        }
-    }
-    fetch_store(st, w, v);
 }
 
-static void exec_tfetch(SqState *st, const uint32_t *w)
+static void exec_vfetch(SqExec *X, const SqFetch *f, int al, uint32_t mask)
 {
-    uint32_t op = w[0] & 0x1f;
-    float *src = temp_reg(st, (w[0] >> 5) & 0x3f, (w[0] >> 11) & 1);
-    uint32_t sswiz = (w[0] >> 26) & 0x3f;
-    float coord[4], out[4] = {0, 0, 0, 0};
+    AdrenoLanes *L = X->L;
+    uint32_t fc0 = X->regs[A2_SQ_FETCH_0 + f->vconst * 2];
+    uint32_t fc1 = X->regs[A2_SQ_FETCH_0 + f->vconst * 2 + 1];
+    float (*src)[AL] = L->r[(f->src + (f->src_rel ? al : 0)) & 63];
+    int ndw = vfetch_dwords(f->fmt);
+    float v[4][AL];
 
-    if (op != 1) {
+    LANES(l) {
+        uint32_t dw[5] = {0};
+        float o[4] = {0, 0, 0, 1};
+        float idx;
+
+        if (!(mask & (1u << l))) {
+            continue;
+        }
+        idx = src[f->scomp][l] + (f->round ? 0.5f : 0.0f);
+        adreno_tlb_read(L->s, L->tlb, (fc0 & ~3u) +
+                        f->stride * (uint32_t)(int)floorf(idx) + f->offset,
+                        dw, ndw * 4);
+        for (int k = 0; k < ndw; k++) {
+            dw[k] = le32_to_cpu(dw[k]);
+            switch (fc1 & 3) {      /* endian swap */
+            case 1:
+                dw[k] = ((dw[k] & 0x00ff00ff) << 8) |
+                        ((dw[k] >> 8) & 0x00ff00ff);
+                break;
+            case 2:
+                dw[k] = bswap32(dw[k]);
+                break;
+            case 3:
+                dw[k] = (dw[k] << 16) | (dw[k] >> 16);
+                break;
+            }
+        }
+        decode_vertex(f, dw, o);
+        for (int k = 0; k < 4; k++) {
+            v[k][l] = f->exp_adj ? ldexpf(o[k], f->exp_adj) : o[k];
+        }
+    }
+    fetch_store(X, f, al, (const float (*)[AL])v, mask);
+}
+
+static void exec_tfetch(SqExec *X, const SqFetch *f, int al, uint32_t mask)
+{
+    AdrenoLanes *L = X->L;
+    float (*src)[AL] = L->r[(f->src + (f->src_rel ? al : 0)) & 63];
+    float coord[3][AL], out[4][AL];
+
+    if (f->op != 1) {
         /* LOD/gradient queries and setters: not modelled */
-        if (op < 24) {
-            fetch_store(st, w, out);
+        if (f->op < 24) {
+            memset(out, 0, sizeof(out));
+            fetch_store(X, f, al, (const float (*)[AL])out, mask);
         }
         return;
     }
     for (int k = 0; k < 3; k++) {
-        coord[k] = src[(sswiz >> (2 * k)) & 3];
+        memcpy(coord[k], src[f->sswz[k]], sizeof(coord[k]));
     }
-    coord[3] = 0;
-    adreno_sample_texture(st->c->s, (w[0] >> 20) & 0x1f, coord, w[1], w[2],
-                          out);
-    fetch_store(st, w, out);
+    adreno_sample(L, &f->tex, coord, mask, out);
+    fetch_store(X, f, al, (const float (*)[AL])out, mask);
 }
 
-/* ------------------------------------------------------------------ */
-/* Control flow                                                        */
-/* ------------------------------------------------------------------ */
-
-static void exec_clause(SqState *st, uint32_t addr, uint32_t count,
-                        uint32_t seq)
+static void exec_clause(SqExec *X, const SqCf *c, const SqCtl *ctl,
+                        uint32_t mask)
 {
-    const AdrenoShaderCtx *c = st->c;
+    const AdrenoProgram *p = X->p;
+    int al = loop_al(ctl);
 
-    for (uint32_t i = 0; i < count; i++) {
-        const uint32_t *w = &c->code[((addr + i) % ADRENO_IMEM_INSNS) * 3];
-        if ((seq >> (2 * i)) & 1) {
-            /* fetch */
-            if (((w[1] >> 31) & 1) && (((w[2] >> 31) & 1) != st->pred)) {
+    for (int i = 0; i < c->count; i++) {
+        uint32_t a = c->addr + i;
+        const SqInsn *in;
+        uint32_t m = mask;
+
+        if (a >= p->ninsn) {
+            return;
+        }
+        in = &p->insn[a];
+        if (!in->valid) {
+            continue;
+        }
+        if (in->predicated) {
+            m &= in->pred_cond ? X->pred : ~X->pred;
+            if (!m) {
                 continue;
             }
-            if ((w[0] & 0x1f) == 0) {
-                exec_vfetch(st, w);
+        }
+        if (in->fetch) {
+            if (in->f.vtx) {
+                exec_vfetch(X, &in->f, al, m);
             } else {
-                exec_tfetch(st, w);
+                exec_tfetch(X, &in->f, al, m);
             }
         } else {
-            if (((w[1] >> 28) & 1) && (((w[1] >> 27) & 1) != st->pred)) {
-                continue;
-            }
-            exec_alu(st, w);
+            exec_alu(X, &in->alu, al, m);
         }
     }
 }
 
-void adreno_shader_run(AdrenoShaderCtx *c)
+static bool bool_const(SqExec *X, uint32_t addr)
 {
-    SqState st = { .c = c };
-    uint32_t pc = 0;
+    return (X->regs[A2_SQ_CF_BOOLEANS + (addr >> 5)] >> (addr & 31)) & 1;
+}
+
+static void run(SqExec *X, uint32_t pc, uint32_t mask, SqCtl ctl, int depth)
+{
+    const AdrenoProgram *p = X->p;
     int guard = 0;
 
-    while (guard++ < 65536) {
-        const uint32_t *pair = &c->code[3 * ((pc >> 1) % ADRENO_IMEM_INSNS)];
-        uint32_t d0, d1, op;
+    while (mask && pc < p->ncf && guard++ < 65536) {
+        const SqCf *c = &p->cf[pc];
         uint32_t next = pc + 1;
 
-        if (pc & 1) {
-            d0 = (pair[1] >> 16) | (pair[2] << 16);
-            d1 = pair[2] >> 16;
-        } else {
-            d0 = pair[0];
-            d1 = pair[1] & 0xffff;
-        }
-        op = (d1 >> 12) & 0xf;
+        switch (c->op) {
+        case CF_EXEC: case CF_EXEC_END:
+        case CF_COND_EXEC: case CF_COND_EXEC_END:
+        case CF_COND_PRED_EXEC: case CF_COND_PRED_EXEC_END:
+        case CF_COND_EXEC_PRED_CLEAN: case CF_COND_EXEC_PRED_CLEAN_END: {
+            uint32_t m = mask;
 
-        switch (op) {
-        case CF_NOP:
-        case CF_ALLOC:
-        case CF_MARK_VS_FETCH_DONE:
-            break;
-        case CF_EXEC:
-        case CF_EXEC_END:
-        case CF_COND_EXEC:
-        case CF_COND_EXEC_END:
-        case CF_COND_PRED_EXEC:
-        case CF_COND_PRED_EXEC_END:
-        case CF_COND_EXEC_PRED_CLEAN:
-        case CF_COND_EXEC_PRED_CLEAN_END: {
-            bool run = true;
-
-            if (op == CF_COND_EXEC || op == CF_COND_EXEC_END ||
-                op == CF_COND_EXEC_PRED_CLEAN ||
-                op == CF_COND_EXEC_PRED_CLEAN_END) {
-                run = ((d1 >> 10) & 1) == bool_const(&st, (d1 >> 2) & 0xff);
-            } else if (op == CF_COND_PRED_EXEC ||
-                       op == CF_COND_PRED_EXEC_END) {
-                run = ((d1 >> 10) & 1) == st.pred;
+            if (c->op == CF_COND_EXEC || c->op == CF_COND_EXEC_END ||
+                c->op == CF_COND_EXEC_PRED_CLEAN ||
+                c->op == CF_COND_EXEC_PRED_CLEAN_END) {
+                if (c->cond != bool_const(X, c->bool_addr)) {
+                    m = 0;
+                }
+            } else if (c->op == CF_COND_PRED_EXEC ||
+                       c->op == CF_COND_PRED_EXEC_END) {
+                m &= c->cond ? X->pred : ~X->pred;
             }
-            if (run) {
-                exec_clause(&st, d0 & 0xfff, (d0 >> 12) & 7,
-                            (d0 >> 16) & 0xfff);
+            if (m) {
+                exec_clause(X, c, &ctl, m);
             }
-            if (op == CF_EXEC_END || op == CF_COND_EXEC_END ||
-                op == CF_COND_PRED_EXEC_END ||
-                op == CF_COND_EXEC_PRED_CLEAN_END) {
+            if (c->op == CF_EXEC_END || c->op == CF_COND_EXEC_END ||
+                c->op == CF_COND_PRED_EXEC_END ||
+                c->op == CF_COND_EXEC_PRED_CLEAN_END) {
                 return;
             }
             break;
         }
         case CF_LOOP_START: {
-            uint32_t id = (d0 >> 16) & 0x1f;
-            uint32_t lc = c->s->regs[A2_SQ_CF_LOOP + id];
+            uint32_t lc = X->regs[A2_SQ_CF_LOOP + c->loop_id];
+            int d = ctl.loop_depth;
 
-            if (st.loop_depth >= 4) {
-                next = d0 & 0x1fff;
+            if (d >= 4) {
+                next = c->addr;
                 break;
             }
-            st.loop_const[st.loop_depth] = lc;
-            if (!((d0 >> 13) & 1)) {
-                st.loop_iter[st.loop_depth] = 0;
+            ctl.loop_const[d] = lc;
+            if (!c->repeat) {
+                ctl.loop_iter[d] = 0;
             }
-            if ((uint32_t)st.loop_iter[st.loop_depth] >= (lc & 0xff)) {
-                next = d0 & 0x1fff;
+            if ((uint32_t)ctl.loop_iter[d] >= (lc & 0xff)) {
+                next = c->addr;
                 break;
             }
-            st.loop_depth++;
+            ctl.loop_mask[d] = mask;
+            ctl.loop_depth++;
             break;
         }
         case CF_LOOP_END: {
-            int d = st.loop_depth - 1;
-            uint32_t iter;
+            int d = ctl.loop_depth - 1;
+            uint32_t cont = mask;
 
             if (d < 0) {
                 break;
             }
-            iter = ++st.loop_iter[d];
-            if (iter < (st.loop_const[d] & 0xff) &&
-                (!((d0 >> 21) & 1) || ((d1 >> 10) & 1) != st.pred)) {
-                next = d0 & 0x1fff;
+            ctl.loop_iter[d]++;
+            if (c->pred_break) {
+                /* lanes whose predicate equals the condition leave */
+                cont &= c->cond ? ~X->pred : X->pred;
+            }
+            if ((uint32_t)ctl.loop_iter[d] < (ctl.loop_const[d] & 0xff) &&
+                cont) {
+                mask = cont;
+                next = c->addr;
                 break;
             }
-            st.loop_depth--;
+            mask = ctl.loop_mask[d];
+            ctl.loop_depth--;
             break;
         }
         case CF_COND_CALL:
         case CF_COND_JMP: {
-            bool take = true;
+            uint32_t take = mask;
 
-            if (!((d0 >> 13) & 1)) {
-                if ((d0 >> 14) & 1) {
-                    take = ((d1 >> 10) & 1) == st.pred;
-                } else {
-                    take = ((d1 >> 10) & 1) ==
-                           bool_const(&st, (d1 >> 2) & 0xff);
+            if (!c->uncond) {
+                if (c->predicated) {
+                    take &= c->cond ? X->pred : ~X->pred;
+                } else if (c->cond != bool_const(X, c->bool_addr)) {
+                    take = 0;
                 }
             }
             if (!take) {
                 break;
             }
-            if (op == CF_COND_CALL) {
-                if (st.call_depth >= 4) {
+            if (c->op == CF_COND_CALL) {
+                if (ctl.call_depth >= 4) {
                     break;
                 }
-                st.call_ret[st.call_depth++] = pc + 1;
+                ctl.call_ret[ctl.call_depth++] = pc + 1;
             }
-            next = d0 & 0x1fff;
+            if (take != mask) {
+                /* the lanes split: the taken ones run on by themselves */
+                if (depth < 8) {
+                    run(X, c->addr, take, ctl, depth + 1);
+                }
+                if (c->op == CF_COND_CALL) {
+                    ctl.call_depth--;
+                }
+                mask &= ~take;
+                break;
+            }
+            next = c->addr;
             break;
         }
         case CF_RETURN:
-            if (st.call_depth) {
-                next = st.call_ret[--st.call_depth];
+            if (ctl.call_depth) {
+                next = ctl.call_ret[--ctl.call_depth];
             }
+            break;
+        default:
             break;
         }
         pc = next;
     }
-    adreno_trace(c->s, "sq: shader did not end\n");
 }
 
-const char *adreno_shader_disasm_type(int type)
+void adreno_shader_exec(AdrenoLanes *L, uint32_t mask)
 {
-    return type == A2_SHADER_VS ? "vs" : "ps";
+    MsmAdrenoState *s = L->s;
+    SqExec X = {
+        .L = L, .p = L->prog, .regs = s->regs,
+        .cbase = s->regs[L->prog->type == A2_SHADER_VS ? A2_SQ_VS_CONST
+                                                      : A2_SQ_PS_CONST] &
+                 0x1ff,
+    };
+    SqCtl ctl = { 0 };
+
+    L->killed = 0;
+    run(&X, 0, mask, ctl, 0);
 }
