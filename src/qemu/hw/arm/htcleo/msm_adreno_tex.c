@@ -300,6 +300,7 @@ typedef struct TexLevel {
     uint32_t base;          /* GPU address */
     uint32_t pitch;         /* in blocks */
     uint32_t w, h;          /* in texels */
+    uint32_t ox, oy;        /* block offset inside a packed mip tail */
 } TexLevel;
 
 typedef struct TexDesc {
@@ -311,6 +312,7 @@ typedef struct TexDesc {
     unsigned dim;
     uint32_t w0, h0;
     int nlevels;
+    int packed_level;       /* first level of the packed tail, or 99 */
     unsigned clamp[2];
     unsigned sign[4];
     bool integer;
@@ -320,31 +322,83 @@ typedef struct TexDesc {
     uint32_t face_size;     /* cube maps: bytes per face of level 0 */
 } TexDesc;
 
+static unsigned log2_ceil(uint32_t v)
+{
+    return v <= 1 ? 0 : 32 - clz32(v - 1);
+}
+
+/*
+ * Block offset of a level inside the 32x32 tile its packed mip tail
+ * shares (Xenos: Xenia's texture_util.cc GetPackedMipOffset, 2D).
+ */
+static void packed_offset(uint32_t w, uint32_t h, int level, uint32_t *x,
+                          uint32_t *y)
+{
+    unsigned lw = log2_ceil(w), lh = log2_ceil(h);
+    unsigned ls = MIN(lw, lh);
+    unsigned base = ls > 4 ? ls - 4 : 0;
+    unsigned pm = level - base;
+
+    *x = *y = 0;
+    if (pm < 3) {
+        if (lw > lh) {
+            *y = 16 >> pm;
+        } else {
+            *x = 16 >> pm;
+        }
+    } else if (lw > lh) {
+        *x = (1u << (lw - base)) >> (pm - 2);
+    } else {
+        *y = (1u << (lh - base)) >> (pm - 2);
+    }
+}
+
+/*
+ * Level 0 is at the base address with the constant's pitch.  Mips start at
+ * the mip address; each is a level of the texture rounded up to a power of
+ * two, its pitch and height aligned to 32 blocks, 4 KiB aligned.  With
+ * SQ_TEX_5 PACKED_MIPS the levels whose smaller side is 16 or less share
+ * one 32x32-block tile (as on Xenos).
+ */
 static void tex_level(const TexDesc *t, int level, TexLevel *lv)
 {
     const uint32_t *fc = t->fc;
     uint32_t bw = t->tf.bw;
+    int stored = MIN(level, t->packed_level);
 
     lv->w = MAX(t->w0 >> level, 1u);
     lv->h = MAX(t->h0 >> level, 1u);
-    if (level == 0) {
+    lv->ox = lv->oy = 0;
+    if (level >= t->packed_level) {
+        /* in blocks, also for the compressed formats */
+        packed_offset(t->w0, t->h0, level, &lv->ox, &lv->oy);
+    }
+    if (stored == 0) {
         lv->base = fc[1] & 0xfffff000;
         lv->pitch = ((fc[0] >> 22) & 0x1ff) * 32;
         lv->pitch = lv->pitch ? lv->pitch / bw : DIV_ROUND_UP(lv->w, bw);
+        if (t->packed_level == 0) {
+            lv->pitch = ROUND_UP(lv->pitch, 32);
+        }
         return;
     }
     lv->base = fc[5] & 0xfffff000;
-    for (int k = 1; k <= level; k++) {
-        uint32_t wb = DIV_ROUND_UP(MAX(t->w0 >> k, 1u), bw);
-        uint32_t hb = DIV_ROUND_UP(MAX(t->h0 >> k, 1u), bw);
-        uint32_t pitch = pow2ceil(ROUND_UP(wb, 32));
-        uint32_t rows = pow2ceil(ROUND_UP(hb, 32));
+    for (int k = 1; k <= stored; k++) {
+        uint32_t wt = MAX(pow2ceil(t->w0) >> k, 1u);
+        uint32_t ht = MAX(pow2ceil(t->h0) >> k, 1u);
+        uint32_t pitch = ROUND_UP(DIV_ROUND_UP(wt, bw), 32);
+        uint32_t rows = ROUND_UP(DIV_ROUND_UP(ht, bw), 32);
+        uint32_t bytes = pitch << t->bpb_log2;
 
-        if (k == level) {
+        if (!t->tiled) {
+            bytes = ROUND_UP(bytes, 256);
+            pitch = bytes >> t->bpb_log2;
+        }
+        if (k == stored) {
             lv->pitch = pitch;
             break;
         }
-        lv->base += ROUND_UP(pitch * rows << t->bpb_log2, 4096);
+        lv->base += ROUND_UP(bytes * rows, 4096);
     }
 }
 
@@ -358,7 +412,7 @@ static void tex_texel(AdrenoLanes *L, const TexDesc *t, const TexLevel *lv,
                       int x, int y, uint32_t face, float out[4])
 {
     uint32_t bw = t->tf.bw;
-    uint32_t bx = x / bw, by = y / bw;
+    uint32_t bx = x / bw + lv->ox, by = y / bw + lv->oy;
     uint32_t off;
     uint8_t blk[16];
     const uint8_t *p;
@@ -546,6 +600,12 @@ static bool tex_desc(MsmAdrenoState *s, unsigned idx, TexDesc *t)
         maxl = 0;
     }
     t->nlevels = MAX(maxl, minl) + 1;
+    t->packed_level = 99;
+    if (fc[5] & (1 << 11)) {
+        unsigned ls = log2_ceil(MIN(t->w0, t->h0));
+
+        t->packed_level = ls > 4 ? ls - 4 : 0;
+    }
     if (t->dim == 3) {
         TexLevel lv;
 

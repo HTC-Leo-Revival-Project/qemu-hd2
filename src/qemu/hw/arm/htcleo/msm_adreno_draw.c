@@ -1467,6 +1467,15 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
 
         d->color_fmt = ci & 0xf;
         d->color_swap = (ci >> 9) & 3;
+        /*
+         * The blob fast-clears an RGBA8888 bin with COLORX_4_4_4_4 on a 4X
+         * MSAA surface of a quarter its pitch, with the 8888 clear colour
+         * in the shader: only 32-bit samples fill the bin, with that
+         * colour.  (A 565 bin is cleared with 565 the same way.)
+         */
+        if (((r[A2_RB_SURFACE_INFO] >> 14) & 3) && d->color_fmt == 0) {
+            d->color_fmt = 5;
+        }
         surface_setup(s, &d->color, ci & 0xfffff000, pitch,
                       color_fmts[d->color_fmt].bpp, ci & (1 << 6));
         d->depth_24 = di & 1;
