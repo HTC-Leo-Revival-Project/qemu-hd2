@@ -42,6 +42,12 @@
  *           sits at its floor, -512 (dBm = (AGC + 512) / 12 - 106, so the
  *           -106 dBm noise floor), in A+0x1F3C (chain 0) and B+0x4E96/98
  *           (the filtered values), and WL1's frequency scan finds no carrier
+ *           The searcher (srchcmd.c) issues its searches the same way;
+ *           after a search the DSP sets "HPQ done" (event 2, B+0x4E56) and
+ *           "LPQ done" (event 1, B+0x4E54) and interrupts, and the results
+ *           it leaves (no peaks: there is no signal) send acquisition on to
+ *           the next frequency.  Handlers ignore a done event for a queue
+ *           with no search pending.
  *   bit 26  GSM L1 frame commands (not modelled)
  *
  * This code is licensed under the GNU GPL v2 or later.
@@ -50,6 +56,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/bswap.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "htcleo.h"
@@ -79,6 +86,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define B_RXAGC_FILT    (MEM_B + 0x4E96)
 #define SYNC_START_AGC  0x13
 #define RXAGC_FLOOR     (-512)
+#define B_EVT_LPQ_DONE  (MEM_B + 0x4E54)
+#define B_EVT_HPQ_DONE  (MEM_B + 0x4E56)
+#define SEARCH_NS       2000000         /* a search takes a couple of ms */
 #define DB_MC           (1u << 19)
 #define DB_SYNC         (1u << 15)
 #define CTL_DOORBELL    0x08
@@ -87,6 +97,7 @@ struct MsmMdspState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq;
+    QEMUTimer *search;
     uint8_t *mem;
     uint32_t ctl;
     uint32_t ctl_regs[0x400];
@@ -98,6 +109,19 @@ static void mdsp_boot(MsmMdspState *s)
     stw_le_p(s->mem + B_MC_STATUS, 1);
     qemu_log_mask(LOG_UNIMP, "msm-mdsp: running image %04x\n",
                   lduw_le_p(s->mem + MEM_A));
+}
+
+/* a search finished, with nothing found */
+static void mdsp_search_done(void *opaque)
+{
+    MsmMdspState *s = opaque;
+
+    if (s->ctl != CTL_RUN) {
+        return;
+    }
+    stw_le_p(s->mem + B_EVT_HPQ_DONE, 1);
+    stw_le_p(s->mem + B_EVT_LPQ_DONE, 1);
+    qemu_irq_pulse(s->irq);
 }
 
 static uint64_t mdsp_read(void *opaque, hwaddr off, unsigned size)
@@ -141,6 +165,8 @@ static void mdsp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                 stw_le_p(s->mem + B_RXAGC_FILT, RXAGC_FLOOR);
                 stw_le_p(s->mem + B_RXAGC_FILT + 2, RXAGC_FLOOR);
             }
+            timer_mod(s->search,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SEARCH_NS);
             stw_le_p(s->mem + B_SYNC_CMD, 0);
             stw_le_p(s->mem + B_SYNC_DONE, 1);
         }
@@ -178,6 +204,7 @@ static void mdsp_reset(DeviceState *dev)
     memset(s->mem, 0, MDSP_CTL);
     memset(s->ctl_regs, 0, sizeof(s->ctl_regs));
     s->ctl = 0;
+    timer_del(s->search);
 }
 
 static void mdsp_init(Object *obj)
@@ -189,6 +216,7 @@ static void mdsp_init(Object *obj)
                           MDSP_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    s->search = timer_new_ns(QEMU_CLOCK_VIRTUAL, mdsp_search_done, s);
 }
 
 static void mdsp_class_init(ObjectClass *oc, const void *data)
