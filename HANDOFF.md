@@ -1,5 +1,23 @@
 # HD2 QEMU — session handoff (2026-10-12)
 
+## Real baseband (baseband=lle), 2026-10-12, latest
+`tools/start-lle.sh` boots cLK, Linux and Android to the lock screen on the real AMSS 2.15.50.14 running on the ARM926 modem core. adb works and `sys.boot_completed` is 1. The README section "Real baseband firmware" has the device map, the reproduced OSBL hand-off and the debugging tools (`AMSSLOG=1` = the amsslog TCG plugin). Fixes along the way:
+- ADM SD0 page at 0xA9400000;
+- NAND BUFFER_STATUS bad-block field and per-codeword ADDR0;
+- the mDSP boot handshake;
+- modem VIC lines: A2M n = 56+n; M2A = write 1 to 0xB8000594 + 4n;
+- SSBI/PM7540 ID (register 0x02 = 0xA2);
+- the HTC SMEM config block (VBUS);
+- the QDSP6 in "only" mode creates its SMD channels;
+- the AKM8973 compass INT storm (also helped HLE).
+
+Open items:
+- SIM/UIM, so there is no network;
+- the PMIC RTC, so the clock starts in 1980 (also charging and the power key: "PMIC API ERROR" lines);
+- the RF SSBI chips.
+
+HLE Android and the MAGLDR→iOS path were re-tested after these changes.
+
 ## Goal in progress
 Boot the **iOS 7 HD2 package** (pixeldrain `jnBDwb5c`, `ios7_v2.rar`, an XNU build for the
 QSD8250 Leo) in the emulator. The OS is started from the SD card by **MAGLDR 1.13 "Boot AD SD"**
