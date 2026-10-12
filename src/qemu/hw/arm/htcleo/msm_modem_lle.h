@@ -19,6 +19,13 @@
  */
 #define MIRQ_ADM0           52
 #define MIRQ_DOG_BARK       55
+/*
+ * apps -> modem doorbells 0-6 (CSR +0x400 + 4n): lines 56-62.  AMSS's
+ * proc_comm ISR is tramp 77 -> HAL 71 -> line 62 (A2M 6), SMSM tramp 76 ->
+ * line 61 (A2M 5), SMD tramp 71 -> line 56 (A2M 0).
+ */
+#define MIRQ_A2M_0          56
+#define MIRQ_A2M_NUM        7
 
 /* load AMSS and start the modem core at its entry point */
 void msm_modem_lle_reset(DeviceState *dev);

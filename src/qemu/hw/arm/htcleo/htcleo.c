@@ -482,7 +482,11 @@ static void htcleo_reset(MachineState *machine, ResetType type)
         blk = blk_by_legacy_dinfo(dinfo);
     }
     if (s->lle) {
-        /* the modem core boots AMSS; it releases the apps core itself */
+        /*
+         * The modem core boots AMSS.  OSBL, which is skipped, has already
+         * released the apps core with the OS loader ("Boot CE") before it
+         * jumps to AMSS, so both run from here.
+         */
         msm_modem_lle_reset(s->lle);
     } else {
         /* AMSS has been running since power-on and owns shared memory */
@@ -657,11 +661,6 @@ static void htcleo_init(MachineState *machine)
     if (object_property_find(cpuobj, "has_el3")) {
         object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
     }
-    if (s->modem_lle) {
-        /* held in reset until AMSS starts it */
-        object_property_set_bool(cpuobj, "start-powered-off", true,
-                                 &error_fatal);
-    }
     qdev_realize(DEVICE(cpuobj), NULL, &error_fatal);
     qdev_realize(DEVICE(&s->apps_cluster), NULL, &error_fatal);
     s->cpu = ARM_CPU(cpuobj);
@@ -732,14 +731,25 @@ static void htcleo_init(MachineState *machine)
     msm_modem_set_smem(MSM_MODEM(s->modem),
                        (uint8_t *)memory_region_get_ram_ptr(machine->ram) +
                        MSM_SHARED_RAM_PHYS);
+    /* with baseband=lle the real AMSS answers the doorbells instead */
     for (int i = 0; i < 16; i++) {
+        if (s->lle) {
+            if (i < MIRQ_A2M_NUM) {
+                qdev_connect_gpio_out_named(s->csr, "a2m", i,
+                        msm_modem_lle_irq(s->lle, MIRQ_A2M_0 + i));
+            }
+            continue;
+        }
         qdev_connect_gpio_out_named(s->csr, "a2m", i,
                                     qdev_get_gpio_in_named(s->modem, "a2m", i));
     }
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 7 && !s->lle; i++) {
         qdev_connect_gpio_out_named(s->modem, "m2a", i, vic_in[INT_A9_M2A_0 + i]);
     }
-    qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP, vic_in[INT_ADSP_A11]);
+    if (!s->lle) {
+        qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP,
+                                    vic_in[INT_ADSP_A11]);
+    }
 
     /* GPIO */
     dev = qdev_new(TYPE_MSM_GPIO);

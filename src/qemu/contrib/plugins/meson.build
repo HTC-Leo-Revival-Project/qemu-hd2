@@ -1,4 +1,5 @@
 contrib_plugins = [
+'amsslog.c',
 'bbv.c',
 'cache.c',
 'cflow.c',
