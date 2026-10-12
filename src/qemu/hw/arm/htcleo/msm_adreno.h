@@ -379,6 +379,7 @@ struct AdrenoProgram {
     uint32_t ninsn;
     bool kills;             /* pixel shader may discard */
     bool exports_depth;
+    bool exports_psize;     /* vertex shader writes the point size */
     uint32_t tex_mask;      /* texture fetch constants used */
 };
 

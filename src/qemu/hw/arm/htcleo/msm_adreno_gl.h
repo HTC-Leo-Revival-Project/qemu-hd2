@@ -24,14 +24,18 @@ typedef struct AdrenoGlslInfo {
     AdrenoGlslTexUnit tex[ADRENO_GL_MAX_UNITS];
     int nvtx;                           /* vertex fetch constants used */
     uint16_t vtx[ADRENO_GL_MAX_VBUFS];  /* by slot: fetch constant 0-95 */
+    /* per slot: the largest stride, and the bytes read around an element */
+    uint32_t vtx_stride[ADRENO_GL_MAX_VBUFS];
+    int32_t vtx_lo[ADRENO_GL_MAX_VBUFS], vtx_hi[ADRENO_GL_MAX_VBUFS];
 } AdrenoGlslInfo;
 
 /*
  * Append the GLSL for program p: helpers, the texture functions and
- * "void sq_main()".  cube_mask: fetch constants that are cube maps.
+ * "void sq_main()".  cube_mask: fetch constants that are cube maps;
+ * texture units (bindings and u_tex[]) are numbered from unit_base.
  */
 void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
-                           uint32_t cube_mask, GString *o,
+                           uint32_t cube_mask, int unit_base, GString *o,
                            AdrenoGlslInfo *info);
 
 /*
@@ -50,6 +54,16 @@ void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
 
 typedef struct AdrenoGlDraw {
     const AdrenoProgram *ps;
+    /*
+     * With vs set the host GPU shades the vertices too: idx are the
+     * vertex indices of a list, strip or fan of triangles or of points
+     * (prim), verts is NULL.
+     */
+    const AdrenoProgram *vs;
+    unsigned prim;
+    const uint32_t *idx;
+    uint32_t nidx, min_idx, max_idx;
+    bool persp, provoking_last, win_offset_vtx;
     int ninterp;
     uint32_t flat_mask;
     bool param_gen;

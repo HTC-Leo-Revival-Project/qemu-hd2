@@ -78,6 +78,7 @@ static const char glsl_helpers[] =
 
 typedef struct Tr {
     GString *o;
+    int unit_base;
     const AdrenoProgram *p;
     AdrenoGlslInfo *info;
     uint32_t cube_mask;
@@ -503,6 +504,8 @@ static void emit_vfetch(Tr *t, const SqFetch *f)
         }
         slot = info->nvtx;
         info->vtx[info->nvtx++] = f->vconst;
+        info->vtx_lo[slot] = INT32_MAX;
+        info->vtx_hi[slot] = INT32_MIN;
     }
     switch (f->fmt) {
     case 2: case 10: case 6: case 24: case 25: case 7: case 21: case 16:
@@ -516,6 +519,9 @@ static void emit_vfetch(Tr *t, const SqFetch *f)
         ndw = 3;
         break;
     }
+    info->vtx_stride[slot] = MAX(info->vtx_stride[slot], f->stride);
+    info->vtx_lo[slot] = MIN(info->vtx_lo[slot], f->offset);
+    info->vtx_hi[slot] = MAX(info->vtx_hi[slot], f->offset + 4 * ndw);
     g_string_append(o, "    float vi = ");
     temp_ref(t, f->src, f->src_rel);
     g_string_append_printf(o, ".%c%s;\n", comp[f->scomp & 3],
@@ -681,11 +687,12 @@ static void emit_exec(Tr *t, const SqCf *c)
 }
 
 void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
-                           uint32_t cube_mask, GString *o,
+                           uint32_t cube_mask, int unit_base, GString *o,
                            AdrenoGlslInfo *info)
 {
     Tr t = { .o = o, .p = p, .info = info, .fragment = fragment,
-             .cube_mask = cube_mask, .linear = true };
+             .cube_mask = cube_mask, .linear = true,
+             .unit_base = unit_base };
     g_autoptr(GString) body = g_string_new(NULL);
 
     memset(info, 0, sizeof(*info));
@@ -811,13 +818,14 @@ void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
     for (int u = 0; u < info->ntex; u++) {
         const AdrenoGlslTexUnit *tu = &info->tex[u];
         bool cube = cube_mask & (1u << tu->const_idx);
+        int b = unit_base + u;
 
         g_string_append_printf(o,
             "layout(binding = %d) uniform %s tu_%d;\n"
             "vec4 tex_%d(vec3 c) {\n"
             "    vec4 ts = u_tex[%d].size;\n"
             "    vec2 uv = c.xy;\n",
-            u, cube ? "sampler2DArray" : "sampler2D", u, u, u);
+            b, cube ? "sampler2DArray" : "sampler2D", u, u, b);
         if (cube) {
             g_string_append(o, "    uv -= 1.0;\n");
         } else if (tu->unnorm) {
@@ -836,7 +844,7 @@ void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
         if (!fragment) {
             g_string_append_printf(o, "    vec4 raw = textureLod(tu_%d, tc, "
                                    "max(%.9g + u_tex[%d].scale.y, 0.0));\n",
-                                   u, tu->bias, u);
+                                   u, tu->bias, b);
         } else if (tu->bias != 0.0f) {
             g_string_append_printf(o, "    vec4 raw = texture(tu_%d, tc, "
                                    "%.9g);\n", u, tu->bias);
@@ -845,7 +853,7 @@ void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
                                    u);
         }
         g_string_append_printf(o, "    return tswz(raw * u_tex[%d].scale.x, "
-                               "u_tex[%d].swz);\n}\n", u, u);
+                               "u_tex[%d].swz);\n}\n", b, b);
     }
     g_string_append_len(o, body->str, body->len);
 }

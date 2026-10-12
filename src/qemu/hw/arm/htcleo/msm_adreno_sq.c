@@ -238,6 +238,9 @@ static AdrenoProgram *decode_program(const uint32_t *code, uint32_t size,
                     if (in->alu.export && in->alu.vdst == 61) {
                         p->exports_depth = true;
                     }
+                    if (in->alu.export && in->alu.vdst == 63) {
+                        p->exports_psize = true;
+                    }
                 }
             }
             /* the CF list ends before the first clause */

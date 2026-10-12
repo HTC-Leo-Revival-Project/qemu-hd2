@@ -1484,6 +1484,71 @@ static AdrenoVertex *shade_vertices(DrawCtx *d, const uint32_t *idx,
     return out;
 }
 
+static AdrenoGlDraw gl_draw_desc(DrawCtx *d)
+{
+    AdrenoGlDraw g = {
+        .ps = d->ps,
+        .ninterp = d->ninterp,
+        .flat_mask = d->flat_mask,
+        .param_gen = d->param_gen,
+        .param_gen_reg = d->param_gen_reg,
+        .persp = d->persp,
+        .provoking_last = d->provoking_last,
+        .win_offset_vtx = d->win_offset_vtx,
+        .win_x = d->win_x,
+        .win_y = d->win_y,
+        .pix_ofs = 0.5f - d->pix_center,
+        .clip_x0 = d->clip_x0, .clip_y0 = d->clip_y0,
+        .clip_x1 = d->clip_x1, .clip_y1 = d->clip_y1,
+        .color_off = d->color.offset,
+        .depth_off = d->depth.offset,
+        .pitch = d->color.pitch,
+        .sx = d->color.sx, .sy = d->color.sy,
+        .color_fmt = d->color_fmt,
+        .color_swap = d->color_swap,
+        .color_write = d->color_write,
+        .depth_24 = d->depth_24,
+    };
+
+    return g;
+}
+
+/*
+ * Triangle lists, strips and fans and points go to the host GPU whole: it
+ * runs the vertex shader too.  Rectangles and lines take the CPU's vertex
+ * path.
+ */
+static bool gl_draw_gpu(DrawCtx *d, unsigned prim, const uint32_t *idx,
+                        uint32_t n)
+{
+    MsmAdrenoState *s = d->s;
+    AdrenoGlDraw g;
+
+    if (!d->gl) {
+        return false;
+    }
+    switch (prim) {
+    case A2_PT_TRILIST: case A2_PT_TRISTRIP: case A2_PT_TRIFAN:
+    case A2_PT_POINTLIST: case A2_PT_POINTLIST_PSIZE:
+        break;
+    default:
+        return false;
+    }
+    g = gl_draw_desc(d);
+    g.vs = adreno_program(s, A2_SHADER_VS);
+    g.prim = prim;
+    g.idx = idx;
+    g.nidx = n;
+    g.min_idx = UINT32_MAX;
+    g.max_idx = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        g.min_idx = MIN(g.min_idx, idx[i]);
+        g.max_idx = MAX(g.max_idx, idx[i]);
+    }
+    adreno_gl_draw(s, &g);
+    return true;
+}
+
 void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
                  uint32_t index_base, uint32_t index_size,
                  const uint32_t *imm, uint32_t imm_dwords)
@@ -1574,6 +1639,21 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         }
     }
 
+    if (mode != A2_EDRAM_COPY) {
+        uint32_t dc = r[A2_RB_DEPTHCONTROL];
+
+        d->ps = adreno_program(s, A2_SHADER_PS);
+        /* depth/stencil before shading when nothing can drop the pixel */
+        d->early_z = (dc & 3) && !d->ps->kills && !d->ps->exports_depth &&
+                     !(r[A2_RB_COLORCONTROL] & (3 << 3));
+        /*
+         * The host GPU renders to GMEM; render targets in memory (the
+         * blob's texture copies) are drawn here.
+         */
+        d->gl = (!d->color_write || d->color.host) &&
+                (!(dc & 3) || d->depth.host) && adreno_gl_available(s);
+    }
+
     /* the vertices */
     n = num_indices;
     if (mode == A2_EDRAM_COPY) {
@@ -1585,6 +1665,9 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     for (uint32_t i = 0; i < n; i++) {
         idx[i] = fetch_index(s, &s->workers[0].tlb, i, src, init, index_base,
                              imm, imm_dwords);
+    }
+    if (mode != A2_EDRAM_COPY && gl_draw_gpu(d, prim, idx, n)) {
+        return;
     }
     verts = shade_vertices(d, idx, n, slot);
 
@@ -1604,22 +1687,8 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         return;
     }
 
-    {
-        uint32_t dc = r[A2_RB_DEPTHCONTROL];
-
-        d->ps = adreno_program(s, A2_SHADER_PS);
-        /* depth/stencil before shading when nothing can drop the pixel */
-        d->early_z = (dc & 3) && !d->ps->kills && !d->ps->exports_depth &&
-                     !(r[A2_RB_COLORCONTROL] & (3 << 3));
-        /*
-         * The host GPU renders to GMEM; render targets in memory (the
-         * blob's texture copies) are drawn here.
-         */
-        d->gl = (!d->color_write || d->color.host) &&
-                (!(dc & 3) || d->depth.host) && adreno_gl_available(s);
-        if (!d->gl) {
-            adreno_gl_gmem_to_cpu(s);
-        }
+    if (!d->gl) {
+        adreno_gl_gmem_to_cpu(s);
     }
 
 #define V(i) (&verts[slot[(i)]])
@@ -1681,29 +1750,10 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     }
 #undef V
     if (d->gl) {
-        AdrenoGlDraw g = {
-            .ps = d->ps,
-            .ninterp = d->ninterp,
-            .flat_mask = d->flat_mask,
-            .param_gen = d->param_gen,
-            .param_gen_reg = d->param_gen_reg,
-            .win_x = d->win_x,
-            .win_y = d->win_y,
-            .pix_ofs = 0.5f - d->pix_center,
-            .clip_x0 = d->clip_x0, .clip_y0 = d->clip_y0,
-            .clip_x1 = d->clip_x1, .clip_y1 = d->clip_y1,
-            .color_off = d->color.offset,
-            .depth_off = d->depth.offset,
-            .pitch = d->color.pitch,
-            .sx = d->color.sx, .sy = d->color.sy,
-            .color_fmt = d->color_fmt,
-            .color_swap = d->color_swap,
-            .color_write = d->color_write,
-            .depth_24 = d->depth_24,
-            .verts = d->glv,
-            .nverts = d->glv_n,
-        };
+        AdrenoGlDraw g = gl_draw_desc(d);
 
+        g.verts = d->glv;
+        g.nverts = d->glv_n;
         adreno_gl_draw(s, &g);
         g_free(d->glv);
     } else {
