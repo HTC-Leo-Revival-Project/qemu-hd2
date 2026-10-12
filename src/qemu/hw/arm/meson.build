@@ -139,6 +139,7 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/msm_mdsp.c',
   'htcleo/msm_ssbi.c',
   'htcleo/msm_uim.c',
+  'htcleo/msm_gstmr.c',
   'htcleo/sim_card.c',
   'htcleo/msm_adreno.c',
   'htcleo/msm_adreno_sq.c',

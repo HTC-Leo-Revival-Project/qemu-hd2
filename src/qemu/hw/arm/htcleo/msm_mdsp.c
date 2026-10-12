@@ -11,22 +11,34 @@
  *   0xB1400000  memory C, 32-bit words
  *   0xB1800000  program memory, 32-bit words
  *   0xB1C00000  control: 3 holds the DSP in reset, 2 lets it run
- *   0xB1C00008  doorbell: the modem core interrupts the DSP
+ *   0xB1C00008  doorbell: the modem core interrupts the DSP; bit 31 with
+ *               the bit of the DSP interrupt to raise
  *
  * Bringing the DSP up, AMSS holds it in reset, downloads the image's
  * sections, writes 0x10000 to C+0x24 and 0xFFFF to A+0xF0, releases it and
  * 500 us later expects the "Master Controller" to have posted a nonzero
  * word at B+0x24.  The DSP interrupts the modem core on VIC line 27
- * (tramp 41).
+ * (tramp 41).  The image (0x1406 for radio 2.15.50.14) is one kernel with
+ * an overlay per application (GSM, WCDMA, W2G ...) that AMSS downloads
+ * while the DSP runs; each overlay has its own variables, which AMSS finds
+ * through a symbol table it switches with the overlay ([0x1350B0C]).  AMSS
+ * sees memory A at 0xC4F00000, B at 0xC5100000 and C at 0xC5300000.
  *
- * Master controller commands: AMSS writes a command code to B+0xB4 and
- * rings the doorbell; the MC clears B+0xB4 when done and interrupts back.
- * An asynchronous command also carries a value in C+0x470 that the MC
- * acknowledges by copying it to C+0x46C.  Here every command completes
- * at once.
- *
- * Image 0x1406 (radio 2.15.50.14) symbols the DSP itself maintains:
- *   B+0x33A4  GSM firmware ready; GSM L1 polls it after enabling the app
+ * Doorbell interrupts and what the DSP does with them here:
+ *   bit 19  master controller command: AMSS writes a command code to
+ *           B+0xB4; the MC clears it when done and interrupts back.  An
+ *           asynchronous command also carries a value in C+0x470 that the
+ *           MC acknowledges by copying it to C+0x46C.  Every command
+ *           completes at once, and the applications report ready:
+ *             B+0x33A4  GSM ready (GSM overlay), polled by GSM L1
+ *             A+0x2148  WCDMA ready for commands (low byte), polled by WL1
+ *                       for 100 ms after it enables WCDMA and W2G
+ *   bit 15  WCDMA synchronous command (mdspsync.c, WCDMA overlay): the
+ *           command code and its arguments are at B+0x4958; the DSP
+ *           overwrites the code with a status, 0 = done, and sets B+0x4E5E
+ *           (event 0, "synchronous command done") which WL1's ISR clears
+ *           before it runs the command's callback
+ *   bit 26  GSM L1 frame commands (not modelled)
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -56,6 +68,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define C_MC_ARG        (MEM_C + 0x470)
 #define IMG_1406        0x1406
 #define B_GSM_READY     (MEM_B + 0x33A4)
+#define A_WCDMA_READY   (MEM_A + 0x2148)
+#define B_SYNC_CMD      (MEM_B + 0x4958)
+#define B_SYNC_DONE     (MEM_B + 0x4E5E)
+#define DB_MC           (1u << 19)
+#define DB_SYNC         (1u << 15)
 #define CTL_DOORBELL    0x08
 
 struct MsmMdspState {
@@ -94,14 +111,23 @@ static void mdsp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 
     if (off == MDSP_CTL + CTL_DOORBELL) {
         s->ctl_regs[CTL_DOORBELL >> 2] = val;
-        if (s->ctl == CTL_RUN && lduw_le_p(s->mem + B_MC_CMD)) {
+        if (s->ctl != CTL_RUN || lduw_le_p(s->mem + MEM_A) != IMG_1406) {
+            qemu_irq_pulse(s->irq);
+            return;
+        }
+        if ((val & DB_MC) && lduw_le_p(s->mem + B_MC_CMD)) {
             qemu_log_mask(LOG_UNIMP, "msm-mdsp: MC command %04x\n",
                           lduw_le_p(s->mem + B_MC_CMD));
             stl_le_p(s->mem + C_MC_ACK, ldl_le_p(s->mem + C_MC_ARG));
             stw_le_p(s->mem + B_MC_CMD, 0);
-            if (lduw_le_p(s->mem + MEM_A) == IMG_1406) {
-                stw_le_p(s->mem + B_GSM_READY, 1);
-            }
+            stw_le_p(s->mem + B_GSM_READY, 1);
+            stw_le_p(s->mem + A_WCDMA_READY, 1);
+        }
+        if (val & DB_SYNC) {
+            qemu_log_mask(LOG_UNIMP, "msm-mdsp: WCDMA sync command %04x\n",
+                          lduw_le_p(s->mem + B_SYNC_CMD));
+            stw_le_p(s->mem + B_SYNC_CMD, 0);
+            stw_le_p(s->mem + B_SYNC_DONE, 1);
         }
         qemu_irq_pulse(s->irq);
         return;

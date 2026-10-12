@@ -87,12 +87,16 @@ static void build_fs(SimCard *c)
 
     f = add_file(c, 0x2FE2, 0x3F00, T_EF, EF_TRANSPARENT, 0, 10);  /* ICCID */
     bcd(SIM_ICCID, f->data, 10);
+    f = add_file(c, 0x2F05, 0x3F00, T_EF, EF_TRANSPARENT, 0, 4);   /* ELP */
+    memcpy(f->data, "en", 2);
 
     /* DF_GSM */
     f = add_file(c, 0x6F07, 0x7F20, T_EF, EF_TRANSPARENT, 0, 9);   /* IMSI */
     snprintf(tmp, sizeof(tmp), "9%s", SIM_IMSI);    /* odd: parity nibble 9 */
     f->data[0] = 8;
     bcd(tmp, f->data + 1, 8);
+    f = add_file(c, 0x6F05, 0x7F20, T_EF, EF_TRANSPARENT, 0, 4);   /* LP */
+    f->data[0] = 0x01;                              /* English */
     f = add_file(c, 0x6FAD, 0x7F20, T_EF, EF_TRANSPARENT, 0, 4);   /* AD */
     memcpy(f->data, "\x00\x00\x00\x03", 4);         /* normal, MNC 3 digits */
     f = add_file(c, 0x6F46, 0x7F20, T_EF, EF_TRANSPARENT, 0, 17);  /* SPN */
@@ -175,7 +179,7 @@ static int file_response(SimCard *c, int idx, uint8_t *r)
         stw_be_p(r + 2, 0x1000);                    /* free memory */
         r[6] = f->type;
         r[12] = 10;                                 /* bytes that follow */
-        r[13] = 0x13;                               /* clock stop allowed */
+        r[13] = 0x93;                   /* CHV1 disabled, clock stop allowed */
         r[14] = dfs;
         r[15] = efs;
         r[16] = 4;                                  /* CHVs and unblock */
