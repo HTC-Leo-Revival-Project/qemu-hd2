@@ -95,6 +95,7 @@ struct MsmNandState {
     uint32_t op_cmd;
     uint32_t op_page;
     int op_cw;
+    int op_off;                 /* column offset inside the first codeword */
     int op_remaining;
 };
 
@@ -172,6 +173,23 @@ static void nand_do_read(MsmNandState *s)
         for (int i = 0; i < bb_width(s); i++) {
             s->buf[bb_pos(s) + i] = raw[CW_RAW - 2 + i];
         }
+    }
+    if (s->op_off) {
+        /*
+         * The column address starts the transfer inside the codeword, e.g.
+         * a 2-byte raw read of the bad-block marker at column 2048.
+         */
+        memmove(s->buf, s->buf + s->op_off, CW_RAW - s->op_off);
+        memset(s->buf + CW_RAW - s->op_off, 0xFF, s->op_off);
+        s->op_off = 0;
+    }
+    if (s->trace) {
+        qemu_log("msm-nand: read page 0x%x cw %d cmd %02x cfg0 %08x "
+                 "cfg1 %08x data %02x%02x bb@%d %02x%02x\n",
+                 s->op_page, s->op_cw, s->op_cmd, reg(s, NAND_DEV0_CFG0),
+                 reg(s, NAND_DEV0_CFG1), s->buf[0], s->buf[1], bb_pos(s),
+                 bb_pos(s) >= 0 ? s->buf[bb_pos(s)] : 0,
+                 bb_pos(s) >= 0 ? s->buf[bb_pos(s) + 1] : 0);
     }
 }
 
@@ -274,6 +292,7 @@ static void nand_exec(MsmNandState *s)
         s->op_cmd = cmd;
         s->op_page = (a0 >> 16) | ((a1 & 0xFF) << 16);
         s->op_cw = ((wide ? col * 2 : col) / CW_RAW) & 3;
+        s->op_off = (wide ? col * 2 : col) % CW_RAW;
         s->op_remaining = ((reg(s, NAND_DEV0_CFG0) >> 6) & 7) + 1;
     }
 
@@ -297,6 +316,12 @@ static void nand_exec(MsmNandState *s)
             break;
         }
     }
+    /*
+     * FLASH_STATUS[14:12] counts down the codewords still to come in this
+     * operation (3, 2, 1, 0 for a whole 2 KiB page); MAGLDR's flash HAL
+     * checks it for every codeword it reads.
+     */
+    s->regs[NAND_FLASH_STATUS >> 2] |= ((s->op_remaining - 1) & 7) << 12;
     s->op_cw = (s->op_cw + 1) & 3;
     if (--s->op_remaining <= 0) {
         s->op_remaining = 0;
