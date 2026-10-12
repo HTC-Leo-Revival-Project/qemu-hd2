@@ -127,17 +127,30 @@ typedef struct AdrenoGl {
     EGLContext ctx;
     QemuThread owner;
     GLuint fbo, vao;
-    GLuint gmem, consts, draw_ubo, vbo, ibo, vdata;
+    GLuint gmem;
+    /*
+     * What draws read (uniforms, constants, vertices, indices) is written
+     * once into this persistently mapped buffer; it starts over when the
+     * host GPU is idle (no driver copies, no waits between draws).
+     */
+    GLuint stream;
+    uint8_t *stream_map;
+    size_t stream_pos;
+    GLint ubo_align, ssbo_align;
     GLuint gmem_stage;          /* GMEM's way to and from the CPU */
     uint8_t *gmem_map;
+    /* stats: GPU timestamps at the first draw of a kick and its end */
+    GLuint tq[2];
+    bool tq_started;
+    uint32_t tq_kick;
     /* GMEM snapshots for resolves */
     GLuint snap[32];
     uint8_t *snap_map[32];
     int nsnap, snap_used;
-    GLsizeiptr vbo_size;
-    uint8_t *vstage;
-    size_t vstage_size;
     int cur_geom;
+    int barriers;
+    const struct GlProg *last_prog;
+    bool stream_wrapped;
     GLuint dummy2d, dummy_arr;
     GHashTable *progs, *texes, *samplers;
     bool gpu_newer, cpu_newer;
@@ -1031,6 +1044,8 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
     t = g_hash_table_lookup(gl->texes, &key);
     if (t && !adreno_gpu_wrote(s, &t->stamp, t->lo, t->hi) &&
         (t->stamp.kick == s->kick_epoch || tex_pages_unchanged(gl, s, t))) {
+        adreno_trace(s, "  gl: texture %u %08x-%08x unchanged\n", idx, t->lo,
+                     t->hi);
         t->stamp.kick = s->kick_epoch;
         t->stamp.writes = s->gpu_writes;
         t->used = gl->ndraw;
@@ -1048,6 +1063,7 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
         }
     }
     if (t && t->hash == h) {
+        adreno_trace(s, "  gl: texture %u %08x-%08x same hash\n", idx, lo, hi);
         t->stamp.kick = s->kick_epoch;
         t->stamp.writes = s->gpu_writes;
         tex_pages(gl, s, t);
@@ -1114,6 +1130,13 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
                 uint32_t hh = MAX(im.h >> level, 1u);
 
                 adreno_tex_decode(s, &gl->tlb, idx, level, layer, buf);
+                if (gl_debug && level == 0 && layer == 0 && !im.is_float) {
+                    static int n;
+                    g_autofree char *path = g_strdup_printf(
+                        "adreno-tex-%03d-%08x-%ux%u.rgba", n++, t->lo, w, hh);
+
+                    g_file_set_contents(path, buf, w * hh * 4, NULL);
+                }
                 if (im.layers > 1) {
                     glTextureSubImage3D(t->tex, level, 0, 0, layer, w, hh, 1,
                                         GL_RGBA, type, buf);
@@ -1212,6 +1235,8 @@ static void bind_textures(AdrenoGl *gl, MsmAdrenoState *s,
                                     tu->mag == 3 ? t->im.mag : tu->mag,
                                     tu->min == 3 ? t->im.min : tu->min,
                                     tu->mip == 3 ? t->im.mip : tu->mip));
+        adreno_trace(s, "  gl: unit %d = fetch %u tex %u (%ux%u at %08x)\n",
+                     u, tu->const_idx, t->tex, t->im.w, t->im.h, t->lo);
         x->size[0] = t->im.w;
         x->size[1] = t->im.h;
         x->size[2] = 1.0f / t->im.w;
@@ -1222,6 +1247,36 @@ static void bind_textures(AdrenoGl *gl, MsmAdrenoState *s,
             x->swz[k] = t->im.swz[k];
         }
     }
+}
+
+#define STREAM_SIZE (64u << 20)
+
+static void stream_reset(AdrenoGl *gl, MsmAdrenoState *s)
+{
+    gl->stream_pos = 0;
+    /* the constants must go in again */
+    s->const_dirty = true;
+}
+
+/* len bytes of the stream buffer at an aligned offset */
+static size_t stream_alloc(AdrenoGl *gl, MsmAdrenoState *s, size_t len,
+                           size_t align)
+{
+    size_t pos = ROUND_UP(gl->stream_pos, align);
+
+    if (pos + len > STREAM_SIZE) {
+        GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+        /* full: wait for the host GPU to be done with it all */
+        glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+        glDeleteSync(fence);
+        stream_reset(gl, s);
+        gl->stream_wrapped = true;
+        pos = 0;
+        assert(len <= STREAM_SIZE);
+    }
+    gl->stream_pos = pos + len;
+    return pos;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1243,6 +1298,7 @@ void adreno_gl_gmem_to_cpu(MsmAdrenoState *s)
         fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
         glDeleteSync(fence);
+        stream_reset(gl, s);
         memcpy(s->gmem, gl->gmem_map, ADRENO_GMEM_SIZE);
         gl->gpu_newer = false;
         if (s->stats_on) {
@@ -1289,19 +1345,35 @@ bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot)
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
     glCopyNamedBufferSubData(gl->gmem, gl->snap[gl->snap_used], 0, 0,
                              ADRENO_GMEM_SIZE);
+    /* the bin is done: the host GPU starts on it while we go on */
+    glFlush();
     *slot = gl->snap_used++;
     return true;
 }
 
 void adreno_gl_snapshots_wait(MsmAdrenoState *s)
 {
+    AdrenoGl *gl = s->gl;
     int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
-    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    GLsync fence;
 
+    if (gl->tq_started) {
+        glQueryCounter(gl->tq[1], GL_TIMESTAMP);
+    }
+    fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
     glDeleteSync(fence);
+    stream_reset(gl, s);
     if (s->stats_on) {
         s->st.sync += g_get_monotonic_time() - t0;
+    }
+    if (gl->tq_started) {
+        GLuint64 a = 0, b = 0;
+
+        glGetQueryObjectui64v(gl->tq[0], GL_QUERY_RESULT, &a);
+        glGetQueryObjectui64v(gl->tq[1], GL_QUERY_RESULT, &b);
+        s->st.gpu += (b - a) / 1000;
+        gl->tq_started = false;
     }
 }
 
@@ -1334,10 +1406,11 @@ void adreno_gl_gmem_from_cpu(MsmAdrenoState *s)
  * the program uses, the bytes the indices of the draw reach, into vd[].
  */
 static void upload_vertices(AdrenoGl *gl, MsmAdrenoState *s, const GlProg *p,
-                            const AdrenoGlDraw *g, DrawU *du)
+                            const AdrenoGlDraw *g, DrawU *du,
+                            size_t *idx_ofs)
 {
     const AdrenoGlslInfo *vi = &p->vinfo;
-    size_t total = 0;
+    size_t total = 16, base, at;
     int64_t lo[ADRENO_GL_MAX_VBUFS], hi[ADRENO_GL_MAX_VBUFS];
 
     for (int i = 0; i < vi->nvtx; i++) {
@@ -1345,15 +1418,14 @@ static void upload_vertices(AdrenoGl *gl, MsmAdrenoState *s, const GlProg *p,
 
         lo[i] = (int64_t)g->min_idx * stride + vi->vtx_lo[i];
         hi[i] = (int64_t)g->max_idx * stride + vi->vtx_hi[i];
-        hi[i] = MIN(hi[i], lo[i] + (64 << 20));
+        hi[i] = MIN(hi[i], lo[i] + (16 << 20));
         total += ROUND_UP(hi[i] - lo[i], 16);
     }
-    if (gl->vstage_size < total) {
-        g_free(gl->vstage);
-        gl->vstage_size = MAX(total, gl->vstage_size * 2);
-        gl->vstage = g_malloc(gl->vstage_size);
-    }
-    total = 0;
+    /* the indices, then the vertex data (vd[] of SSBO binding 2) */
+    *idx_ofs = stream_alloc(gl, s, g->nidx * 4, 4);
+    memcpy(gl->stream_map + *idx_ofs, g->idx, g->nidx * 4);
+    base = stream_alloc(gl, s, total, MAX(gl->ssbo_align, 16));
+    at = 0;
     for (int i = 0; i < vi->nvtx; i++) {
         unsigned c = vi->vtx[i];
         uint32_t fc0 = s->regs[A2_SQ_FETCH_0 + c * 2];
@@ -1361,15 +1433,14 @@ static void upload_vertices(AdrenoGl *gl, MsmAdrenoState *s, const GlProg *p,
         uint32_t len = hi[i] - lo[i];
 
         adreno_tlb_read(s, &gl->tlb, (fc0 & ~3u) + (uint32_t)lo[i],
-                        gl->vstage + total, len);
-        du->vb[i][0] = total / 4;
+                        gl->stream_map + base + at, len);
+        du->vb[i][0] = at / 4;
         du->vb[i][1] = lo[i];
         du->vb[i][2] = fc1 & 3;
         du->vb[i][3] = len;
-        total += ROUND_UP(len, 16);
+        at += ROUND_UP(len, 16);
     }
-    glNamedBufferData(gl->vdata, MAX(total, 16), gl->vstage, GL_STREAM_DRAW);
-    glNamedBufferData(gl->ibo, g->nidx * 4, g->idx, GL_STREAM_DRAW);
+    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 2, gl->stream, base, total);
 }
 
 /* rasterizer state for the host GPU's own primitive assembly */
@@ -1417,6 +1488,7 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     GlProg *p;
     DrawU du;
     uint32_t cc = r[A2_RB_COLORCONTROL], bc = r[A2_RB_BLEND_CONTROL];
+    size_t idx_ofs = 0;
     int geom;
 
     if ((g->vs ? !g->nidx : !g->nverts) ||
@@ -1425,22 +1497,32 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     }
     gl->ndraw++;
     adreno_tlb_flush(&gl->tlb);
+    if (s->stats_on && !gl->tq_started) {
+        if (!gl->tq[0]) {
+            glGenQueries(2, gl->tq);
+        }
+        glQueryCounter(gl->tq[0], GL_TIMESTAMP);
+        gl->tq_started = true;
+    }
     p = gl_program(gl, s, g);
     if (!p) {
         return;
     }
     geom = p->key.geom;
     gmem_upload(gl, s);
-    if (s->const_dirty) {
-        glNamedBufferSubData(gl->consts, 0, 512 * 16,
-                             &r[A2_SQ_CONSTANT_0]);
-        s->const_dirty = false;
-    }
 
+    /*
+     * Textures first: checking one may do the pending resolves, which
+     * waits for the host GPU and starts the stream buffer over.
+     */
     memset(&du, 0, sizeof(du));
+    bind_textures(gl, s, &p->info, p->key.cube_mask, 0, &du);
+    if (geom != GEOM_CPU) {
+        bind_textures(gl, s, &p->vinfo, p->key.vs_cube_mask,
+                      ADRENO_GL_MAX_UNITS, &du);
+    }
     memcpy(du.bools, &r[A2_SQ_CF_BOOLEANS], sizeof(du.bools));
     memcpy(du.loops, &r[A2_SQ_CF_LOOP], sizeof(du.loops));
-    bind_textures(gl, s, &p->info, p->key.cube_mask, 0, &du);
     du.cb[0] = r[A2_SQ_PS_CONST] & 0x1ff;
     du.cb[1] = r[A2_SQ_VS_CONST] & 0x1ff;
     cf = adreno_color_fmt(g->color_fmt);
@@ -1471,30 +1553,9 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     du.misc[1] = g->win_x;
     du.misc[2] = g->win_y;
     du.misc[3] = g->pix_ofs;
-
-    if (geom == GEOM_CPU) {
-        GLsizeiptr vbytes = (GLsizeiptr)g->nverts *
-                            ADRENO_GL_VTX_VEC4(g->ninterp) * 16;
-
-        if (vbytes > gl->vbo_size) {
-            gl->vbo_size = MAX(vbytes, gl->vbo_size * 2);
-        }
-        /* orphan the last draw's vertices */
-        glNamedBufferData(gl->vbo, gl->vbo_size, NULL, GL_STREAM_DRAW);
-        glNamedBufferSubData(gl->vbo, 0, vbytes, g->verts);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, gl->vbo);
-    } else {
+    if (geom != GEOM_CPU) {
         uint32_t mm = r[A2_PA_SU_POINT_MINMAX];
 
-        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
-
-        bind_textures(gl, s, &p->vinfo, p->key.vs_cube_mask,
-                      ADRENO_GL_MAX_UNITS, &du);
-        upload_vertices(gl, s, p, g, &du);
-        if (s->stats_on) {
-            s->st.upload += g_get_monotonic_time() - t0;
-        }
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, gl->vdata);
         du.vp0[0] = adreno_f(r[A2_PA_CL_VPORT_XSCALE]);
         du.vp0[1] = adreno_f(r[A2_PA_CL_VPORT_XOFFSET]);
         du.vp0[2] = adreno_f(r[A2_PA_CL_VPORT_YSCALE]);
@@ -1511,12 +1572,57 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         du.psz[1] = fx124(mm >> 16);
         du.psz[2] = g->prim == A2_PT_POINTLIST_PSIZE || g->vs->exports_psize;
     }
-    glNamedBufferSubData(gl->draw_ubo, 0, sizeof(du), &du);
 
+    /* what the draw reads, into the stream buffer: again if it filled up */
+    do {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+        size_t u;
+
+        gl->stream_wrapped = false;
+        if (s->const_dirty) {
+            size_t c = stream_alloc(gl, s, 512 * 16, gl->ubo_align);
+
+            memcpy(gl->stream_map + c, &r[A2_SQ_CONSTANT_0], 512 * 16);
+            glBindBufferRange(GL_UNIFORM_BUFFER, 0, gl->stream, c, 512 * 16);
+            s->const_dirty = false;
+        }
+        if (geom == GEOM_CPU) {
+            size_t vbytes = (size_t)g->nverts *
+                            ADRENO_GL_VTX_VEC4(g->ninterp) * 16;
+            size_t v = stream_alloc(gl, s, vbytes, MAX(gl->ssbo_align, 16));
+
+            memcpy(gl->stream_map + v, g->verts, vbytes);
+            glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, gl->stream, v,
+                              vbytes);
+        } else {
+            upload_vertices(gl, s, p, g, &du, &idx_ofs);
+        }
+        u = stream_alloc(gl, s, sizeof(du), gl->ubo_align);
+        memcpy(gl->stream_map + u, &du, sizeof(du));
+        glBindBufferRange(GL_UNIFORM_BUFFER, 1, gl->stream, u, sizeof(du));
+        if (s->stats_on) {
+            s->st.upload += g_get_monotonic_time() - t0;
+        }
+    } while (gl->stream_wrapped);
+
+    /*
+     * GMEM is only accessed in the interlocked critical sections, which
+     * run in primitive order, also across draws that use the same program
+     * (NVIDIA; a draw of another program may overtake the ones before).
+     * A barrier between every two draws costs the host GPU a wait for
+     * idle each, so there is one where the program changes;
+     * ADRENO_GL_BARRIER=1: between all draws.
+     */
+    if (gl->barriers == 1 || p != gl->last_prog) {
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
     raster_state(gl, s, geom, g);
     glUseProgram(p->prog);
     glScissor(g->clip_x0, g->clip_y0, g->clip_x1 - g->clip_x0,
               g->clip_y1 - g->clip_y0);
+    adreno_trace(s, "  gl: draw geom %d program %016" PRIx64 "/%016" PRIx64
+                 " indices %u-%u\n", geom, p->key.vs_hash, p->key.ps_hash,
+                 g->min_idx, g->max_idx);
     if (geom == GEOM_CPU) {
         glDrawArrays(GL_TRIANGLES, 0, g->nverts);
     } else {
@@ -1524,12 +1630,10 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
                       g->prim == A2_PT_TRISTRIP ? GL_TRIANGLE_STRIP :
                       g->prim == A2_PT_TRIFAN ? GL_TRIANGLE_FAN : GL_TRIANGLES;
 
-        glDrawElements(mode, g->nidx, GL_UNSIGNED_INT, NULL);
+        glDrawElements(mode, g->nidx, GL_UNSIGNED_INT,
+                       (const void *)(uintptr_t)idx_ofs);
     }
-    /* the next draw reads what this one wrote to GMEM */
-    if (!getenv("ADRENO_GL_NOBARRIER")) {
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    }
+    gl->last_prog = p;
     gl->gpu_newer = true;
 }
 
@@ -1586,6 +1690,8 @@ static bool gl_init(MsmAdrenoState *s)
     }
     qemu_thread_get_self(&gl->owner);
     gl_debug = getenv("ADRENO_GL_DEBUG") != NULL;
+    gl->barriers = getenv("ADRENO_GL_BARRIER") ?
+                   atoi(getenv("ADRENO_GL_BARRIER")) : 0;
     if (gl_debug) {
         glEnable(GL_DEBUG_OUTPUT);
         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
@@ -1626,19 +1732,17 @@ static bool gl_init(MsmAdrenoState *s)
                                          GL_MAP_READ_BIT | GL_MAP_WRITE_BIT |
                                          GL_MAP_PERSISTENT_BIT |
                                          GL_MAP_COHERENT_BIT);
-    glCreateBuffers(1, &gl->consts);
-    glNamedBufferStorage(gl->consts, 512 * 16, &s->regs[A2_SQ_CONSTANT_0],
-                         GL_DYNAMIC_STORAGE_BIT);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, gl->consts);
-    glCreateBuffers(1, &gl->draw_ubo);
-    glNamedBufferStorage(gl->draw_ubo, sizeof(DrawU), NULL,
-                         GL_DYNAMIC_STORAGE_BIT);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 1, gl->draw_ubo);
-    glCreateBuffers(1, &gl->vbo);
-    gl->vbo_size = 64 * 1024;
-    glCreateBuffers(1, &gl->vdata);
-    glCreateBuffers(1, &gl->ibo);
-    glVertexArrayElementBuffer(gl->vao, gl->ibo);
+    glCreateBuffers(1, &gl->stream);
+    glNamedBufferStorage(gl->stream, STREAM_SIZE, NULL,
+                         GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT |
+                         GL_MAP_COHERENT_BIT);
+    gl->stream_map = glMapNamedBufferRange(gl->stream, 0, STREAM_SIZE,
+                                           GL_MAP_WRITE_BIT |
+                                           GL_MAP_PERSISTENT_BIT |
+                                           GL_MAP_COHERENT_BIT);
+    glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &gl->ubo_align);
+    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &gl->ssbo_align);
+    glVertexArrayElementBuffer(gl->vao, gl->stream);
     gl->cur_geom = GEOM_CPU;
     /* the guest's depth range; points' (0, 0) at the guest's top */
     glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
@@ -1656,7 +1760,7 @@ static bool gl_init(MsmAdrenoState *s)
         glTextureSubImage3D(gl->dummy_arr, 0, 0, 0, i, 1, 1, 1, GL_RGBA,
                             GL_UNSIGNED_BYTE, black);
     }
-    s->const_dirty = false;
+    s->const_dirty = true;
     s->gl = gl;
     return true;
 }

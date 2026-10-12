@@ -331,7 +331,7 @@ struct MsmAdrenoState {
         int64_t last;
         uint64_t kicks, gpu_draws, cpu_draws, soft_draws, resolves;
         uint64_t hashes, decodes, hash_bytes;
-        int64_t cp, sync, resolve, tex, upload;
+        int64_t cp, sync, resolve, tex, upload, gpu;
     } st;
 
     char *trace_path;

@@ -765,6 +765,11 @@ static uint32_t cp_type3(MsmAdrenoState *s, uint32_t hdr, uint32_t *p,
             for (uint32_t k = 0; k < cnt && base + off + k < ADRENO_NREGS;
                  k++) {
                 s->regs[base + off + k] = adreno_ldl(s, mem + (off + k) * 4);
+                if (base + off + k >= A2_SQ_CONSTANT_0 &&
+                    base + off + k < A2_SQ_CONSTANT_0 + 512 * 4) {
+                    /* the host GPU's copy of the constants is stale */
+                    s->const_dirty = true;
+                }
             }
         }
         break;
@@ -954,12 +959,13 @@ static void cp_run_ring(MsmAdrenoState *s)
                         PRIu64 " resolves, %" PRIu64 " texture hashes, %"
                         PRIu64 " decodes (%.1f MB hashed); ms: cp %.1f, "
                         "gmem sync %.1f, "
-                        "resolve %.1f, textures %.1f, vertex upload %.1f\n",
+                        "resolve %.1f, textures %.1f, vertex upload %.1f, "
+                        "GPU span %.1f\n",
                         s->st.kicks, s->st.gpu_draws, s->st.cpu_draws,
                         s->st.soft_draws, s->st.resolves, s->st.hashes,
                         s->st.decodes, s->st.hash_bytes / 1e6, s->st.cp / 1e3,
                         s->st.sync / 1e3, s->st.resolve / 1e3, s->st.tex / 1e3,
-                        s->st.upload / 1e3);
+                        s->st.upload / 1e3, s->st.gpu / 1e3);
                 memset(&s->st, 0, sizeof(s->st));
                 s->st.last = now;
             }
@@ -1045,6 +1051,7 @@ static void adreno_reset(DeviceState *dev)
     MsmAdrenoState *s = MSM_ADRENO(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->const_dirty = true;
     memset(s->imem_size, 0, sizeof(s->imem_size));
     memset(s->shadow_en, 0, sizeof(s->shadow_en));
     s->regs[A2_CP_ME_CNTL] = 1u << 28;     /* halted until the driver starts it */
