@@ -6,7 +6,9 @@
  *        BMA150 G-sensor, button backlight (board-htcleo-microp.c)
  *  0x48  TI TPS65023 PMIC (CPU core voltage)
  *  0x26  Maxim DS2746 battery gauge (drivers/power/ds2746_*.c)
- *  0x1C  AKM8973 compass
+ *  0x1C  AKM8973 compass: a measurement (MS1 = 0) completes 10 ms later
+ *        and raises INT (GPIO 39, level high) until ST is read; then the
+ *        part is back in power-down.  The field is a constant one.
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -395,6 +397,111 @@ static void microp_class_init(ObjectClass *oc, const void *data)
     device_class_set_legacy_reset(DEVICE_CLASS(oc), microp_reset);
 }
 
+/* ------------------------------------------------------------------ */
+/* AKM8973 compass                                                     */
+/* ------------------------------------------------------------------ */
+
+#define AKM_ST          0xC0    /* bit 0: data ready */
+#define AKM_TMPS        0xC1
+#define AKM_H1X         0xC2
+#define AKM_MS1         0xE0
+#define AKM_MODE_MEASURE    0x00
+#define AKM_MODE_POWERDOWN  0x03
+
+OBJECT_DECLARE_SIMPLE_TYPE(HtcleoAkm, HTCLEO_AKM)
+
+struct HtcleoAkm {
+    I2CSlave parent_obj;
+    qemu_irq irq;
+    QEMUTimer *timer;
+    uint8_t regs[256];
+    uint8_t ptr;
+    bool have_ptr;
+};
+
+static void akm_done(void *opaque)
+{
+    HtcleoAkm *s = opaque;
+
+    s->regs[AKM_ST] = 1;
+    s->regs[AKM_TMPS] = 0x90;
+    /* about 0.3 G north and down, mid-scale is 0x80 */
+    s->regs[AKM_H1X] = 0x98;
+    s->regs[AKM_H1X + 1] = 0x80;
+    s->regs[AKM_H1X + 2] = 0x60;
+    s->regs[AKM_MS1] = AKM_MODE_POWERDOWN;
+    qemu_set_irq(s->irq, 1);
+}
+
+static int akm_event(I2CSlave *i2c, enum i2c_event ev)
+{
+    HtcleoAkm *s = HTCLEO_AKM(i2c);
+
+    if (ev == I2C_START_SEND) {
+        s->have_ptr = false;
+    }
+    return 0;
+}
+
+static int akm_send(I2CSlave *i2c, uint8_t data)
+{
+    HtcleoAkm *s = HTCLEO_AKM(i2c);
+
+    if (!s->have_ptr) {
+        s->ptr = data;
+        s->have_ptr = true;
+        return 0;
+    }
+    s->regs[s->ptr] = data;
+    if (s->ptr == AKM_MS1 && data == AKM_MODE_MEASURE) {
+        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+    }
+    s->ptr++;
+    return 0;
+}
+
+static uint8_t akm_recv(I2CSlave *i2c)
+{
+    HtcleoAkm *s = HTCLEO_AKM(i2c);
+    uint8_t v = s->regs[s->ptr];
+
+    if (s->ptr == AKM_ST && (v & 1)) {
+        /* reading the status hands over the sample */
+        s->regs[AKM_ST] = 0;
+        qemu_set_irq(s->irq, 0);
+    }
+    s->ptr++;
+    return v;
+}
+
+static void akm_reset(DeviceState *dev)
+{
+    HtcleoAkm *s = HTCLEO_AKM(dev);
+
+    timer_del(s->timer);
+    memset(s->regs, 0, sizeof(s->regs));
+    s->regs[AKM_MS1] = AKM_MODE_POWERDOWN;
+    qemu_set_irq(s->irq, 0);
+}
+
+static void akm_init(Object *obj)
+{
+    HtcleoAkm *s = HTCLEO_AKM(obj);
+
+    s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, akm_done, s);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
+}
+
+static void akm_class_init(ObjectClass *oc, const void *data)
+{
+    I2CSlaveClass *k = I2C_SLAVE_CLASS(oc);
+
+    k->event = akm_event;
+    k->send = akm_send;
+    k->recv = akm_recv;
+    device_class_set_legacy_reset(DEVICE_CLASS(oc), akm_reset);
+}
+
 static const TypeInfo htcleo_i2c_types[] = {
     {
         .name = TYPE_HTCLEO_REGDEV,
@@ -413,6 +520,12 @@ static const TypeInfo htcleo_i2c_types[] = {
         .instance_size = sizeof(HtcleoMicrop),
         .instance_init = microp_init,
         .class_init = microp_class_init,
+    }, {
+        .name = TYPE_HTCLEO_AKM,
+        .parent = TYPE_I2C_SLAVE,
+        .instance_size = sizeof(HtcleoAkm),
+        .instance_init = akm_init,
+        .class_init = akm_class_init,
     },
 };
 DEFINE_TYPES(htcleo_i2c_types)

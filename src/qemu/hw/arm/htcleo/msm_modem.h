@@ -43,6 +43,9 @@ struct MsmModemState {
     qemu_irq m2a[M2A_NUM];
     QEMUTimer *wake_timer;
     QEMUTimer *park_timer;      /* watches MAGLDR's modem mailbox */
+    QEMUTimer *q6_timer;        /* qdsp6-only: waits for AMSS's SMEM */
+    bool qdsp6_only;            /* baseband=lle: only play the QDSP6 */
+    bool q6_up;
     uint32_t last_apps;
     GByteArray *pkt_acc[SMD_NUM_CH];
 
@@ -88,6 +91,8 @@ uint32_t smem_item(MsmModemState *s, unsigned id, uint32_t *size);
 
 void msm_modem_set_smem(MsmModemState *s, uint8_t *smem);
 void msm_modem_boot(MsmModemState *s);
+/* baseband=lle: the real AMSS owns SMEM; bring up only the QDSP6 side */
+void msm_modem_qdsp6_boot(MsmModemState *s);
 
 int smd_modem_write(MsmModemState *s, SmdChan *c, const void *buf, int len);
 int smd_modem_send_packet(MsmModemState *s, SmdChan *c, const void *buf,

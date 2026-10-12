@@ -320,6 +320,12 @@ static void htcleo_ts_irq(void *opaque, int n, int level)
     msm_gpio_set_input(s->gpio, HTCLEO_GPIO_TS_IRQ, level);
 }
 
+static void htcleo_akm_irq(void *opaque, int n, int level)
+{
+    HtcleoMachineState *s = opaque;
+    msm_gpio_set_input(s->gpio, HTCLEO_GPIO_COMPASS_INT, level);
+}
+
 static const QemuInputHandler htcleo_keyboard = {
     .name  = "HTC HD2 buttons",
     .mask  = INPUT_EVENT_MASK_KEY,
@@ -488,6 +494,7 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * jumps to AMSS, so both run from here.
          */
         msm_modem_lle_reset(s->lle);
+        msm_modem_qdsp6_boot(MSM_MODEM(s->modem));
     } else {
         /* AMSS has been running since power-on and owns shared memory */
         msm_modem_boot(MSM_MODEM(s->modem));
@@ -737,6 +744,10 @@ static void htcleo_init(MachineState *machine)
             if (i < MIRQ_A2M_NUM) {
                 qdev_connect_gpio_out_named(s->csr, "a2m", i,
                         msm_modem_lle_irq(s->lle, MIRQ_A2M_0 + i));
+            } else if (i == 8) {
+                /* A2M 8 rings the QDSP6, still modelled by msm_modem */
+                qdev_connect_gpio_out_named(s->csr, "a2m", i,
+                        qdev_get_gpio_in_named(s->modem, "a2m", i));
             }
             continue;
         }
@@ -746,10 +757,8 @@ static void htcleo_init(MachineState *machine)
     for (int i = 0; i < 7 && !s->lle; i++) {
         qdev_connect_gpio_out_named(s->modem, "m2a", i, vic_in[INT_A9_M2A_0 + i]);
     }
-    if (!s->lle) {
-        qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP,
-                                    vic_in[INT_ADSP_A11]);
-    }
+    qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP,
+                                vic_in[INT_ADSP_A11]);
 
     /* GPIO */
     dev = qdev_new(TYPE_MSM_GPIO);
@@ -974,7 +983,9 @@ static void htcleo_init(MachineState *machine)
         htcleo_regdev_create(bus, 0x48, tps65023_init,
                              ARRAY_SIZE(tps65023_init));
         htcleo_regdev_create(bus, 0x26, ds2746_init, ARRAY_SIZE(ds2746_init));
-        htcleo_regdev_create(bus, 0x1C, NULL, 0);
+        dev = DEVICE(i2c_slave_create_simple(bus, TYPE_HTCLEO_AKM, 0x1C));
+        qdev_connect_gpio_out_named(dev, "irq", 0,
+                                    qemu_allocate_irq(htcleo_akm_irq, s, 0));
     }
 
     /* Buttons and touchscreen */

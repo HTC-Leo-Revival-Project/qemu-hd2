@@ -28,6 +28,7 @@
 #include "qemu/timer.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "system/runstate.h"
@@ -37,6 +38,9 @@
 #include "msm_modem.h"
 
 /* SMEM item ids (arch/arm/mach-msm/smd_private.h) */
+#define SMEM_HEAP_INFO_OFF          0xC0
+#define SMEM_SPINLOCK_ARRAY         7
+#define SMEM_SPINLOCK_SMEM_ALLOC    3
 #define SMEM_CHANNEL_ALLOC_TBL      13
 #define SMEM_SMD_BASE_ID            14
 #define SMEM_SMEM_SLOW_CLOCK_VALUE  83
@@ -833,6 +837,16 @@ static void modem_a2m(void *opaque, int n, int level)
     if (!level || !s->smem || s->taken_over) {
         return;
     }
+    if (s->qdsp6_only) {
+        /* the real AMSS has A2M 0-6; the QDSP6 listens to A2M 8 */
+        if (s->trace) {
+            qemu_log("modem: qdsp6 A2M %d\n", n);
+        }
+        if (n == 8 && s->q6_up) {
+            smd_scan(s, true);
+        }
+        return;
+    }
     switch (n) {
     case 0:
         smd_scan(s, false);
@@ -941,11 +955,97 @@ void msm_modem_boot(MsmModemState *s)
     aux_loopback(s, false);
 }
 
+/*
+ * baseband=lle: the QDSP6 as its own processor next to the real AMSS.  On
+ * the phone OSBL boots it and its firmware creates the apps <-> DSP SMD
+ * channels (the names are not in AMSS); here, once AMSS has set up SMEM,
+ * they are allocated the way the DSP does it, at the table slots and sizes
+ * a real HD2's SMEM has (42 DAL_AQ_VID, 43 DAL_AQ_AUD, 46 DAL00: 40-byte
+ * channel header, 16 KiB FIFO), or the next free slots.  The apps rings A2M 8, the DSP answers on
+ * INT_ADSP_A11; DAL is served by msm_qdsp6.c as before.  The modem <-> DSP
+ * channels (AMSS's own audio path) are not created.
+ */
+static const struct { int cid; const char *name; } q6_channels[] = {
+    { 42, "DAL_AQ_VID" }, { 43, "DAL_AQ_AUD" }, { 46, "DAL00" },
+};
+
+/* smem_alloc() for the DSP; 0 when SMEM is not ready or the lock is held */
+static uint32_t q6_smem_alloc(MsmModemState *s, unsigned id, uint32_t size)
+{
+    uint32_t e = 0xD0 + id * 16, h = SMEM_HEAP_INFO_OFF, off;
+
+    if (smem_rd(s, e)) {
+        return smem_rd(s, e + 4);
+    }
+    size = ROUND_UP(size, 8);
+    if (!smem_rd(s, h) || smem_rd(s, h + 8) < size) {
+        return 0;
+    }
+    off = smem_rd(s, h + 4);
+    smem_wr(s, e + 4, off);
+    smem_wr(s, e + 8, size);
+    smem_wr(s, e + 12, 0);
+    smem_wr(s, e, 1);
+    memset(s->smem + off, 0, size);
+    smem_wr(s, h + 4, off + size);
+    smem_wr(s, h + 8, smem_rd(s, h + 8) - size);
+    return off;
+}
+
+static void q6_poll(void *opaque)
+{
+    MsmModemState *s = opaque;
+    uint32_t tbl = smem_item(s, SMEM_CHANNEL_ALLOC_TBL, NULL);
+    uint32_t locks = smem_item(s, SMEM_SPINLOCK_ARRAY, NULL);
+
+    /* AMSS has its SMD up once the allocation table exists */
+    if (!tbl || !locks ||
+        smem_rd(s, locks + 4 * SMEM_SPINLOCK_SMEM_ALLOC)) {
+        timer_mod(s->q6_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+        return;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(q6_channels); i++) {
+        int cid = q6_channels[i].cid;
+        uint32_t e = tbl + 32 * cid;
+
+        /* AMSS may have put its own channels there: take the next free one */
+        while (cid < SMD_NUM_CH && smem_rdb(s, e)) {
+            cid++;
+            e += 32;
+        }
+        if (cid >= SMD_NUM_CH) {
+            break;
+        }
+        if (!q6_smem_alloc(s, SMEM_SMD_BASE_ID + cid, 2 * HC_SIZE) ||
+            !q6_smem_alloc(s, SMEM_SMD_FIFO_BASE_ID + cid, 0x4000)) {
+            break;
+        }
+        memset(s->smem + e, 0, 32);
+        pstrcpy((char *)s->smem + e, 20, q6_channels[i].name);
+        smem_wr(s, e + 20, cid);
+        smem_wr(s, e + 24, SMD_TYPE_APPS_DSP);
+        smem_wr(s, e + 28, 1);          /* ref_count */
+    }
+    s->q6_up = true;
+    msm_qdsp6_reset(s);
+    /* Linux probes the table when the heap moved and the DSP interrupts */
+    m2a(s, M2A_DSP);
+}
+
+void msm_modem_qdsp6_boot(MsmModemState *s)
+{
+    s->qdsp6_only = true;
+    s->q6_up = false;
+    timer_mod(s->q6_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+}
+
 static void modem_reset(DeviceState *dev)
 {
     MsmModemState *s = MSM_MODEM(dev);
     timer_del(s->wake_timer);
     timer_del(s->park_timer);
+    timer_del(s->q6_timer);
 }
 
 static void modem_realize(DeviceState *dev, Error **errp)
@@ -958,6 +1058,7 @@ static void modem_realize(DeviceState *dev, Error **errp)
     }
     s->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, modem_wake_apps, s);
     s->park_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, modem_park_poll, s);
+    s->q6_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, q6_poll, s);
     msm_modem_rpc_init(s);
     msm_atmodem_init(s);
     msm_gps_init(s);

@@ -134,6 +134,7 @@
 #define HTCLEO_GPIO_UP_INT_N            90
 #define HTCLEO_GPIO_UP_RESET_N          91
 #define HTCLEO_GPIO_TS_IRQ              92
+#define HTCLEO_GPIO_COMPASS_INT         39  /* AKM8973 INT, level high */
 #define HTCLEO_GPIO_POWER_KEY           94
 #define HTCLEO_GPIO_POWER_USB           109
 #define HTCLEO_GPIO_SD_STATUS           153
@@ -171,6 +172,7 @@
 #define TYPE_MSM_MDSP       "msm-mdsp"
 #define TYPE_HTCLEO_MICROP  "htcleo-microp"
 #define TYPE_HTCLEO_TS      "htcleo-ts"
+#define TYPE_HTCLEO_AKM     "htcleo-akm8973"
 #define TYPE_TPS65023       "tps65023"
 #define TYPE_AKM8973        "akm8973"
 #define TYPE_HTCLEO_RAMCON  "htcleo-ramconsole"
