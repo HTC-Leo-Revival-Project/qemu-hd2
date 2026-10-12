@@ -139,7 +139,7 @@ cd .. && tools/start-lle.sh          # start.sh with BASEBAND=lle and nand-lle.i
 
 Debugging:
 - `AMSSLOG=1 tools/start-lle.sh` writes AMSS's own debug log ("F3" messages) to `images/qemu.log`. It uses the TCG plugin `contrib/plugins/amsslog.c`, which hooks the msg_send functions. `AMSSLOG="1 hook=0xVA"` also reports each call of a function.
-- `TRACE=on` logs the modem core's peripheral accesses.
+- `TRACE=on` logs the modem core's peripheral accesses; `qom-set /machine/modem-lle trace-now true` (tools/qmon.py) switches it on at runtime, and `/machine/modem-lle/mdsp trace` logs DSP memory accesses. `AMSSLOG="1 mem=0xLO-0xHI"` logs the device accesses made by a code range.
 - `tools/amss_dis.py` disassembles by AMSS virtual address (ARM or Thumb). `tools/amss_xref.py` finds the code that loads a literal, and `tools/amss_fatal.py` finds ERR_FATAL sites.
 - `QMON_CPU=1 tools/qmon.py` runs monitor commands on the modem core. gdb (multiprocess stub, inferior 2) works, but it slows AMSS enough to trip its watchdog.
 
