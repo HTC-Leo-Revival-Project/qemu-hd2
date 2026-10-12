@@ -30,7 +30,7 @@
  */
 #include "qemu/osdep.h"
 #include <math.h>
-#include "msm_adreno.h"
+#include "msm_adreno_gl.h"
 
 #define SUBPIX      16
 #define MAX_CLIPPED 12
@@ -39,11 +39,7 @@
 /* Colour formats                                                      */
 /* ------------------------------------------------------------------ */
 
-typedef struct ColorFmt {
-    uint8_t bpp;        /* bytes per pixel */
-    uint8_t bits[4];    /* channel widths from bit 0 */
-    uint8_t kind;       /* 0 unorm, 1 snorm, 2 float16, 3 float32 */
-} ColorFmt;
+typedef AdrenoColorFmt ColorFmt;
 
 static const ColorFmt color_fmts[16] = {
     [0]  = { 2, { 4, 4, 4, 4 }, 0 },     /* COLORX_4_4_4_4 */
@@ -63,6 +59,11 @@ static const ColorFmt color_fmts[16] = {
     [14] = { 3, { 8, 8, 8, 0 }, 0 },     /* COLORX_8_8_8 */
     [15] = { 4, { 8, 8, 8, 8 }, 0 },
 };
+
+const AdrenoColorFmt *adreno_color_fmt(unsigned fmt)
+{
+    return &color_fmts[fmt & 15];
+}
 
 uint16_t adreno_float_to_half(float f)
 {
@@ -355,6 +356,11 @@ typedef struct DrawCtx {
     uint32_t nprims, cap;
     int64_t area;                   /* sum of bounding boxes */
     uint32_t nthreads;
+    bool persp;
+    /* host GPU backend: screen-space triangles instead of prims */
+    bool gl;
+    float *glv;
+    uint32_t glv_n, glv_cap;
 } DrawCtx;
 
 static Prim *new_prim(DrawCtx *d)
@@ -466,6 +472,40 @@ static void to_screen(DrawCtx *d, const AdrenoVertex *v, SVert *o)
 /* Primitive setup                                                     */
 /* ------------------------------------------------------------------ */
 
+/* a triangle for the host GPU (see AdrenoGlDraw) */
+static void gl_emit(DrawCtx *d, const SVert *const v[3], const int64_t x[3],
+                    const int64_t y[3], const SVert *prov, bool backface)
+{
+    int nf = ADRENO_GL_VTX_VEC4(d->ninterp) * 4;
+
+    if (d->glv_n + 3 > d->glv_cap) {
+        d->glv_cap = MAX(d->glv_cap * 2, 96);
+        d->glv = g_renew(float, d->glv, (size_t)d->glv_cap * nf);
+    }
+    for (int i = 0; i < 3; i++) {
+        float *o = d->glv + (size_t)d->glv_n++ * nf;
+        float rhw = d->persp ? v[i]->rhw : 1.0f;
+
+        o[0] = x[i] / (float)SUBPIX;
+        o[1] = y[i] / (float)SUBPIX;
+        o[2] = v[i]->z;
+        o[3] = rhw;
+        o[4] = v[i]->pc[0];
+        o[5] = v[i]->pc[1];
+        o[6] = backface;
+        o[7] = 0.0f;
+        for (int n = 0; n < d->ninterp; n++) {
+            if (d->flat_mask & (1u << n)) {
+                memcpy(o + 8 + 4 * n, prov->v->interp[n], 16);
+            } else {
+                for (int k = 0; k < 4; k++) {
+                    o[8 + 4 * n + k] = v[i]->v->interp[n][k] * rhw;
+                }
+            }
+        }
+    }
+}
+
 static void setup_triangle(DrawCtx *d, const SVert *a, const SVert *b,
                            const SVert *c, const SVert *prov, bool cull)
 {
@@ -474,6 +514,7 @@ static void setup_triangle(DrawCtx *d, const SVert *a, const SVert *b,
     int64_t x[3], y[3];
     int64_t area;
     int64_t cofs = llrintf(d->pix_center * SUBPIX);
+    int minx, maxx, miny, maxy;
     bool cw, backface;
     Prim *p;
 
@@ -508,20 +549,27 @@ static void setup_triangle(DrawCtx *d, const SVert *a, const SVert *b,
         area = -area;
     }
 
-    p = new_prim(d);
-    p->backface = backface;
-    p->minx = MAX(d->clip_x0,
-                  (int)((MIN(MIN(x[0], x[1]), x[2]) - cofs) / SUBPIX) - 1);
-    p->maxx = MIN(d->clip_x1 - 1,
-                  (int)((MAX(MAX(x[0], x[1]), x[2]) - cofs) / SUBPIX) + 1);
-    p->miny = MAX(d->clip_y0,
-                  (int)((MIN(MIN(y[0], y[1]), y[2]) - cofs) / SUBPIX) - 1);
-    p->maxy = MIN(d->clip_y1 - 1,
-                  (int)((MAX(MAX(y[0], y[1]), y[2]) - cofs) / SUBPIX) + 1);
-    if (p->minx > p->maxx || p->miny > p->maxy) {
-        d->nprims--;
+    minx = MAX(d->clip_x0,
+               (int)((MIN(MIN(x[0], x[1]), x[2]) - cofs) / SUBPIX) - 1);
+    maxx = MIN(d->clip_x1 - 1,
+               (int)((MAX(MAX(x[0], x[1]), x[2]) - cofs) / SUBPIX) + 1);
+    miny = MAX(d->clip_y0,
+               (int)((MIN(MIN(y[0], y[1]), y[2]) - cofs) / SUBPIX) - 1);
+    maxy = MIN(d->clip_y1 - 1,
+               (int)((MAX(MAX(y[0], y[1]), y[2]) - cofs) / SUBPIX) + 1);
+    if (minx > maxx || miny > maxy) {
         return;
     }
+    if (d->gl) {
+        gl_emit(d, v, x, y, prov, backface);
+        return;
+    }
+    p = new_prim(d);
+    p->backface = backface;
+    p->minx = minx;
+    p->maxx = maxx;
+    p->miny = miny;
+    p->maxy = maxy;
     d->area += (int64_t)(p->maxx - p->minx + 1) * (p->maxy - p->miny + 1);
     p->inv_area = 1.0f / (float)area;
     for (int i = 0; i < 3; i++) {
@@ -794,8 +842,7 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
     uint32_t dc = r[A2_RB_DEPTHCONTROL];
     bool stencil_en = dc & 1, z_en = dc & 2, z_write = dc & 4;
     uint8_t buf[4];
-    uint32_t raw, stored_z, sten;
-    float dz;
+    uint32_t raw, stored_z, sten, zq;
     bool pass = true, zpass = true;
     bool bf = backface && (dc & (1 << 7));
     uint32_t refmask = r[bf ? A2_RB_STENCILREFMASK_BF : A2_RB_STENCILREFMASK];
@@ -813,12 +860,10 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
         raw = ldl_le_p(buf);
         stored_z = raw >> 8;
         sten = raw & 0xff;
-        dz = stored_z / 16777215.0f;
     } else {
         raw = lduw_le_p(buf);
         stored_z = raw;
         sten = 0;
-        dz = stored_z / 65535.0f;
     }
     if (bf) {
         sfunc = (dc >> 20) & 7;
@@ -834,8 +879,11 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
     if (stencil_en) {
         pass = compare(sfunc, ref & mask, sten & mask);
     }
+    zq = d->depth_24 ? (uint32_t)lrintf(clamp01(z) * 16777215.0f)
+                     : (uint32_t)lrintf(clamp01(z) * 65535.0f);
     if (pass && z_en) {
-        zpass = compare((dc >> 4) & 7, clamp01(z), dz);
+        /* in the buffer's fixed point */
+        zpass = compare((dc >> 4) & 7, zq, stored_z);
     }
     if (stencil_en && d->depth_24) {
         uint32_t ns;
@@ -850,8 +898,7 @@ static bool depth_stencil(DrawCtx *d, AdrenoTlb *tlb, int x, int y, float z,
         sten = (sten & ~wmask) | (ns & wmask);
     }
     if (pass && zpass && z_en && z_write) {
-        stored_z = d->depth_24 ? (uint32_t)lrintf(clamp01(z) * 16777215.0f)
-                               : (uint32_t)lrintf(clamp01(z) * 65535.0f);
+        stored_z = zq;
     }
     if (stencil_en || (z_en && z_write)) {
         if (d->depth_24) {
@@ -948,7 +995,7 @@ static void shade_block(DrawCtx *d, AdrenoWorker *w, const Prim *p,
     AdrenoLanes *L = &w->lanes;
     const uint32_t *r = d->r;
     uint32_t cc = r[A2_RB_COLORCONTROL];
-    bool persp = !(r[A2_PA_SU_SC_MODE_CNTL] & (1 << 20));
+    bool persp = d->persp;
     float z[AL];
     uint32_t exec = 0;
 
@@ -1000,12 +1047,12 @@ static void shade_block(DrawCtx *d, AdrenoWorker *w, const Prim *p,
 
             L->r[d->param_gen_reg][0][l] = p->backface ? -fx : fx;
             L->r[d->param_gen_reg][1][l] = (by + lane_y[l] - d->win_y) + 0.5f;
-            L->r[d->param_gen_reg][2][l] = pw[0] * p->pc[0][0] +
-                                           pw[1] * p->pc[1][0] +
-                                           pw[2] * p->pc[2][0];
-            L->r[d->param_gen_reg][3][l] = pw[0] * p->pc[0][1] +
-                                           pw[1] * p->pc[1][1] +
-                                           pw[2] * p->pc[2][1];
+            L->r[d->param_gen_reg][2][l] = b0 * p->pc[0][0] +
+                                           b1 * p->pc[1][0] +
+                                           b2 * p->pc[2][0];
+            L->r[d->param_gen_reg][3][l] = b0 * p->pc[0][1] +
+                                           b1 * p->pc[1][1] +
+                                           b2 * p->pc[2][1];
         }
     }
     if (!cover) {
@@ -1161,6 +1208,118 @@ static void raster_run(DrawCtx *d)
 /* Resolve (EDRAM_COPY)                                                */
 /* ------------------------------------------------------------------ */
 
+/* a resolve's copy, which may wait for the end of the command kick */
+struct AdrenoResolveJob {
+    Surface src;
+    unsigned sfmt, dfmt, sswap, dswap, dmask;
+    uint32_t dpitch, dbase;
+    int offx, offy, rx0, ry0, x0, y0, x1, y1;
+    bool raw, tiled;
+    int slot;               /* the GMEM snapshot it copies from */
+};
+
+/* copy the rectangle from GMEM (the copy at gmem) to memory */
+static void resolve_copy(MsmAdrenoState *s, AdrenoResolveJob *j,
+                         uint8_t *gmem)
+{
+    AdrenoTlb *tlb = &s->workers[0].tlb;
+    const ColorFmt *sf = &color_fmts[j->sfmt], *df = &color_fmts[j->dfmt];
+    Surface *src = &j->src;
+    g_autofree uint8_t *row = g_malloc((j->x1 - j->x0) *
+                                       MAX(sf->bpp, df->bpp));
+    int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
+    adreno_tlb_flush(tlb);
+    if (src->host) {
+        src->host = gmem;
+    }
+    for (int y = j->y0; y < j->y1; y++) {
+        uint32_t dy = y - j->ry0 + j->offy;
+        uint32_t daddr = j->dbase + (dy * j->dpitch +
+                                     (j->x0 - j->rx0 + j->offx)) * df->bpp;
+
+        if (j->raw && !j->tiled && src->host && src->sx == 1) {
+            uint64_t off = src->offset + ((uint64_t)y * src->pitch + j->x0) *
+                           sf->bpp;
+
+            if (off + (j->x1 - j->x0) * sf->bpp > ADRENO_GMEM_SIZE) {
+                break;
+            }
+            adreno_tlb_write(s, tlb, daddr, gmem + off,
+                             (j->x1 - j->x0) * sf->bpp);
+            continue;
+        }
+        for (int x = j->x0; x < j->x1; x++) {
+            uint8_t px[16] = {0};
+            uint8_t *o = j->tiled ? px : row + (x - j->x0) * df->bpp;
+            uint32_t dx = x - j->rx0 + j->offx;
+            float c[4];
+
+            surface_rw(s, tlb, src, x, y, px, false);
+            if (!j->raw) {
+                color_unpack(j->sfmt, px, c);
+                if (j->sswap == 1) {
+                    swap_rb(c);
+                }
+                if (j->dmask != 0xf) {
+                    uint8_t oldpx[16] = {0};
+                    float old[4];
+
+                    adreno_tlb_read(s, tlb, j->tiled ?
+                                    j->dbase + adreno_tiled_offset(dx, dy,
+                                        j->dpitch, ctz32(df->bpp)) :
+                                    daddr + (x - j->x0) * df->bpp,
+                                    oldpx, df->bpp);
+                    color_unpack(j->dfmt, oldpx, old);
+                    if (j->dswap == 1) {
+                        swap_rb(old);
+                    }
+                    for (int k = 0; k < 4; k++) {
+                        if (!(j->dmask & (1 << k))) {
+                            c[k] = old[k];
+                        }
+                    }
+                }
+                if (j->dswap == 1) {
+                    swap_rb(c);
+                }
+                color_pack(j->dfmt, c, o);
+            } else if (!j->tiled) {
+                memcpy(o, px, df->bpp);
+            }
+            if (j->tiled) {
+                /* a tiled destination (a texture): pixel by pixel */
+                adreno_tlb_write(s, tlb, j->dbase +
+                                 adreno_tiled_offset(dx, dy, j->dpitch,
+                                                     ctz32(df->bpp)),
+                                 o, df->bpp);
+            }
+        }
+        if (!j->tiled) {
+            adreno_tlb_write(s, tlb, daddr, row, (j->x1 - j->x0) * df->bpp);
+        }
+    }
+    if (s->stats_on) {
+        s->st.resolves++;
+        s->st.resolve += g_get_monotonic_time() - t0;
+    }
+}
+
+void adreno_resolves_flush(MsmAdrenoState *s)
+{
+    if (!s->nresolves) {
+        return;
+    }
+    adreno_gl_snapshots_wait(s);
+    for (uint32_t i = 0; i < s->nresolves; i++) {
+        AdrenoResolveJob *j = &s->resolves[i];
+
+        resolve_copy(s, j, adreno_gl_snapshot_ptr(s, j->slot));
+    }
+    s->nresolves = 0;
+    adreno_gl_snapshots_release(s);
+}
+
 static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
 {
     MsmAdrenoState *s = d->s;
@@ -1180,12 +1339,8 @@ static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
     int x0, y0, x1, y1, rx0, ry0;
     Surface src;
     const ColorFmt *sf = &color_fmts[sfmt], *df = &color_fmts[dfmt];
-    bool raw = sfmt == dfmt && sswap == dswap && dmask == 0xf &&
-               !(dinfo & 7);
-    bool tiled = !(dinfo & (1 << 3)) && is_power_of_2(df->bpp);
-    g_autofree uint8_t *row = NULL;
+    AdrenoResolveJob job;
 
-    adreno_tlb_flush(tlb);
     for (int i = 0; i < nv; i++) {
         SVert sv;
 
@@ -1219,72 +1374,38 @@ static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
     if (!dpitch) {
         dpitch = src.pitch;
     }
-    row = g_malloc((x1 - x0) * MAX(sf->bpp, df->bpp));
-    for (int y = y0; y < y1; y++) {
-        uint32_t dy = y - ry0 + offy;
-        uint32_t daddr = dbase + (dy * dpitch + (x0 - rx0 + offx)) * df->bpp;
+    job = (AdrenoResolveJob) {
+        .src = src, .sfmt = sfmt, .dfmt = dfmt, .sswap = sswap,
+        .dswap = dswap, .dmask = dmask, .dpitch = dpitch, .dbase = dbase,
+        .offx = offx, .offy = offy, .rx0 = rx0, .ry0 = ry0,
+        .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1,
+        .raw = sfmt == dfmt && sswap == dswap && dmask == 0xf && !(dinfo & 7),
+        .tiled = !(dinfo & (1 << 3)) && is_power_of_2(df->bpp),
+    };
+    {
+        /* the destination rows, whole tile rows when tiled */
+        uint64_t rowb = (uint64_t)dpitch * df->bpp;
+        uint64_t lo = dbase + ((y0 - ry0 + offy) & ~31) * rowb;
+        uint64_t hi = dbase + ROUND_UP(y1 - ry0 + offy, 32) * rowb;
 
-        if (raw && !tiled && src.host && src.sx == 1) {
-            uint64_t off = src.offset + ((uint64_t)y * src.pitch + x0) *
-                           sf->bpp;
-
-            if (off + (x1 - x0) * sf->bpp > ADRENO_GMEM_SIZE) {
-                break;
-            }
-            adreno_tlb_write(s, tlb, daddr, s->gmem + off,
-                             (x1 - x0) * sf->bpp);
-            continue;
-        }
-        for (int x = x0; x < x1; x++) {
-            uint8_t px[16] = {0};
-            uint8_t *o = tiled ? px : row + (x - x0) * df->bpp;
-            uint32_t dx = x - rx0 + offx;
-            float c[4];
-
-            surface_rw(s, tlb, &src, x, y, px, false);
-            if (!raw) {
-                color_unpack(sfmt, px, c);
-                if (sswap == 1) {
-                    swap_rb(c);
-                }
-                if (dmask != 0xf) {
-                    uint8_t oldpx[16] = {0};
-                    float old[4];
-
-                    adreno_tlb_read(s, tlb, tiled ?
-                                    dbase + adreno_tiled_offset(dx, dy,
-                                        dpitch, ctz32(df->bpp)) :
-                                    daddr + (x - x0) * df->bpp,
-                                    oldpx, df->bpp);
-                    color_unpack(dfmt, oldpx, old);
-                    if (dswap == 1) {
-                        swap_rb(old);
-                    }
-                    for (int k = 0; k < 4; k++) {
-                        if (!(dmask & (1 << k))) {
-                            c[k] = old[k];
-                        }
-                    }
-                }
-                if (dswap == 1) {
-                    swap_rb(c);
-                }
-                color_pack(dfmt, c, o);
-            } else if (!tiled) {
-                memcpy(o, px, df->bpp);
-            }
-            if (tiled) {
-                /* a tiled destination (a texture): pixel by pixel */
-                adreno_tlb_write(s, tlb, dbase +
-                                 adreno_tiled_offset(dx, dy, dpitch,
-                                                     ctz32(df->bpp)),
-                                 o, df->bpp);
-            }
-        }
-        if (!tiled) {
-            adreno_tlb_write(s, tlb, daddr, row, (x1 - x0) * df->bpp);
-        }
+        adreno_mem_written(s, lo, MIN(hi, UINT32_MAX));
     }
+    /*
+     * With the host GPU, a copy of GMEM is taken on the GPU and copied to
+     * memory when the commands are done: no waiting for the GPU per bin.
+     */
+    if (!(copyc & 0xf8) && src.host && adreno_gl_gmem_snapshot(s, &job.slot)) {
+        if (s->nresolves == s->cap_resolves) {
+            s->cap_resolves = MAX(16, s->cap_resolves * 2);
+            s->resolves = g_renew(AdrenoResolveJob, s->resolves,
+                                  s->cap_resolves);
+        }
+        s->resolves[s->nresolves++] = job;
+        return;
+    }
+    adreno_resolves_flush(s);
+    adreno_gl_gmem_to_cpu(s);
+    resolve_copy(s, &job, s->gmem);
 
     /* clear the source after the copy */
     if ((copyc >> 4) & 0xf) {
@@ -1319,48 +1440,53 @@ static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
             }
         }
     }
+    if (copyc & 0xf8) {
+        adreno_gl_gmem_from_cpu(s);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* Draw                                                                */
 /* ------------------------------------------------------------------ */
 
-static uint32_t fetch_index(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t i,
-                            unsigned src, uint32_t init, uint32_t index_base,
-                            const uint32_t *imm, uint32_t imm_dwords)
+/* the draw's vertex indices, with VGT_INDX_OFFSET and the index clamp */
+static void fetch_indices(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t *idx,
+                          uint32_t n, unsigned src, uint32_t init,
+                          uint32_t index_base, const uint32_t *imm,
+                          uint32_t imm_dwords)
 {
     bool i32 = init & (1 << 11), i8 = init & (1 << 13);
-    uint32_t idx = i;
+    uint32_t ofs = s->regs[A2_VGT_INDX_OFFSET];
+    uint32_t lo = s->regs[A2_VGT_MIN_VTX_INDX];
+    uint32_t hi = s->regs[A2_VGT_MAX_VTX_INDX];
 
     if (src == 0) {
-        if (i32) {
-            uint32_t v = 0;
+        /* DMA: the index buffer in one read */
+        unsigned size = i32 ? 4 : i8 ? 1 : 2;
+        g_autofree uint8_t *buf = g_malloc((size_t)n * size);
 
-            adreno_tlb_read(s, tlb, index_base + i * 4, &v, 4);
-            idx = le32_to_cpu(v);
-        } else if (i8) {
-            uint8_t b = 0;
-
-            adreno_tlb_read(s, tlb, index_base + i, &b, 1);
-            idx = b;
-        } else {
-            uint16_t h = 0;
-
-            adreno_tlb_read(s, tlb, index_base + i * 2, &h, 2);
-            idx = le16_to_cpu(h);
+        adreno_tlb_read(s, tlb, index_base, buf, n * size);
+        for (uint32_t i = 0; i < n; i++) {
+            idx[i] = i32 ? ldl_le_p(buf + 4 * i) :
+                     i8 ? buf[i] : lduw_le_p(buf + 2 * i);
         }
     } else if (src == 1) {
-        if (i32) {
-            idx = i < imm_dwords ? imm[i] : 0;
-        } else {
-            idx = (i / 2) < imm_dwords ? (imm[i / 2] >> (16 * (i & 1))) &
-                                         0xffff : 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (i32) {
+                idx[i] = i < imm_dwords ? imm[i] : 0;
+            } else {
+                idx[i] = (i / 2) < imm_dwords ?
+                         (imm[i / 2] >> (16 * (i & 1))) & 0xffff : 0;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            idx[i] = i;
         }
     }
-    idx += s->regs[A2_VGT_INDX_OFFSET];
-    idx = MIN(MAX(idx, s->regs[A2_VGT_MIN_VTX_INDX]),
-              s->regs[A2_VGT_MAX_VTX_INDX]);
-    return idx;
+    for (uint32_t i = 0; i < n; i++) {
+        idx[i] = MIN(MAX(idx[i] + ofs, lo), hi);
+    }
 }
 
 /* shade the vertices of the index list, AL at a time */
@@ -1437,6 +1563,72 @@ static AdrenoVertex *shade_vertices(DrawCtx *d, const uint32_t *idx,
     return out;
 }
 
+static AdrenoGlDraw gl_draw_desc(DrawCtx *d)
+{
+    AdrenoGlDraw g = {
+        .ps = d->ps,
+        .ninterp = d->ninterp,
+        .flat_mask = d->flat_mask,
+        .param_gen = d->param_gen,
+        .param_gen_reg = d->param_gen_reg,
+        .persp = d->persp,
+        .provoking_last = d->provoking_last,
+        .win_offset_vtx = d->win_offset_vtx,
+        .win_x = d->win_x,
+        .win_y = d->win_y,
+        .pix_ofs = 0.5f - d->pix_center,
+        .clip_x0 = d->clip_x0, .clip_y0 = d->clip_y0,
+        .clip_x1 = d->clip_x1, .clip_y1 = d->clip_y1,
+        .color_off = d->color.offset,
+        .depth_off = d->depth.offset,
+        .pitch = d->color.pitch,
+        .sx = d->color.sx, .sy = d->color.sy,
+        .color_fmt = d->color_fmt,
+        .color_swap = d->color_swap,
+        .color_write = d->color_write,
+        .depth_24 = d->depth_24,
+    };
+
+    return g;
+}
+
+/*
+ * Triangle lists, strips and fans and points go to the host GPU whole: it
+ * runs the vertex shader too.  Rectangles and lines take the CPU's vertex
+ * path.
+ */
+static bool gl_draw_gpu(DrawCtx *d, unsigned prim, const uint32_t *idx,
+                        uint32_t n)
+{
+    MsmAdrenoState *s = d->s;
+    AdrenoGlDraw g;
+
+    if (!d->gl) {
+        return false;
+    }
+    switch (prim) {
+    case A2_PT_TRILIST: case A2_PT_TRISTRIP: case A2_PT_TRIFAN:
+    case A2_PT_POINTLIST: case A2_PT_POINTLIST_PSIZE:
+        break;
+    default:
+        return false;
+    }
+    g = gl_draw_desc(d);
+    g.vs = adreno_program(s, A2_SHADER_VS);
+    g.prim = prim;
+    g.idx = idx;
+    g.nidx = n;
+    g.min_idx = UINT32_MAX;
+    g.max_idx = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        g.min_idx = MIN(g.min_idx, idx[i]);
+        g.max_idx = MAX(g.max_idx, idx[i]);
+    }
+    adreno_gl_draw(s, &g);
+    s->st.gpu_draws++;
+    return true;
+}
+
 void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
                  uint32_t index_base, uint32_t index_size,
                  const uint32_t *imm, uint32_t imm_dwords)
@@ -1470,6 +1662,7 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     /* PARAM_SHADE: 1 = interpolated (Gouraud), 0 = flat */
     d->flat_mask = ~r[A2_SQ_INTERPOLATOR_CNTL] & 0xffff;
     d->provoking_last = r[A2_PA_SU_SC_MODE_CNTL] & (1 << 19);
+    d->persp = !(r[A2_PA_SU_SC_MODE_CNTL] & (1 << 20));
     d->pix_center = (r[A2_PA_SU_VTX_CNTL] & 1) ? 0.5f : 0.0f;
     d->win_x = sextract32(r[A2_PA_SC_WINDOW_OFFSET], 0, 15);
     d->win_y = sextract32(r[A2_PA_SC_WINDOW_OFFSET], 16, 15);
@@ -1526,6 +1719,21 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         }
     }
 
+    if (mode != A2_EDRAM_COPY) {
+        uint32_t dc = r[A2_RB_DEPTHCONTROL];
+
+        d->ps = adreno_program(s, A2_SHADER_PS);
+        /* depth/stencil before shading when nothing can drop the pixel */
+        d->early_z = (dc & 3) && !d->ps->kills && !d->ps->exports_depth &&
+                     !(r[A2_RB_COLORCONTROL] & (3 << 3));
+        /*
+         * The host GPU renders to GMEM; render targets in memory (the
+         * blob's texture copies) are drawn here.
+         */
+        d->gl = (!d->color_write || d->color.host) &&
+                (!(dc & 3) || d->depth.host) && adreno_gl_available(s);
+    }
+
     /* the vertices */
     n = num_indices;
     if (mode == A2_EDRAM_COPY) {
@@ -1534,9 +1742,10 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     idx = g_new(uint32_t, n);
     slot = g_new(uint32_t, n);
     adreno_tlb_flush(&s->workers[0].tlb);
-    for (uint32_t i = 0; i < n; i++) {
-        idx[i] = fetch_index(s, &s->workers[0].tlb, i, src, init, index_base,
-                             imm, imm_dwords);
+    fetch_indices(s, &s->workers[0].tlb, idx, n, src, init, index_base, imm,
+                  imm_dwords);
+    if (mode != A2_EDRAM_COPY && gl_draw_gpu(d, prim, idx, n)) {
+        return;
     }
     verts = shade_vertices(d, idx, n, slot);
 
@@ -1550,13 +1759,9 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         return;
     }
 
-    {
-        uint32_t dc = r[A2_RB_DEPTHCONTROL];
-
-        d->ps = adreno_program(s, A2_SHADER_PS);
-        /* depth/stencil before shading when nothing can drop the pixel */
-        d->early_z = (dc & 3) && !d->ps->kills && !d->ps->exports_depth &&
-                     !(r[A2_RB_COLORCONTROL] & (3 << 3));
+    if (!d->gl) {
+        adreno_resolves_flush(s);
+        adreno_gl_gmem_to_cpu(s);
     }
 
 #define V(i) (&verts[slot[(i)]])
@@ -1617,7 +1822,23 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         break;
     }
 #undef V
-    raster_run(d);
+    if (d->gl) {
+        AdrenoGlDraw g = gl_draw_desc(d);
+
+        g.verts = d->glv;
+        g.nverts = d->glv_n;
+        adreno_gl_draw(s, &g);
+        s->st.cpu_draws++;
+        g_free(d->glv);
+    } else {
+        raster_run(d);
+        s->st.soft_draws++;
+        /* the CPU drew into GMEM or memory */
+        adreno_gl_gmem_from_cpu(s);
+        if (!d->color.host || !d->depth.host) {
+            adreno_mem_written(s, 0, UINT32_MAX);
+        }
+    }
     g_free(d->prims);
     (void)index_size;
 }

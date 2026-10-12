@@ -268,6 +268,48 @@ void adreno_stl(MsmAdrenoState *s, uint32_t va, uint32_t val)
     adreno_write(s, va & ~3u, &val, 4);
 }
 
+void adreno_mem_written(MsmAdrenoState *s, uint32_t lo, uint32_t hi)
+{
+    unsigned n = s->gpu_writes++ % ARRAY_SIZE(s->write_log);
+
+    s->write_log[n].lo = lo;
+    s->write_log[n].hi = hi;
+}
+
+bool adreno_gpu_wrote(MsmAdrenoState *s, const AdrenoMemStamp *st,
+                      uint32_t lo, uint32_t hi)
+{
+    if (s->gpu_writes - st->writes > ARRAY_SIZE(s->write_log)) {
+        return true;
+    }
+    for (uint32_t i = st->writes; i != s->gpu_writes; i++) {
+        unsigned n = i % ARRAY_SIZE(s->write_log);
+
+        if (s->write_log[n].lo < hi && lo < s->write_log[n].hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool adreno_mem_unchanged(MsmAdrenoState *s, AdrenoMemStamp *st, uint32_t lo,
+                          uint32_t hi)
+{
+    bool same = st->kick == s->kick_epoch &&
+                s->gpu_writes - st->writes <= ARRAY_SIZE(s->write_log);
+
+    for (uint32_t i = st->writes; same && i != s->gpu_writes; i++) {
+        unsigned n = i % ARRAY_SIZE(s->write_log);
+
+        if (s->write_log[n].lo < hi && lo < s->write_log[n].hi) {
+            same = false;
+        }
+    }
+    st->kick = s->kick_epoch;
+    st->writes = s->gpu_writes;
+    return same;
+}
+
 void adreno_tlb_flush(AdrenoTlb *tlb)
 {
     memset(tlb->tag, 0, sizeof(tlb->tag));
@@ -400,6 +442,9 @@ static void adreno_reg_write(MsmAdrenoState *s, uint32_t reg, uint32_t val)
         return;
     }
     r[reg] = val;
+    if (reg >= A2_SQ_CONSTANT_0 && reg < A2_SQ_CONSTANT_0 + 512 * 4) {
+        s->const_dirty = true;
+    }
     /* scratch registers: SCRATCH_UMSK selects the ones mirrored in memory */
     if (reg >= A2_SCRATCH_REG0 && reg < A2_SCRATCH_REG0 + 8) {
         unsigned n = reg - A2_SCRATCH_REG0;
@@ -720,6 +765,11 @@ static uint32_t cp_type3(MsmAdrenoState *s, uint32_t hdr, uint32_t *p,
             for (uint32_t k = 0; k < cnt && base + off + k < ADRENO_NREGS;
                  k++) {
                 s->regs[base + off + k] = adreno_ldl(s, mem + (off + k) * 4);
+                if (base + off + k >= A2_SQ_CONSTANT_0 &&
+                    base + off + k < A2_SQ_CONSTANT_0 + 512 * 4) {
+                    /* the host GPU's copy of the constants is stale */
+                    s->const_dirty = true;
+                }
             }
         }
         break;
@@ -887,12 +937,42 @@ static void cp_run_ring(MsmAdrenoState *s)
     if (r[A2_CP_ME_CNTL] & (1u << 28)) {
         return;     /* micro engine halted */
     }
+    /* the CPU may have written what the commands use */
+    s->kick_epoch++;
     rb.base = r[A2_CP_RB_BASE];
     rb.size = size;
     rb.pos = r[A2_CP_RB_RPTR] % size;
     rb.end = r[A2_CP_RB_WPTR] % size;
     s->ib_depth = 0;
-    cp_exec_stream(s, &rb);
+    {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
+        cp_exec_stream(s, &rb);
+        if (s->stats_on) {
+            int64_t now = g_get_monotonic_time();
+
+            s->st.kicks++;
+            s->st.cp += now - t0;
+            if (now - s->st.last >= s->stats_us) {
+                fprintf(stderr, "adreno: %" PRIu64 " kicks, draws %" PRIu64
+                        " gpu %" PRIu64 " cpu-vertex %" PRIu64 " soft, %"
+                        PRIu64 " resolves, %" PRIu64 " texture hashes, %"
+                        PRIu64 " decodes (%.1f MB hashed); ms: cp %.1f, "
+                        "gmem sync %.1f, "
+                        "resolve %.1f, textures %.1f, vertex upload %.1f, "
+                        "GPU span %.1f\n",
+                        s->st.kicks, s->st.gpu_draws, s->st.cpu_draws,
+                        s->st.soft_draws, s->st.resolves, s->st.hashes,
+                        s->st.decodes, s->st.hash_bytes / 1e6, s->st.cp / 1e3,
+                        s->st.sync / 1e3, s->st.resolve / 1e3, s->st.tex / 1e3,
+                        s->st.upload / 1e3, s->st.gpu / 1e3);
+                memset(&s->st, 0, sizeof(s->st));
+                s->st.last = now;
+            }
+        }
+    }
+    /* the resolves are in memory before the CPU looks */
+    adreno_resolves_flush(s);
     r[A2_CP_RB_RPTR] = rb.pos;
     /* RB_NO_UPDATE clear: the read pointer goes to memory */
     if (!(r[A2_CP_RB_CNTL] & (1u << 27))) {
@@ -971,6 +1051,7 @@ static void adreno_reset(DeviceState *dev)
     MsmAdrenoState *s = MSM_ADRENO(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->const_dirty = true;
     memset(s->imem_size, 0, sizeof(s->imem_size));
     memset(s->shadow_en, 0, sizeof(s->shadow_en));
     s->regs[A2_CP_ME_CNTL] = 1u << 28;     /* halted until the driver starts it */
@@ -1066,6 +1147,15 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     s->gmem = g_malloc0(ADRENO_GMEM_SIZE);
     s->pkt = g_new(uint32_t, 0x4000 + 1);
 
+    s->const_dirty = true;
+    s->stats_on = getenv("ADRENO_STATS") != NULL;
+    s->stats_us = s->stats_on ? atof(getenv("ADRENO_STATS")) * 1e6 : 0;
+    if (s->stats_us < 100000) {
+        s->stats_us = 5000000;
+    }
+    if (!s->backend) {
+        s->backend = g_strdup("gl");
+    }
     /* worker 0 is the vCPU thread itself; the rest are rasterizer threads */
     s->nthreads = MAX(1, MIN(s->nthreads, ADRENO_MAX_THREADS));
     s->workers = g_new0(AdrenoWorker, s->nthreads);
@@ -1099,6 +1189,8 @@ static void adreno_unrealize(DeviceState *dev)
 static const Property adreno_props[] = {
     /* rasterizer threads, the vCPU's included */
     DEFINE_PROP_UINT32("threads", MsmAdrenoState, nthreads, 6),
+    /* "gl": the host GPU (OpenGL 4.5 with interlock), "soft": the CPU */
+    DEFINE_PROP_STRING("backend", MsmAdrenoState, backend),
 };
 
 static void adreno_class_init(ObjectClass *klass, const void *data)

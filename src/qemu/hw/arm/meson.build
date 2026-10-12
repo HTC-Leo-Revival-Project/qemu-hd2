@@ -146,7 +146,16 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/msm_adreno_sq.c',
   'htcleo/msm_adreno_draw.c',
   'htcleo/msm_adreno_tex.c',
+  'htcleo/msm_adreno_glsl.c',
 ))
+# the Adreno host GPU backend (stubs without OpenGL)
+if opengl.found()
+  arm_common_ss.add(when: 'CONFIG_HTCLEO',
+                    if_true: [files('htcleo/msm_adreno_gl.c'), opengl])
+else
+  arm_common_ss.add(when: 'CONFIG_HTCLEO',
+                    if_true: files('htcleo/msm_adreno_gl.c'))
+endif
 
 arm_common_ss.add(files('boot.c'))
 
