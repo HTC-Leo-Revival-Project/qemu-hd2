@@ -319,6 +319,49 @@ static void lle_osbl_smem_init(MsmModemLleState *s)
     }
 }
 
+/*
+ * HTC's OSBL also fills a configuration block at SMEM + 0xEF000 that AMSS
+ * and Linux read: the board ID, the radio version, the CID, the NAND ID,
+ * the boot reason and whether a USB cable (VBUS) is present.  Values as a
+ * real HD2 with radio 2.15.50.14 has them, minus its serial numbers.
+ */
+static void lle_osbl_htc_config(MsmModemLleState *s)
+{
+    static const struct { uint32_t off, val; } words[] = {
+        { 0xEF0A0, 0x0001E000 }, { 0xEF0A4, 6 },
+        { 0xEF0C8, 0x0001F400 }, { 0xEF0CC, 7 },
+        { 0xEF200, 0x302 },
+        { 0xEF20C, 1 },                 /* VBUS: USB cable plugged in */
+        { 0xEF210, 0x3E },              /* board ID */
+        { 0xEF244, 1 }, { 0xEF248, 4 }, { 0xEF24C, 0x26 },
+        { 0xEF250, 0x00F2A000 },
+        { 0xEF298, 0x01000100 }, { 0xEF2A0, 1 },
+        { 0xEF2AC, 0x5501BCEC },        /* NAND ID */
+        { 0xEF2C8, 0xFFFFFFFF }, { 0xEF2CC, 0xFFFFFFFF },
+        { 0xEF2E8, 0x00021904 }, { 0xEF2EC, 0x8004FFFF },
+        { 0xEF2F0, 0x020000D4 }, { 0xEF2F4, 0x00000102 },
+        { 0xEF2F8, 0xFFFFFFFF }, { 0xEF2FC, 0xFFFFFFFF },
+    };
+    static const struct { uint32_t off; const char *str; } strs[] = {
+        { 0xEF220, "2.15.50.14" },      /* radio */
+        { 0xEF230, "15.42.50.11U" },
+        { 0xEF270, "HTC__032" },        /* CID */
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(words); i++) {
+        uint32_t v = cpu_to_le32(words[i].val);
+        address_space_write(&address_space_memory,
+                            MSM_SHARED_RAM_PHYS + words[i].off,
+                            MEMTXATTRS_UNSPECIFIED, &v, 4);
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(strs); i++) {
+        address_space_write(&address_space_memory,
+                            MSM_SHARED_RAM_PHYS + strs[i].off,
+                            MEMTXATTRS_UNSPECIFIED, strs[i].str,
+                            strlen(strs[i].str) + 1);
+    }
+}
+
 void msm_modem_lle_reset(DeviceState *dev)
 {
     MsmModemLleState *s = MSM_MODEM_LLE(dev);
@@ -333,6 +376,7 @@ void msm_modem_lle_reset(DeviceState *dev)
         exit(1);
     }
     lle_osbl_smem_init(s);
+    lle_osbl_htc_config(s);
     /* OSBL jumps to AMSS in SVC mode with the MMU and caches off */
     cpu_set_pc(CPU(&s->cpu), s->entry);
     info_report("htcleo: modem core starts AMSS at 0x%08x", s->entry);
