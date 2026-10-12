@@ -52,6 +52,7 @@
 #include "htcleo.h"
 #include "msm_regfile.h"
 #include "msm_mdp.h"
+#include "msm_adreno.h"
 #include "msm_modem.h"
 #include "htcleo_i2cdev.h"
 #include "hw/i2c/i2c.h"
@@ -948,7 +949,13 @@ static void htcleo_init(MachineState *machine)
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, MSM_HSUSB_PHYS);
     sysbus_connect_irq(sbd, 0, vic_in[INT_USB_HS]);
-    htcleo_regfile("msm-gpu", MSM_GPU_PHYS, 0x20000);
+    /* Adreno 200 GPU */
+    dev = qdev_new(TYPE_MSM_ADRENO);
+    sbd = SYS_BUS_DEVICE(dev);
+    object_property_add_child(OBJECT(machine), "gpu", OBJECT(dev));
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, MSM_GPU_PHYS);
+    sysbus_connect_irq(sbd, 0, vic_in[INT_GRAPHICS]);
 
     /* I2C bus and the board's chips */
     {

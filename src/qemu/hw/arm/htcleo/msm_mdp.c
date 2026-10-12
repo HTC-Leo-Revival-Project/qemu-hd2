@@ -162,8 +162,9 @@ void msm_mdp_setup_scanout(MsmMdpState *s, uint32_t base, uint32_t w,
     s->regs[MDP_DMA_P_IBUF_ADDR >> 2] = base;
     s->regs[MDP_DMA_P_SIZE >> 2] = (h << 16) | w;
     s->regs[MDP_DMA_P_IBUF_Y_STRIDE >> 2] = stride;
-    /* DMA_OUT_SEL_LCDC | format */
-    s->regs[MDP_DMA_P_CONFIG >> 2] = (2u << 19) | (rgb565 ? (1u << 25) : (2u << 25));
+    /* DMA_OUT_SEL_LCDC | format | PACK_PATTERN_RGB (32 bpp: B,G,R,X) */
+    s->regs[MDP_DMA_P_CONFIG >> 2] = (2u << 19) | (0x21u << 8) |
+                                     (rgb565 ? (1u << 25) : (2u << 25));
     s->regs[MDP_LCDC_EN >> 2] = 1;
     timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 60);
@@ -186,6 +187,7 @@ static bool mdp_gfx_update(void *opaque)
     uint32_t size = s->regs[MDP_DMA_P_SIZE >> 2];
     uint32_t stride = s->regs[MDP_DMA_P_IBUF_Y_STRIDE >> 2];
     uint32_t fmt = (s->regs[MDP_DMA_P_CONFIG >> 2] >> 25) & 3;
+    uint32_t pack = (s->regs[MDP_DMA_P_CONFIG >> 2] >> 8) & 0x3f;
     uint32_t w = size & 0x7FF, h = (size >> 16) & 0x7FF;
     int bpp = fmt == 1 ? 2 : fmt == 2 ? 4 : 3;
     uint8_t *dst;
@@ -239,10 +241,19 @@ static bool mdp_gfx_update(void *opaque)
                 g |= g >> 6;
                 b |= b >> 5;
             } else if (bpp == 4) {
-                /* XRGB8888 in memory as B,G,R,X (little endian 0xXXRRGGBB) */
-                b = line[4 * x];
-                g = line[4 * x + 1];
-                r = line[4 * x + 2];
+                /*
+                 * XRGB8888: the pack pattern names the component in each
+                 * byte, from byte 0 up (2 bits each: 0 G, 1 B, 2 R).  The
+                 * kernel's 32 bpp framebuffer is R,G,B,X with PATTERN_BGR.
+                 */
+                uint8_t c[3] = { 0, 0, 0 };
+
+                for (int k = 0; k < 3; k++) {
+                    c[((pack >> (2 * k)) & 3) % 3] = line[4 * x + k];
+                }
+                g = c[0];
+                b = c[1];
+                r = c[2];
             } else {
                 r = line[3 * x];
                 g = line[3 * x + 1];

@@ -138,6 +138,9 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/msm_mtmr.c',
   'htcleo/msm_mdsp.c',
   'htcleo/msm_ssbi.c',
+  'htcleo/msm_adreno.c',
+  'htcleo/msm_adreno_sq.c',
+  'htcleo/msm_adreno_draw.c',
 ))
 
 arm_common_ss.add(files('boot.c'))
