@@ -22,6 +22,13 @@
  * MAGLDR does.  The peripheral calls msm_adm_crci_kick() when that
  * changes, and the channel carries on from the waiting descriptor.
  *
+ * The four security domains also have a page each, at 0xA9400000 (SD0),
+ * 0xA9500000 (SD1), 0xA9600000 (SD2) and 0xA9700000 (SD3), with the
+ * domain's registers at its usual offset in the page: AMSS drives SD0
+ * through 0xA9400000.  Interrupt 0 is raised for any domain; interrupts
+ * 1-4 are the per-domain lines, SD3 being the apps processor's
+ * INT_ADM_AARM and SD0 the modem's.
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
@@ -111,7 +118,8 @@ static bool uartdm_window(uint32_t a)
 struct MsmAdmState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
-    qemu_irq irq;
+    qemu_irq irq;               /* any domain (one processor owns them all) */
+    qemu_irq dom_irq[ADM_DOMAINS];
     AdmChannel ch[ADM_DOMAINS][ADM_CHANNELS];
     uint32_t isr[ADM_DOMAINS];
     uint32_t regs[0x400];
@@ -166,6 +174,7 @@ static void adm_update(MsmAdmState *s)
         if (s->isr[d]) {
             level = true;
         }
+        qemu_set_irq(s->dom_irq[d], s->isr[d] != 0);
     }
     qemu_set_irq(s->irq, level);
 }
@@ -543,6 +552,9 @@ static void adm_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &adm_ops, s, "msm-adm", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+    for (int d = 0; d < ADM_DOMAINS; d++) {
+        sysbus_init_irq(sbd, &s->dom_irq[d]);
+    }
 }
 
 static void adm_class_init(ObjectClass *oc, const void *data)

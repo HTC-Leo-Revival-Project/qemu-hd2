@@ -11,6 +11,15 @@
 
 #define TYPE_MSM_MODEM_LLE "msm-modem-lle"
 
+/*
+ * Modem VIC inputs.  AMSS names interrupts by tramp id; its tramp table maps
+ * them to HAL ids and the HAL table to VIC lines (read at run time):
+ * tramp 59 (DMOV dev 0) -> HAL 55 -> line 52, tramp 162 (watchdog bark,
+ * FIQ) -> HAL 146 -> line 55, the L4 tick is line 32.
+ */
+#define MIRQ_ADM0           52
+#define MIRQ_DOG_BARK       55
+
 /* load AMSS and start the modem core at its entry point */
 void msm_modem_lle_reset(DeviceState *dev);
 ARMCPU *msm_modem_lle_cpu(DeviceState *dev);

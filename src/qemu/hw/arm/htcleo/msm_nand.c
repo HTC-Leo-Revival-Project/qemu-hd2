@@ -18,7 +18,9 @@
  * In ECC mode with the bad-block byte in the user area (CFG1 bit16 = 0)
  * the controller keeps the factory marker at BAD_BLOCK_BYTE_NUM of the last
  * codeword and relocates the user data there (one byte, or two on the HD2's
- * x16 part) to the bbf positions at the end of the codeword.  Raw
+ * x16 part) to the bbf positions at the end of the codeword.  A read puts
+ * the user data back and reports the marker in BUFFER_STATUS[31:16]
+ * (BAD_BLOCK_STATUS), which is how AMSS's bad-block scan reads it.  Raw
  * mode (CFG1 bit0 = 1) moves the codeword untouched.  Programming can only
  * clear bits, erase sets a whole block back to 0xFF.
  *
@@ -170,9 +172,15 @@ static void nand_do_read(MsmNandState *s)
     nand_read_cw(s, s->op_page, s->op_cw, raw);
     memcpy(s->buf, raw, CW_RAW);
     if (bb_relocated(s, s->op_cw)) {
+        uint32_t bbs = 0xFFFF;
+
         for (int i = 0; i < bb_width(s); i++) {
             s->buf[bb_pos(s) + i] = raw[CW_RAW - 2 + i];
+            bbs = deposit32(bbs, 8 * i, 8, raw[bb_pos(s) + i]);
         }
+        /* BUFFER_STATUS[31:16] BAD_BLOCK_STATUS: the marker it found */
+        s->regs[NAND_BUFFER_STATUS >> 2] =
+            deposit32(s->regs[NAND_BUFFER_STATUS >> 2], 16, 16, bbs);
     }
     if (s->op_off) {
         /*
@@ -367,8 +375,13 @@ static void nand_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     }
     switch (off) {
     case NAND_ADDR0:
-        /* a new address always starts a new operation */
-        s->op_remaining = 0;
+        /*
+         * A new address starts a new operation.  AMSS rewrites the same
+         * address before every codeword of a page, which carries on.
+         */
+        if (val != s->regs[off >> 2]) {
+            s->op_remaining = 0;
+        }
         s->regs[off >> 2] = val;
         break;
     case NAND_EXEC_CMD:

@@ -773,7 +773,21 @@ static void htcleo_init(MachineState *machine)
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, MSM_DMOV_PHYS);
-    sysbus_connect_irq(sbd, 0, vic_in[INT_ADM_AARM]);
+    /* the SD0-SD2 pages 0xA9400000-0xA9600000 (AMSS uses SD0) */
+    for (int d = 0; d < 3; d++) {
+        MemoryRegion *alias = g_new(MemoryRegion, 1);
+        memory_region_init_alias(alias, OBJECT(dev), "msm-adm-sd",
+                                 sysbus_mmio_get_region(sbd, 0), 0, 0x1000);
+        memory_region_add_subregion(sysmem, MSM_DMOV_PHYS - (3 - d) * 0x100000,
+                                    alias);
+    }
+    if (s->lle) {
+        /* SD3 interrupts the apps processor, SD0 the modem */
+        sysbus_connect_irq(sbd, 1 + 3, vic_in[INT_ADM_AARM]);
+        sysbus_connect_irq(sbd, 1 + 0, msm_modem_lle_irq(s->lle, MIRQ_ADM0));
+    } else {
+        sysbus_connect_irq(sbd, 0, vic_in[INT_ADM_AARM]);
+    }
 
     /* NAND */
     s->nand = qdev_new(TYPE_MSM_NAND);
