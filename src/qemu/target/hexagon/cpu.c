@@ -518,6 +518,16 @@ static void hexagon_cpu_set_irq(void *opaque, int irq, int level)
     CPUState *cs = CPU(cpu);
     CPUHexagonState *env = cpu_env(cs);
 
+    if (HEXAGON_CPU_GET_CLASS(cpu)->hex_def->hex_version == HEX_VER_V2) {
+        /* QDSP6 V2: 32 interrupt lines, line n is pending bit 31 - n */
+        qemu_log_mask(CPU_LOG_INT, "%s: irq %d, level %d\n",
+                      __func__, irq, level);
+        if (level) {
+            BQL_LOCK_GUARD();
+            hex_raise_interrupts(env, 1u << (31 - irq), CPU_INTERRUPT_HARD);
+        }
+        return;
+    }
     switch (irq) {
     case HEXAGON_CPU_IRQ_0 ... HEXAGON_CPU_IRQ_7:
         qemu_log_mask(CPU_LOG_INT, "%s: irq %d, level %d\n",
@@ -536,7 +546,7 @@ static void hexagon_cpu_init(Object *obj)
 {
 #ifndef CONFIG_USER_ONLY
     HexagonCPU *cpu = HEXAGON_CPU(obj);
-    qdev_init_gpio_in(DEVICE(cpu), hexagon_cpu_set_irq, 8);
+    qdev_init_gpio_in(DEVICE(cpu), hexagon_cpu_set_irq, 32);
 #endif
 }
 

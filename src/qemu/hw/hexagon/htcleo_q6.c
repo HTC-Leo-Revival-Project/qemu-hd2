@@ -14,6 +14,13 @@
  * does.  Peripherals that are not modelled yet sit behind a tap that logs
  * accesses and keeps what was written (trace=on).
  *
+ * The QDSP6 subsystem registers are at 0xAB000000 (Qube maps them at
+ * 0xFB000000 for the kernel):
+ *   0xAB000000  timer, the MSM GPT block: +0 match, +4 count, +8 enable
+ *               (bit 0 enable, bit 1 clear on match), +C clear.  It
+ *               interrupts on line 3 ("Qube Timer INT Number: 3").
+ *   0xABF00000  "TCM IO": interrupt routing the kernel sets up at boot
+ *
  *   qemu-system-hexagon -M htcleo-q6 -kernel dsp1.elf \
  *     -object memory-backend-file,id=htcleo.ram,size=1G,mem-path=...,share=on
  *
@@ -23,6 +30,9 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/host-utils.h"
+#include "hw/core/irq.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
@@ -42,6 +52,10 @@
 #define HTCLEO_Q6_THREADS       6
 #define HTCLEO_Q6_TLB_ENTRIES   64
 
+#define Q6_TIMER_BASE           0xAB000000
+#define Q6_TIMER_IRQ            3
+#define Q6_TIMER_HZ             32768       /* sleep clock */
+
 #define TAP_BASE                0x40000000ULL
 #define TAP_SIZE                0xC0000000ULL
 #define TRACE_REPEATS           4
@@ -57,6 +71,12 @@ struct HtcleoQ6MachineState {
     GHashTable *seen;
     bool trace;
     HexagonCPU *cpu[HTCLEO_Q6_THREADS];
+
+    /* timer */
+    MemoryRegion timer_io;
+    QEMUTimer *timer;
+    uint32_t tmr_match, tmr_enable;
+    int64_t tmr_base;           /* virtual time of count 0 */
 };
 
 /* ---------------------------------------------------------------- */
@@ -119,6 +139,97 @@ static const MemoryRegionOps tap_ops = {
 };
 
 /* ---------------------------------------------------------------- */
+/* Timer (the MSM GPT block)                                         */
+/* ---------------------------------------------------------------- */
+
+static uint32_t q6_timer_count(HtcleoQ6MachineState *s, int64_t now)
+{
+    return muldiv64(now - s->tmr_base, Q6_TIMER_HZ, NANOSECONDS_PER_SECOND);
+}
+
+static void q6_timer_schedule(HtcleoQ6MachineState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t delta;
+
+    if (!(s->tmr_enable & 1)) {
+        timer_del(s->timer);
+        return;
+    }
+    delta = s->tmr_match - q6_timer_count(s, now);
+    timer_mod(s->timer, now + muldiv64(delta ? delta : 1,
+                                       NANOSECONDS_PER_SECOND, Q6_TIMER_HZ));
+}
+
+static void q6_timer_fire(void *opaque)
+{
+    HtcleoQ6MachineState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->trace) {
+        qemu_log("q6-timer: match %08x, interrupt\n", s->tmr_match);
+    }
+    qemu_irq_pulse(qdev_get_gpio_in(DEVICE(s->cpu[0]), Q6_TIMER_IRQ));
+    if (s->tmr_enable & 2) {
+        s->tmr_base = now;      /* clear on match */
+    }
+    /* the count wraps before it matches again */
+    timer_mod(s->timer, now + muldiv64(s->tmr_enable & 2 ? s->tmr_match :
+                                       0x100000000ULL,
+                                       NANOSECONDS_PER_SECOND, Q6_TIMER_HZ));
+}
+
+static uint64_t q6_timer_read(void *opaque, hwaddr off, unsigned size)
+{
+    HtcleoQ6MachineState *s = opaque;
+
+    switch (off) {
+    case 0x0:
+        return s->tmr_match;
+    case 0x4:
+        return q6_timer_count(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    case 0x8:
+        return s->tmr_enable;
+    }
+    return 0;
+}
+
+static void q6_timer_write(void *opaque, hwaddr off, uint64_t val,
+                           unsigned size)
+{
+    HtcleoQ6MachineState *s = opaque;
+
+    if (s->trace) {
+        qemu_log("q6-timer: [%02x] <- %08x (count %08x) pc %08x\n",
+                 (unsigned)off, (unsigned)val,
+                 q6_timer_count(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)),
+                 q6_pc());
+    }
+
+    switch (off) {
+    case 0x0:
+        s->tmr_match = val;
+        break;
+    case 0x8:
+        s->tmr_enable = val & 3;
+        break;
+    case 0xC:
+        s->tmr_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        break;
+    default:
+        return;
+    }
+    q6_timer_schedule(s);
+}
+
+static const MemoryRegionOps q6_timer_ops = {
+    .read = q6_timer_read,
+    .write = q6_timer_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ---------------------------------------------------------------- */
 /* Machine                                                           */
 /* ---------------------------------------------------------------- */
 
@@ -151,6 +262,10 @@ static void htcleo_q6_init(MachineState *machine)
     memory_region_init_io(&s->tap, OBJECT(machine), &tap_ops, s, "q6-tap",
                           TAP_SIZE);
     memory_region_add_subregion_overlap(sysmem, TAP_BASE, &s->tap, -1);
+    memory_region_init_io(&s->timer_io, OBJECT(machine), &q6_timer_ops, s,
+                          "q6-timer", 0x10);
+    memory_region_add_subregion(sysmem, Q6_TIMER_BASE, &s->timer_io);
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, q6_timer_fire, s);
 
     glob = qdev_new(TYPE_HEXAGON_GLOBALREG);
     object_property_add_child(OBJECT(machine), "global-regs", OBJECT(glob));
