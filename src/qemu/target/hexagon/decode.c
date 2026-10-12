@@ -789,8 +789,9 @@ int decode_packet(DisasContext *ctx, int max_words, const uint32_t *words,
 
 #ifndef CONFIG_USER_ONLY
     /*
-     * QDSP6 V2 has its SSR in s2 and something else in s6, where V5 has
-     * STID and SSR: swap them so the V5 SSR machinery acts on V2's SSR
+     * QDSP6 V2 numbers its system registers differently: its SSR is s2
+     * (V5: STID), IMASK s3 (V5: ELR), IPEND s17 (V5: MODECTL) and MODECTL
+     * s19.  Swap them so the V5 machinery acts on V2's registers
      */
     if (ctx->hex_def->hex_version == HEX_VER_V2) {
         for (i = 0; i < num_insns; i++) {
@@ -798,9 +799,17 @@ int decode_packet(DisasContext *ctx, int max_words, const uint32_t *words,
             int op = insn->opcode == Y2_tfrsrcr ? 0 :
                      insn->opcode == Y2_tfrscrr ? 1 : -1;
 
-            if (op >= 0 && (insn->regno[op] == HEX_SREG_STID ||
-                            insn->regno[op] == HEX_SREG_SSR)) {
-                insn->regno[op] ^= HEX_SREG_STID ^ HEX_SREG_SSR;
+            static const uint8_t v2_sreg[NUM_SREGS] = {
+                [0 ... NUM_SREGS - 1] = 0xff,
+                [HEX_SREG_STID] = HEX_SREG_SSR, [HEX_SREG_SSR] = HEX_SREG_STID,
+                /* IMASK */
+                [HEX_SREG_ELR] = HEX_SREG_IMASK, [HEX_SREG_IMASK] = HEX_SREG_ELR,
+                /* IPEND and MODECTL */
+                [HEX_SREG_MODECTL] = 19, [19] = HEX_SREG_MODECTL,
+            };
+
+            if (op >= 0 && v2_sreg[insn->regno[op]] != 0xff) {
+                insn->regno[op] = v2_sreg[insn->regno[op]];
             }
         }
     }

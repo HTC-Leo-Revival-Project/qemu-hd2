@@ -80,11 +80,14 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
 
     qemu_log_mask(CPU_LOG_INT,
                   "\t%s: event 0x%02x:%s, cause 0x%" PRIx32 "(%" PRIu32 ")"
-                  " ssr 0x%08" PRIx32 " elr 0x%08" PRIx32 " stid 0x%08" PRIx32 "\n",
+                  " ssr 0x%08" PRIx32 " elr 0x%08" PRIx32 " s5 0x%08" PRIx32 "\n",
                   __func__, (unsigned)cs->exception_index,
-                  event_name[cs->exception_index], env->cause_code,
+                  (unsigned)cs->exception_index < ARRAY_SIZE(event_name) &&
+                  event_name[cs->exception_index] ?
+                  event_name[cs->exception_index] : "HEX_EVENT_INT",
+                  env->cause_code,
                   env->cause_code, env->t_sreg[HEX_SREG_SSR],
-                  env->t_sreg[HEX_SREG_ELR], env->t_sreg[HEX_SREG_STID]);
+                  env->t_sreg[HEX_SREG_ELR], env->t_sreg[HEX_SREG_BADVA1]);
 
     env->llsc_addr = ~0;
 

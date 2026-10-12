@@ -1564,6 +1564,12 @@ void HELPER(raise_stack_overflow)(CPUHexagonState *env, uint32_t slot,
 }
 
 /* clear interrupt auto-disable: the interrupts in mask can be taken again */
+static bool hex_is_v2(CPUHexagonState *env)
+{
+    return HEXAGON_CPU_GET_CLASS(env_archcpu(env))->hex_def->hex_version ==
+           HEX_VER_V2;
+}
+
 void HELPER(ciad)(CPUHexagonState *env, uint32_t mask)
 {
     uint32_t ipendad;
@@ -1572,6 +1578,15 @@ void HELPER(ciad)(CPUHexagonState *env, uint32_t mask)
 
     BQL_LOCK_GUARD();
     cpu = env_archcpu(env);
+    if (hex_is_v2(env)) {
+        /* V2: IAD is all of s20, in V2's bit order like the mask */
+        ipendad = hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
+                                         env->threadId);
+        hexagon_globalreg_write(cpu->globalregs, HEX_SREG_IPENDAD,
+                                ipendad & ~mask, env->threadId);
+        hex_interrupt_update(env);
+        return;
+    }
     ipendad = cpu->globalregs ?
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
                                env->threadId) : 0;
@@ -1592,6 +1607,14 @@ void HELPER(siad)(CPUHexagonState *env, uint32_t mask)
 
     BQL_LOCK_GUARD();
     cpu = env_archcpu(env);
+    if (hex_is_v2(env)) {
+        ipendad = hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
+                                         env->threadId);
+        hexagon_globalreg_write(cpu->globalregs, HEX_SREG_IPENDAD,
+                                ipendad | mask, env->threadId);
+        hex_interrupt_update(env);
+        return;
+    }
     ipendad = cpu->globalregs ?
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
                                env->threadId) : 0;
@@ -1637,6 +1660,10 @@ void HELPER(iassignw)(CPUHexagonState *env, uint32_t src)
             uint32_t imask = thread_env->t_sreg[HEX_SREG_IMASK];
             uint32_t intbitpos = (src >> 16) & 0xF;
             uint32_t val = (src >> thread_env->threadId) & 0x1;
+            if (hex_is_v2(env)) {
+                /* 32 interrupts, interrupt n in IMASK bit 31 - n */
+                intbitpos = 31 - ((src >> 16) & 0x1F);
+            }
             imask = deposit32(imask, intbitpos, 1, val);
             thread_env->t_sreg[HEX_SREG_IMASK] = imask;
 

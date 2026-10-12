@@ -18,6 +18,38 @@
 
 static bool hex_is_qualified_for_int(CPUHexagonState *env, int int_num);
 
+/*
+ * QDSP6 V2 has 32 interrupts and numbers them from the top bit of its
+ * masks: interrupt n is bit 31 - n of IPEND (its s17), IAD (s20) and the
+ * per-thread IMASK (s3).  decode.c moves those registers to s19, s20 and
+ * s10 here, which keep V2's layout.
+ */
+#define V2_IPEND    19
+#define V2_IAD      HEX_SREG_IPENDAD
+
+static bool is_v2(CPUHexagonState *env)
+{
+    return HEXAGON_CPU_GET_CLASS(env_archcpu(env))->hex_def->hex_version ==
+           HEX_VER_V2;
+}
+
+static uint32_t v2_bit(int int_num)
+{
+    return 1u << (31 - int_num);
+}
+
+static uint32_t v2_greg(CPUHexagonState *env, int reg)
+{
+    return hexagon_globalreg_read(env_archcpu(env)->globalregs, reg,
+                                  env->threadId);
+}
+
+static void v2_set_greg(CPUHexagonState *env, int reg, uint32_t val)
+{
+    hexagon_globalreg_write(env_archcpu(env)->globalregs, reg, val,
+                            env->threadId);
+}
+
 static bool get_syscfg_gie(CPUHexagonState *env)
 {
     HexagonCPU *cpu = env_archcpu(env);
@@ -53,6 +85,9 @@ static void set_ssr_ex_cause(CPUHexagonState *env, int ex, uint32_t cause)
 
 static bool get_iad_bit(CPUHexagonState *env, int int_num)
 {
+    if (is_v2(env)) {
+        return v2_greg(env, V2_IAD) & v2_bit(int_num);
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -63,6 +98,11 @@ static bool get_iad_bit(CPUHexagonState *env, int int_num)
 
 static void set_iad_bit(CPUHexagonState *env, int int_num, int val)
 {
+    if (is_v2(env)) {
+        uint32_t iad = v2_greg(env, V2_IAD) & ~v2_bit(int_num);
+        v2_set_greg(env, V2_IAD, iad | (val ? v2_bit(int_num) : 0));
+        return;
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -76,6 +116,9 @@ static void set_iad_bit(CPUHexagonState *env, int int_num, int val)
 
 static uint32_t get_ipend(CPUHexagonState *env)
 {
+    if (is_v2(env)) {
+        return v2_greg(env, V2_IPEND);
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -85,6 +128,9 @@ static uint32_t get_ipend(CPUHexagonState *env)
 
 static inline bool get_ipend_bit(CPUHexagonState *env, int int_num)
 {
+    if (is_v2(env)) {
+        return v2_greg(env, V2_IPEND) & v2_bit(int_num);
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -95,6 +141,10 @@ static inline bool get_ipend_bit(CPUHexagonState *env, int int_num)
 
 static void clear_ipend(CPUHexagonState *env, uint32_t mask)
 {
+    if (is_v2(env)) {
+        v2_set_greg(env, V2_IPEND, v2_greg(env, V2_IPEND) & ~mask);
+        return;
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -108,6 +158,10 @@ static void clear_ipend(CPUHexagonState *env, uint32_t mask)
 
 static void set_ipend(CPUHexagonState *env, uint32_t mask)
 {
+    if (is_v2(env)) {
+        v2_set_greg(env, V2_IPEND, v2_greg(env, V2_IPEND) | mask);
+        return;
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -121,6 +175,11 @@ static void set_ipend(CPUHexagonState *env, uint32_t mask)
 
 static void set_ipend_bit(CPUHexagonState *env, int int_num, int val)
 {
+    if (is_v2(env)) {
+        uint32_t ipend = v2_greg(env, V2_IPEND) & ~v2_bit(int_num);
+        v2_set_greg(env, V2_IPEND, ipend | (val ? v2_bit(int_num) : 0));
+        return;
+    }
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t ipendad =
         hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
@@ -134,6 +193,9 @@ static void set_ipend_bit(CPUHexagonState *env, int int_num, int val)
 
 static bool get_imask_bit(CPUHexagonState *env, int int_num)
 {
+    if (is_v2(env)) {
+        return env->t_sreg[HEX_SREG_IMASK] & v2_bit(int_num);
+    }
     uint32_t imask = env->t_sreg[HEX_SREG_IMASK];
     return extract32(imask, int_num, 1);
 }
@@ -232,7 +294,8 @@ static void hex_accept_int(CPUHexagonState *env, int int_num)
 
     set_ipend_bit(env, int_num, 0);
     set_iad_bit(env, int_num, 1);
-    set_ssr_ex_cause(env, 1, HEX_CAUSE_INT0 | int_num);
+    /* V2 has the interrupt number itself as the cause */
+    set_ssr_ex_cause(env, 1, is_v2(env) ? int_num : HEX_CAUSE_INT0 | int_num);
     cs->exception_index = HEX_EVENT_INT0 + int_num;
     env->cause_code = HEX_EVENT_INT0 + int_num;
     clear_pending_locks(env);

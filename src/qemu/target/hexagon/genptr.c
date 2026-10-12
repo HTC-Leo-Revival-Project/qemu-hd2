@@ -195,7 +195,8 @@ G_GNUC_UNUSED
 static void gen_log_sreg_write(DisasContext *ctx, int rnum, TCGv_i32 val)
 {
     /* QDSP6 V2's s6 (decoded as STID, see decode.c) has no fixed bits */
-    const uint32_t reg_mask = (ctx->is_v2 && rnum == HEX_SREG_STID) ? 0 :
+    const uint32_t reg_mask = (ctx->is_v2 && (rnum == HEX_SREG_STID ||
+                                              rnum == HEX_SREG_IMASK)) ? 0 :
                               sreg_immut_masks[rnum];
 
     if (ctx->is_v2 && rnum == HEX_SREG_SSR) {
