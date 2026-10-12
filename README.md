@@ -244,6 +244,7 @@ Not emulated:
 | `start-lle.sh` | Launch with the real baseband firmware |
 | `amss_dis.py` / `amss_xref.py` / `amss_fatal.py` | AMSS reverse-engineering helpers |
 | `gltri.c` / `gltest.c` | GLES2 test programs for the emulated GPU |
+| `hd2bench/` | HD2 Bench, an Android 4.0 app (`build.sh` makes `hd2bench.apk`): CPU, OpenGL ES 2.0 and internal/SD storage speeds, to compare a real HD2 with the emulator |
 
 ## Credits
 

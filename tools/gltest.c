@@ -10,7 +10,11 @@
  *   cube  a spinning depth-tested cube (frame time is reported)
  *   pb565 a clear of a 480x800 RGB565 pbuffer
  *   fill  8 full-screen blended, mipmapped, bilinear textured quads per
- *         frame (overdraw like a game's; frame time is reported)
+ *         frame (overdraw like a game's; frame time is reported);
+ *         "fill SECONDS LAYERS noswap" times LAYERS of them without the
+ *         buffer swap (and its wait for the display)
+ *   mesh  a lit, textured, depth-tested sphere of 2 x 96 x 96 triangles
+ *         (a game's vertex load); "mesh SECONDS GRID noswap"
  * Each scene prints read-back pixels and their expected values.
  */
 #include <dlfcn.h>
@@ -349,6 +353,118 @@ static void scene_cube(int frames)
     printf("%.1f ms per frame\n", busy / frames);
 }
 
+static int layers = 8;
+static bool noswap;
+
+static void present(void)
+{
+    if (noswap) {
+        glFinish();
+    } else {
+        eglSwapBuffers(dpy, surf);
+        glFinish();
+    }
+}
+
+static const char mesh_vs[] =
+    "attribute vec4 pos; attribute vec4 attr; uniform mat4 m;\n"
+    "uniform vec3 light; varying vec2 uv; varying float lum;\n"
+    "void main() {\n"
+    "    gl_Position = m * pos;\n"
+    "    vec3 n = normalize(pos.xyz);\n"
+    "    lum = 0.2 + 0.8 * max(dot(n, light), 0.0);\n"
+    "    uv = attr.xy;\n"
+    "}\n";
+static const char mesh_fs[] =
+    "precision mediump float; uniform sampler2D t; varying vec2 uv;\n"
+    "varying float lum;\n"
+    "void main() { gl_FragColor = texture2D(t, uv) * lum; }\n";
+
+static void scene_mesh(int frames, int g)
+{
+    GLuint prog = program(mesh_vs, mesh_fs), tex;
+    int nv = (g + 1) * (g + 1), ni = g * g * 6;
+    GLfloat *v = malloc(nv * 6 * sizeof(GLfloat));
+    GLushort *idx = malloc(ni * sizeof(GLushort));
+    GLubyte *img = malloc(128 * 128 * 4);
+    GLint mloc = glGetUniformLocation(prog, "m");
+    double busy = 0;
+    int n = 0;
+
+    for (int j = 0; j <= g; j++) {
+        for (int i = 0; i <= g; i++) {
+            float th = (float)M_PI * j / g, ph = 2 * (float)M_PI * i / g;
+            float r = 1.0f + 0.05f * sinf(8 * ph) * sinf(6 * th);
+            GLfloat *p = &v[(j * (g + 1) + i) * 6];
+
+            p[0] = r * sinf(th) * cosf(ph);
+            p[1] = r * cosf(th);
+            p[2] = r * sinf(th) * sinf(ph);
+            p[3] = 1;
+            p[4] = 4.0f * i / g;
+            p[5] = 2.0f * j / g;
+        }
+    }
+    for (int j = 0; j < g; j++) {
+        for (int i = 0; i < g; i++) {
+            int a = j * (g + 1) + i, b = a + 1, c = a + g + 1, d = c + 1;
+
+            /* counter-clockwise from outside */
+            idx[n++] = a; idx[n++] = b; idx[n++] = c;
+            idx[n++] = b; idx[n++] = d; idx[n++] = c;
+        }
+    }
+    for (int i = 0; i < 128 * 128; i++) {
+        bool on = ((i & 127) / 16 + i / (128 * 16)) & 1;
+
+        img[4 * i + 0] = on ? 230 : 40;
+        img[4 * i + 1] = on ? 180 : 90;
+        img[4 * i + 2] = on ? 60 : 200;
+        img[4 * i + 3] = 255;
+    }
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 128, 128, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, img);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR_MIPMAP_LINEAR);
+    glUniform3f(glGetUniformLocation(prog, "light"), 0.48f, 0.64f, 0.6f);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 24, v);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 24, v + 4);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glClearColor(0.1f, 0.1f, 0.1f, 1);
+    for (int fr = 0; fr < frames; fr++) {
+        float a = fr * 0.05f, f = 1.0f / tanf(0.5f), asp = (float)W / H;
+        float ca = cosf(a), sa = sinf(a), zn = 1, zf = 10;
+        /* rotate about y, push to z = -3, perspective */
+        GLfloat m[16] = {
+            ca * f / asp, 0, -sa * (zf + zn) / (zn - zf), sa,
+            0, f, 0, 0,
+            sa * f / asp, 0, ca * (zf + zn) / (zn - zf), -ca,
+            0, 0, -3 * (zf + zn) / (zn - zf) + 2 * zf * zn / (zn - zf), 3,
+        };
+        double t0 = now_ms();
+
+        glUniformMatrix4fv(mloc, 1, GL_FALSE, m);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDrawElements(GL_TRIANGLES, ni, GL_UNSIGNED_SHORT, idx);
+        if (fr == 0) {
+            probe("mesh centre", W / 2, H / 2, "lit checker");
+            probe("mesh background", 5, 5, "26 26 26");
+        }
+        present();
+        if (fr) {
+            busy += now_ms() - t0;
+        }
+    }
+    printf("%.1f ms per frame (%d triangles)\n", busy / (frames - 1),
+           ni / 3);
+}
+
 static void scene_fill(int frames)
 {
     GLuint prog = program(tex_vs, tex_fs), tex;
@@ -376,17 +492,21 @@ static void scene_fill(int frames)
 
         glClearColor(0.1f, 0.1f, 0.1f, 1);
         glClear(GL_COLOR_BUFFER_BIT);
-        for (int q = 0; q < 8; q++) {
-            quad_px(prog, W / 2 + q, H / 2, W, H, 1.0f + q * 0.25f);
+        for (int q = 0; q < layers; q++) {
+            quad_px(prog, W / 2 + q % 8, H / 2, W, H, 1.0f + q * 0.25f);
         }
-        eglSwapBuffers(dpy, surf);
-        glFinish();
+        if (fr == 0) {
+            /* blending is order dependent: these catch reordered layers */
+            probe("fill layers", W / 3, H / 3, "same as software");
+            probe("fill layers", W * 2 / 3, H * 3 / 4, "same as software");
+        }
+        present();
         if (fr) {
             busy += now_ms() - t0;
         }
     }
-    printf("%.1f ms per frame (8 full-screen layers)\n",
-           busy / (frames - 1));
+    printf("%.1f ms per frame (%d full-screen layers%s)\n",
+           busy / (frames - 1), layers, noswap ? ", no swap" : "");
     free(img);
 }
 
@@ -437,8 +557,14 @@ int main(int argc, char **argv)
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &H);
     glViewport(0, 0, W, H);
 
+    if (argc > 3) {
+        layers = atoi(argv[3]);
+    }
+    noswap = argc > 4 && !strcmp(argv[4], "noswap");
     if (!strcmp(scene, "cube")) {
         scene_cube(seconds * 10);
+    } else if (!strcmp(scene, "mesh")) {
+        scene_mesh(seconds * 4, argc > 3 ? layers : 96);
     } else if (!strcmp(scene, "fill")) {
         scene_fill(seconds * 2);
     } else {
