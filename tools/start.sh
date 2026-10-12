@@ -14,7 +14,7 @@ SD=; [ -f "${SDCARD:-sdcard.img}" ] && SD="-drive if=sd,format=raw,file=${SDCARD
 NET="-nic user,model=bcm4329 -nic user,model=msm-modem,net=10.0.3.0/24"
 ADB="-chardev socket,id=adb,host=127.0.0.1,port=${ADB_PORT:-5555},server=on,wait=off -global msm-hsusb.adb=adb"
 M=htcleo
-D=unimp,guest_errors PLUGIN=
+D=${QEMU_D:-unimp,guest_errors} PLUGIN=
 [ "$BASEBAND" = lle ] && M="htcleo,baseband=lle,baseband-firmware=${AMSS:-amss.elf},baseband-trace=${TRACE:-off}"
 if [ -n "$AMSSLOG" ]; then
   # AMSS 2.15.50.14's msg_send entry points
