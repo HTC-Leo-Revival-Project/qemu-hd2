@@ -137,6 +137,7 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/msm_modem_lle.c',
   'htcleo/msm_mtmr.c',
   'htcleo/msm_mdsp.c',
+  'htcleo/msm_ssbi.c',
 ))
 
 arm_common_ss.add(files('boot.c'))

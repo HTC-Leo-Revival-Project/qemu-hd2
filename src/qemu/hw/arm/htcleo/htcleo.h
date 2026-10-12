@@ -170,6 +170,8 @@
 #define TYPE_MSM_UARTDM     "msm-uartdm"
 #define TYPE_MSM_MTMR       "msm-mtmr"
 #define TYPE_MSM_MDSP       "msm-mdsp"
+#define TYPE_MSM_SSBI       "msm-ssbi"
+#define MSM_SSBI_NUM        6   /* SSBI controllers, see msm_ssbi.c */
 #define TYPE_HTCLEO_MICROP  "htcleo-microp"
 #define TYPE_HTCLEO_TS      "htcleo-ts"
 #define TYPE_HTCLEO_AKM     "htcleo-akm8973"

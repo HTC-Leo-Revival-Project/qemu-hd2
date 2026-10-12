@@ -25,6 +25,8 @@
  *   0xB8001000  the modem VIC, same block as the apps one (L4 flavour)
  *               -> ARM926 IRQ/FIQ; source 32 is the L4 tick
  *   0x9C000000  1 MiB of modem-side RAM (L4 maps it at 0xF9700000)
+ *   0xB8000300  SSBI controllers to the PM7540 PMIC and other chips, also at
+ *               0xB8000400, 0xA8100000 and 0xB0007580-0xB00075DF (msm_ssbi.c)
  *   0xB1000000  the modem DSP's memories and control (msm_mdsp.c)
  *   0xFFFC0000  internal SRAM; AMSS puts its TLB-locked sleep code at
  *               0xFFFEF800 (L4 maps 0xFFF00000 at 0xF9600000)
@@ -424,6 +426,24 @@ static void lle_realize(DeviceState *dev, Error **errp)
 
     /* the modem's interrupts to the other processors: "m2a" 0-7 */
     qdev_pass_gpios(s->tmr, DEVICE(s), "m2a");
+
+    /*
+     * SSBI controllers (msm_ssbi.c): two sit inside the timer block, so
+     * they are mapped over it
+     */
+    {
+        static const hwaddr base[MSM_SSBI_NUM] = {
+            0xB8000300, 0xA8100000, 0xB8000400,
+            0xB0007580, 0xB00075A0, 0xB00075C0,
+        };
+        DeviceState *d = qdev_new(TYPE_MSM_SSBI);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(d), &error_fatal);
+        for (int i = 0; i < MSM_SSBI_NUM; i++) {
+            memory_region_add_subregion_overlap(&s->mem, base[i],
+                    sysbus_mmio_get_region(SYS_BUS_DEVICE(d), i), 1);
+        }
+    }
 
     s->mdsp = lle_private_device(s, TYPE_MSM_MDSP, MODEM_MDSP_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->mdsp), 0,
