@@ -168,6 +168,7 @@
 #define TYPE_MSM_SPI        "msm-spi"
 #define TYPE_MSM_UARTDM     "msm-uartdm"
 #define TYPE_MSM_MTMR       "msm-mtmr"
+#define TYPE_MSM_MDSP       "msm-mdsp"
 #define TYPE_HTCLEO_MICROP  "htcleo-microp"
 #define TYPE_HTCLEO_TS      "htcleo-ts"
 #define TYPE_TPS65023       "tps65023"

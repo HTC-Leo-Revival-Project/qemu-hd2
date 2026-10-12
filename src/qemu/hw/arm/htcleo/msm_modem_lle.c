@@ -25,6 +25,7 @@
  *   0xB8001000  the modem VIC, same block as the apps one (L4 flavour)
  *               -> ARM926 IRQ/FIQ; source 32 is the L4 tick
  *   0x9C000000  1 MiB of modem-side RAM (L4 maps it at 0xF9700000)
+ *   0xB1000000  the modem DSP's memories and control (msm_mdsp.c)
  *   0xFFFC0000  internal SRAM; AMSS puts its TLB-locked sleep code at
  *               0xFFFEF800 (L4 maps 0xFFF00000 at 0xF9600000)
  *
@@ -54,6 +55,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmModemLleState, MSM_MODEM_LLE)
 #define MODEM_RAM9C_SIZE 0x00100000
 #define MODEM_IMEM_PHYS 0xFFFC0000
 #define MODEM_IMEM_SIZE 0x00040000
+#define MODEM_MDSP_PHYS 0xB1000000
+#define MIRQ_MDSP       27
 
 #define TAP_BASE        0x40000000ULL
 #define TAP_SIZE        0xC0000000ULL
@@ -68,7 +71,7 @@ struct MsmModemLleState {
     MemoryRegion ram_alias;
     MemoryRegion tap;
     MemoryRegion ram9c, imem;
-    DeviceState *vic, *tmr;
+    DeviceState *vic, *tmr, *mdsp;
 
     MemoryRegion *ram;
     char *firmware;
@@ -418,6 +421,10 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->tmr = lle_private_device(s, TYPE_MSM_MTMR, MODEM_TMR_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->tmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_TICK));
+
+    s->mdsp = lle_private_device(s, TYPE_MSM_MDSP, MODEM_MDSP_PHYS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->mdsp), 0,
+                       qdev_get_gpio_in(s->vic, MIRQ_MDSP));
 }
 
 static void lle_init(Object *obj)
