@@ -62,7 +62,7 @@ def unsign(d):
 def elf_size(e):
     phoff, = struct.unpack_from('<I', e, 28)
     phes, phn = struct.unpack_from('<HH', e, 42)
-    end = 0
+    end = phoff + phes * phn        # the DSP ELF has them at its end
     for k in range(phn):
         _, off, _, _, fsz, _, _, _ = struct.unpack_from('<8I', e, phoff + 32 * k)
         end = max(end, off + fsz)
@@ -119,6 +119,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('nbh')
     ap.add_argument('-o', '--output', default='amss.elf')
+    ap.add_argument('--dsp', metavar='DSP_ELF',
+                    help='also write the QDSP6 firmware (DSP1) ELF here')
     ap.add_argument('--write-nand', metavar='NAND_IMG',
                     help='also write the radio partitions into this image')
     a = ap.parse_args()
@@ -142,6 +144,14 @@ def main():
     open(a.output, 'wb').write(elf)
     print(f'AMSS ELF at payload {at:#x}: {len(elf)} bytes, entry {entry:#x}'
           f' -> {a.output}')
+    if a.dsp:
+        dsp = p[at + len(elf):]
+        if dsp[:4] != b'\x7fELF':
+            sys.exit('no DSP ELF after the AMSS one')
+        dsp = dsp[:elf_size(dsp)]
+        open(a.dsp, 'wb').write(dsp)
+        print(f'DSP1 ELF at payload {at + len(elf):#x}: {len(dsp)} bytes'
+              f' -> {a.dsp}')
     if a.write_nand:
         print('radio partitions -> %s' % a.write_nand)
         write_nand(a.write_nand, p, at, len(elf), partitions(p))
