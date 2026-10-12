@@ -132,13 +132,23 @@ Fixes:
      a Thumb disassembler that names call and literal targets.
 
 Open:
-- Touch: a swipe on "slide to unlock" does nothing. The kernel has
-  `ios7leo_register_hid_touch`; check what touch controller and protocol it expects.
+- Touch, kernel side done. Kernel source: github.com/Garysss123/xnu-hd2, branch
+  codex/hd2-source, cloned to build-tmp/xnu-hd2. The touch transport is
+  `xnu/iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_touch_transport.c`.
+  - The TS model now answers ID 0x55 until the D0 00 01 enable, and reports after. iOS
+    polls with the IRQ high.
+  - Verified in the kernel: 500+ packets with no errors, correct coordinates, down/move/up
+    events enqueued, a userspace client (pid 11) maps the queue and its reader head keeps
+    up.
+  - Still, UIKit ignores swipes and taps. The lock screen stays and the AssistiveTouch
+    button doesn't open. The port's own notes say "not-gesture-proof" and hardware is not
+    verified. Next: look at the userspace consumer (pid 11) in rootfs.hfs and the HID
+    packet format/timestamps (leo_touch_make_hid_packet, mach_absolute_time).
+  - The Android regression run passed after this change (boot, adb, touch).
 - Clock: it shows 12:03 Thursday, January 1, so the RTC/time source is not set up for iOS.
 - A black screenshot once while the framebuffer held the lock screen. Probably the display
   sleeping on idle; not confirmed.
 - The XNU RW-lock panic, sometimes.
-- Android regression test of the NAND/SDCC/ADM changes (still pending, see below).
 
 ## Next steps
 1. **Debug FATAL HIT 3.**
