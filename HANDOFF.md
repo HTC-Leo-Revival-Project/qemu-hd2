@@ -108,6 +108,38 @@ transcripts. Use `-d guest_errors`, kill QEMU after traced runs with `pkill -x q
   OS from SD.
 - Message codes: "FATAL HIT n" uses string 0x28004490. Stages print "1"…"6".
 
+## Update (later on 2026-10-12): iOS 7 reaches the lock screen
+Boot with `build-tmp/iosboot.sh [SECONDS]`. It runs adsd.sh, presses Call, waits, and saves
+`build-tmp/ios-screen.png`. About 75 s per run. 3 of the last 4 boots showed the iOS 7 lock
+screen; one hit an XNU panic: `RW lock not held (mode 2)`, locks_arm.c:299.
+
+Fixes:
+1. NAND (msm_nand.c, committed):
+   - A read starting at a column inside a codeword now starts at that offset. MAGLDR's
+     bad-block probe is a 2-byte raw read at column 2048.
+   - FLASH_STATUS[14:12] = codewords still to come. MAGLDR's flash HAL checks it per codeword
+     (expects READY | n<<12). Before this, "FATAL HIT 3".
+2. Modem (msm_modem.c, committed): while taken over, poll mailbox 0x280b7a70. On 0x300d300d,
+   store [0x280b7a74] to 0x1E0000 and run msm_modem_boot(). XNU's SDCC2 driver needs
+   proc_comm 30 (arg 0x17) answered.
+3. SD image: the FAT32 BPB hidden-sectors field must equal the partition LBA (2048). The iOS
+   kernel's fl32_locate (FAT32 reader for IOS7/ROOTFS.HFS) rejects the card otherwise
+   (locator=-3). mksdcard.sh now passes `-h 2048`; sdcard-ios7.img and sdcard.img are patched.
+4. Tooling:
+   - magnav.py tolerates the bar edge under glyphs.
+   - adsd.sh polls for the menu.
+   - Kernel analysis lives in build-tmp/ios7k: macho.bin, syms.json (27k symbols) and dis.py,
+     a Thumb disassembler that names call and literal targets.
+
+Open:
+- Touch: a swipe on "slide to unlock" does nothing. The kernel has
+  `ios7leo_register_hid_touch`; check what touch controller and protocol it expects.
+- Clock: it shows 12:03 Thursday, January 1, so the RTC/time source is not set up for iOS.
+- A black screenshot once while the framebuffer held the lock screen. Probably the display
+  sleeping on idle; not confirmed.
+- The XNU RW-lock panic, sometimes.
+- Android regression test of the NAND/SDCC/ADM changes (still pending, see below).
+
 ## Next steps
 1. **Debug FATAL HIT 3.**
    - Run `build-tmp/adsd.sh`, start gdb with `build-tmp/load.gdb` in the background, then press f2.
