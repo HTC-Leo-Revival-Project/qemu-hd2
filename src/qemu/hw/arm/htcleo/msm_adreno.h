@@ -231,10 +231,23 @@ typedef struct AdrenoTlb {
 
 typedef struct AdrenoProgram AdrenoProgram;
 
+/*
+ * Decoded 32x32 texel tiles (RGBA8) of the textures a draw samples, per
+ * thread; a draw's generation number invalidates them.
+ */
+#define ADRENO_TEXCACHE 128
+typedef struct AdrenoTexTile {
+    uint32_t gen;
+    uint32_t base, pitch, key, tx, ty;
+    uint8_t rgba[32 * 32 * 4];
+} AdrenoTexTile;
+
 typedef struct AdrenoLanes {
     struct MsmAdrenoState *s;
     const AdrenoProgram *prog;
     AdrenoTlb *tlb;
+    AdrenoTexTile *texcache;
+    uint32_t texgen;
     bool quads;                 /* pixel lanes: derivatives available */
     float r[64][4][AL];         /* temporaries */
     /* vertex shader outputs */
@@ -291,6 +304,7 @@ struct MsmAdrenoState {
 
     /* draw statistics */
     uint64_t draws, pixels;
+    uint32_t texgen;            /* texture cache generation, per draw */
 
     char *trace_path;
     FILE *trace;

@@ -320,6 +320,7 @@ typedef struct TexDesc {
     uint32_t swz;
     float border[4];
     uint32_t face_size;     /* cube maps: bytes per face of level 0 */
+    bool fast;              /* unsigned normalized: direct decode */
 } TexDesc;
 
 static unsigned log2_ceil(uint32_t v)
@@ -402,6 +403,18 @@ static void tex_level(const TexDesc *t, int level, TexLevel *lv)
     }
 }
 
+static const float u8f[256] = {
+#define F(i) (i) / 255.0f
+#define F4(i) F(i), F(i + 1), F(i + 2), F(i + 3)
+#define F16(i) F4(i), F4(i + 4), F4(i + 8), F4(i + 12)
+#define F64(i) F16(i), F16(i + 16), F16(i + 32), F16(i + 48)
+    F64(0), F64(64), F64(128), F64(192),
+#undef F64
+#undef F16
+#undef F4
+#undef F
+};
+
 static float srgb_to_linear(float c)
 {
     return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
@@ -430,6 +443,51 @@ static void tex_texel(AdrenoLanes *L, const TexDesc *t, const TexLevel *lv,
     if (t->tf.kind == 3) {
         block_texel(t->fmt, p, x & 3, y & 3, out);
         return;
+    }
+    if (t->fast) {
+        /* the common unsigned normalized formats */
+        uint16_t h;
+
+        switch (t->fmt) {
+        case 6: case 14:    /* 8_8_8_8 */
+            out[0] = u8f[p[0]];
+            out[1] = u8f[p[1]];
+            out[2] = u8f[p[2]];
+            out[3] = u8f[p[3]];
+            return;
+        case 2: case 8: case 9:    /* 8 */
+            out[0] = u8f[p[0]];
+            out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            return;
+        case 10:            /* 8_8 */
+            out[0] = u8f[p[0]];
+            out[1] = u8f[p[1]];
+            out[2] = 0.0f;
+            out[3] = 1.0f;
+            return;
+        case 4:             /* 5_6_5 */
+            h = lduw_le_p(p);
+            out[0] = (h & 31) * (1.0f / 31);
+            out[1] = ((h >> 5) & 63) * (1.0f / 63);
+            out[2] = (h >> 11) * (1.0f / 31);
+            out[3] = 1.0f;
+            return;
+        case 15:            /* 4_4_4_4 */
+            h = lduw_le_p(p);
+            out[0] = (h & 15) * (1.0f / 15);
+            out[1] = ((h >> 4) & 15) * (1.0f / 15);
+            out[2] = ((h >> 8) & 15) * (1.0f / 15);
+            out[3] = (h >> 12) * (1.0f / 15);
+            return;
+        case 3:             /* 1_5_5_5 (X Y Z 5 bits, W 1 bit) */
+            h = lduw_le_p(p);
+            out[0] = (h & 31) * (1.0f / 31);
+            out[1] = ((h >> 5) & 31) * (1.0f / 31);
+            out[2] = ((h >> 10) & 31) * (1.0f / 31);
+            out[3] = h >> 15;
+            return;
+        }
     }
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
@@ -511,12 +569,75 @@ static int wrap(int i, int size, unsigned mode, bool *border)
     }
 }
 
+/* the formats whose texels fit RGBA8 exactly: cached as decoded tiles */
+static bool tex_cacheable(const TexDesc *t)
+{
+    /* uncompressed texels decode faster than a cache miss costs */
+    return t->tf.kind == 3;
+}
+
+
+static const uint8_t *cached_texel(AdrenoLanes *L, const TexDesc *t,
+                                   const TexLevel *lv, int x, int y,
+                                   uint32_t face)
+{
+    uint32_t base = lv->base + face * t->face_size;
+    uint32_t key = t->fmt | (t->fc[0] & 0x3fc) << 8 | lv->ox << 18 |
+                   lv->oy << 25 | (uint32_t)t->tiled << 31;
+    uint32_t tx = x >> 5, ty = y >> 5;
+    unsigned slot = (base / 4096 * 7 + tx * 13 + ty * 31 + lv->ox) %
+                    ADRENO_TEXCACHE;
+    AdrenoTexTile *tile = &L->texcache[slot];
+
+    if (tile->gen != L->texgen || tile->base != base || tile->key != key ||
+        tile->pitch != lv->pitch || tile->tx != tx || tile->ty != ty) {
+        int w = MIN(32, (int)lv->w - (int)(tx << 5));
+        int h = MIN(32, (int)lv->h - (int)(ty << 5));
+
+        for (int j = 0; j < h; j++) {
+            for (int i = 0; i < w; i++) {
+                float c[4];
+                uint8_t *o = &tile->rgba[(j * 32 + i) * 4];
+
+                tex_texel(L, t, lv, (tx << 5) + i, (ty << 5) + j, face, c);
+                for (int k = 0; k < 4; k++) {
+                    o[k] = (uint8_t)lrintf(c[k] * 255.0f);
+                }
+            }
+        }
+        tile->gen = L->texgen;
+        tile->base = base;
+        tile->key = key;
+        tile->pitch = lv->pitch;
+        tile->tx = tx;
+        tile->ty = ty;
+    }
+    return &tile->rgba[((y & 31) * 32 + (x & 31)) * 4];
+}
+
+static inline void fetch_texel(AdrenoLanes *L, const TexDesc *t,
+                               const TexLevel *lv, int x, int y,
+                               uint32_t face, bool cache, float out[4])
+{
+    if (cache) {
+        const uint8_t *c = cached_texel(L, t, lv, x, y, face);
+
+        out[0] = u8f[c[0]];
+        out[1] = u8f[c[1]];
+        out[2] = u8f[c[2]];
+        out[3] = u8f[c[3]];
+    } else {
+        tex_texel(L, t, lv, x, y, face, out);
+    }
+}
+
 static void sample_level(AdrenoLanes *L, const TexDesc *t, int level,
                          float u, float v, uint32_t face, bool linear,
                          float out[4])
 {
     TexLevel lv;
     float x, y;
+    bool cache = tex_cacheable(t) && L->texcache;
 
     tex_level(t, level, &lv);
     x = u * lv.w;
@@ -535,7 +656,7 @@ static void sample_level(AdrenoLanes *L, const TexDesc *t, int level,
             if (b) {
                 memcpy(c[i], t->border, sizeof(c[i]));
             } else {
-                tex_texel(L, t, &lv, xi, yi, face, c[i]);
+                fetch_texel(L, t, &lv, xi, yi, face, cache, c[i]);
             }
         }
         for (int k = 0; k < 4; k++) {
@@ -552,7 +673,7 @@ static void sample_level(AdrenoLanes *L, const TexDesc *t, int level,
         if (b) {
             memcpy(out, t->border, sizeof(float) * 4);
         } else {
-            tex_texel(L, t, &lv, xi, yi, face, out);
+            fetch_texel(L, t, &lv, xi, yi, face, cache, out);
         }
     }
 }
@@ -582,6 +703,7 @@ static bool tex_desc(MsmAdrenoState *s, unsigned idx, TexDesc *t)
         t->sign[k] = (fc[0] >> (2 + 2 * k)) & 3;
     }
     t->integer = fc[3] & 1;
+    t->fast = !t->integer && !(fc[0] & 0x3fc) && t->tf.kind == 0;
     t->exp_adj = ((int32_t)(fc[3] << 13)) >> 26;
     t->swz = (fc[3] >> 1) & 0xfff;
     switch (fc[5] & 3) {

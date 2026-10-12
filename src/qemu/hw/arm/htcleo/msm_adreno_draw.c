@@ -1053,29 +1053,64 @@ static void raster_prim(DrawCtx *d, AdrenoWorker *w, const Prim *p,
 {
     int64_t cofs = llrintf(d->pix_center * SUBPIX);
     int by0 = p->miny & ~3, bx0 = p->minx & ~3;
+    int64_t lstep[3][AL];
 
+    /* each lane's offset from the block's first sample, per edge */
+    for (int i = 0; i < 3; i++) {
+        for (int l = 0; l < AL; l++) {
+            lstep[i][l] = (p->A[i] * lane_x[l] + p->B[i] * lane_y[l]) *
+                          SUBPIX;
+        }
+    }
     for (int by = by0; by <= p->maxy; by += 4) {
+        int64_t sy = (int64_t)by * SUBPIX + cofs;
+        bool rows_in = by >= p->miny && by + 3 <= p->maxy;
+
         if ((uint32_t)(by >> 2) % nthr != (uint32_t)w->index) {
             continue;
         }
         for (int bx = bx0; bx <= p->maxx; bx += 4) {
+            int64_t sx = (int64_t)bx * SUBPIX + cofs;
             int64_t e[3][AL];
-            uint32_t cover = 0;
+            uint32_t cover = 0xffff;
+            bool all_in = rows_in && bx >= p->minx && bx + 3 <= p->maxx;
+            bool skip = false;
 
-            for (int l = 0; l < AL; l++) {
-                int x = bx + lane_x[l], y = by + lane_y[l];
-                int64_t sx = (int64_t)x * SUBPIX + cofs;
-                int64_t sy = (int64_t)y * SUBPIX + cofs;
-                bool in = x >= p->minx && x <= p->maxx && y >= p->miny &&
-                          y <= p->maxy;
+            for (int i = 0; i < 3 && !skip; i++) {
+                int64_t e0 = p->A[i] * sx + p->B[i] * sy + p->C[i];
+                /* the block's corners: all outside one edge = no pixel */
+                int64_t c0 = e0, c1 = e0 + 3 * SUBPIX * p->A[i];
+                int64_t c2 = e0 + 3 * SUBPIX * p->B[i];
+                int64_t c3 = c1 + 3 * SUBPIX * p->B[i];
 
-                for (int i = 0; i < 3; i++) {
-                    e[i][l] = p->A[i] * sx + p->B[i] * sy + p->C[i];
-                    if (e[i][l] < 0 || (e[i][l] == 0 && !p->tl[i])) {
-                        in = false;
-                    }
+                if (c0 < 0 && c1 < 0 && c2 < 0 && c3 < 0) {
+                    skip = true;
+                    break;
                 }
-                cover |= (uint32_t)in << l;
+                if (c0 <= 0 || c1 <= 0 || c2 <= 0 || c3 <= 0) {
+                    all_in = false;
+                }
+                for (int l = 0; l < AL; l++) {
+                    e[i][l] = e0 + lstep[i][l];
+                }
+            }
+            if (skip) {
+                continue;
+            }
+            if (!all_in) {
+                cover = 0;
+                for (int l = 0; l < AL; l++) {
+                    int x = bx + lane_x[l], y = by + lane_y[l];
+                    bool in = x >= p->minx && x <= p->maxx && y >= p->miny &&
+                              y <= p->maxy;
+
+                    for (int i = 0; i < 3; i++) {
+                        if (e[i][l] < 0 || (e[i][l] == 0 && !p->tl[i])) {
+                            in = false;
+                        }
+                    }
+                    cover |= (uint32_t)in << l;
+                }
             }
             if (cover) {
                 shade_block(d, w, p, bx, by, cover,
@@ -1092,6 +1127,7 @@ void adreno_raster_worker(AdrenoWorker *w)
     adreno_tlb_flush(&w->tlb);
     w->lanes.s = w->s;
     w->lanes.tlb = &w->tlb;
+    w->lanes.texgen = w->s->texgen;
     for (uint32_t i = 0; i < d->nprims; i++) {
         raster_prim(d, w, &d->prims[i], d->nthreads);
     }
@@ -1369,6 +1405,7 @@ static AdrenoVertex *shade_vertices(DrawCtx *d, const uint32_t *idx,
     L->tlb = &w->tlb;
     L->prog = adreno_program(s, A2_SHADER_VS);
     L->quads = false;
+    L->texgen = s->texgen;
     adreno_tlb_flush(&w->tlb);
     for (uint32_t b = 0; b < nu; b += AL) {
         uint32_t cnt = MIN(AL, nu - b);
@@ -1414,6 +1451,8 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     uint32_t tl, br, n;
 
     s->draws++;
+    /* textures may have changed since the last draw */
+    s->texgen++;
     adreno_trace(s, "  draw #%" PRIu64 " prim %u src %u n %u mode %u "
                  "color %08x surf %08x depth %08x/%08x vte %08x sc %08x\n",
                  s->draws, prim, src, num_indices, mode, r[A2_RB_COLOR_INFO],

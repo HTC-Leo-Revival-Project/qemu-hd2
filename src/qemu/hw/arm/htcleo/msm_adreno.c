@@ -1075,6 +1075,7 @@ static void adreno_realize(DeviceState *dev, Error **errp)
 
         w->s = s;
         w->index = i;
+        w->lanes.texcache = g_new0(AdrenoTexTile, ADRENO_TEXCACHE);
         if (i) {
             qemu_sem_init(&w->go, 0);
             qemu_thread_create(&w->thread, "adreno-raster",
@@ -1097,7 +1098,7 @@ static void adreno_unrealize(DeviceState *dev)
 
 static const Property adreno_props[] = {
     /* rasterizer threads, the vCPU's included */
-    DEFINE_PROP_UINT32("threads", MsmAdrenoState, nthreads, 4),
+    DEFINE_PROP_UINT32("threads", MsmAdrenoState, nthreads, 6),
 };
 
 static void adreno_class_init(ObjectClass *klass, const void *data)
