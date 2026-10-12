@@ -67,11 +67,13 @@ def main():
             if again == cur:
                 break
             cur = again
-        if cur is None:         # caught mid-redraw?
+        for _ in range(6):      # caught mid-redraw?
+            if cur is not None:
+                break
             time.sleep(0.5)
             cur = cursor(sock)
-            if cur is None:
-                sys.exit('no menu cursor on screen')
+        if cur is None:
+            sys.exit('no menu cursor on screen')
         if cur == target:
             break
         press(sock, 'pgdn' if cur < target else 'pgup')
