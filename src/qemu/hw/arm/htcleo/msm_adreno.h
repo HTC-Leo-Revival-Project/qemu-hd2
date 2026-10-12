@@ -271,6 +271,7 @@ typedef struct AdrenoWorker {
 } AdrenoWorker;
 
 typedef struct AdrenoGl AdrenoGl;
+typedef struct AdrenoResolveJob AdrenoResolveJob;
 
 struct MsmAdrenoState {
     SysBusDevice parent_obj;
@@ -313,13 +314,44 @@ struct MsmAdrenoState {
     AdrenoGl *gl;
     bool gl_failed;
     bool const_dirty;           /* ALU constants changed since uploaded */
-    uint32_t mem_epoch;         /* memory may have changed: new commands,
-                                   or the GPU wrote it */
+    AdrenoResolveJob *resolves; /* resolves waiting for the kick's end */
+    uint32_t nresolves, cap_resolves;
+    /*
+     * What may have changed memory: the CPU, between command kicks, and
+     * the GPU, whose writes (resolves, draws to memory) are logged.
+     */
+    uint32_t kick_epoch;
+    uint32_t gpu_writes;
+    struct { uint32_t lo, hi; } write_log[1024];
+
+    /* ADRENO_STATS=SECONDS: where the time goes, on stderr (us) */
+    bool stats_on;
+    int64_t stats_us;
+    struct {
+        int64_t last;
+        uint64_t kicks, gpu_draws, cpu_draws, soft_draws, resolves;
+        uint64_t hashes, decodes, hash_bytes;
+        int64_t cp, sync, resolve, tex, upload;
+    } st;
 
     char *trace_path;
     FILE *trace;
     uint64_t trace_vtx_draws;   /* trace vertices up to this draw */
 };
+
+/* A point in time for adreno_mem_unchanged() */
+typedef struct AdrenoMemStamp {
+    uint32_t kick, writes;
+} AdrenoMemStamp;
+
+/* the GPU wrote [lo, hi) of its address space */
+void adreno_mem_written(MsmAdrenoState *s, uint32_t lo, uint32_t hi);
+/* nothing changed [lo, hi) since the stamp, which becomes now */
+bool adreno_mem_unchanged(MsmAdrenoState *s, AdrenoMemStamp *st, uint32_t lo,
+                          uint32_t hi);
+/* the GPU wrote [lo, hi) since the stamp (or the log cannot tell) */
+bool adreno_gpu_wrote(MsmAdrenoState *s, const AdrenoMemStamp *st,
+                      uint32_t lo, uint32_t hi);
 
 /* GPU virtual address space (MH MMU) */
 bool adreno_read(MsmAdrenoState *s, uint32_t gpuaddr, void *buf, uint32_t len);
@@ -360,6 +392,8 @@ typedef struct AdrenoColorFmt {
 } AdrenoColorFmt;
 
 const AdrenoColorFmt *adreno_color_fmt(unsigned fmt);
+/* do the resolves that wait (msm_adreno_gl.c snapshots of GMEM) */
+void adreno_resolves_flush(MsmAdrenoState *s);
 void adreno_draw(MsmAdrenoState *s, uint32_t initiator, uint32_t num_indices,
                  uint32_t index_base, uint32_t index_size,
                  const uint32_t *immediate, uint32_t immediate_dwords);

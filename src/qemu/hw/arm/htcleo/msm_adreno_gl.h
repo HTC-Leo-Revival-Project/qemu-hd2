@@ -88,6 +88,16 @@ void adreno_gl_gmem_to_cpu(MsmAdrenoState *s);
 /* s->gmem changed: the host GPU's copy is stale */
 void adreno_gl_gmem_from_cpu(MsmAdrenoState *s);
 
+/*
+ * Copies of GMEM for resolves done later: snapshot() queues a copy on the
+ * host GPU (false: none free, or no host GPU), wait() waits for all of
+ * them, release() frees them.
+ */
+bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot);
+void adreno_gl_snapshots_wait(MsmAdrenoState *s);
+uint8_t *adreno_gl_snapshot_ptr(MsmAdrenoState *s, int slot);
+void adreno_gl_snapshots_release(MsmAdrenoState *s);
+
 /* msm_adreno_tex.c: textures for the host GPU */
 typedef struct AdrenoTexImage {
     uint32_t w, h;              /* level 0 */
@@ -105,8 +115,9 @@ typedef struct AdrenoTexImage {
 } AdrenoTexImage;
 
 bool adreno_tex_image(MsmAdrenoState *s, unsigned idx, AdrenoTexImage *im);
-/* a hash of the memory the texture's levels occupy */
-uint64_t adreno_tex_hash(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx);
+/* a hash of the memory [*lo, *hi) the texture's levels occupy */
+uint64_t adreno_tex_hash(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx,
+                         uint32_t *lo, uint32_t *hi);
 /* decode a level (w >> level by h >> level texels) of a layer */
 void adreno_tex_decode(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx,
                        int level, int layer, void *out);

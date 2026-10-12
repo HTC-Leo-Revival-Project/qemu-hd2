@@ -1208,6 +1208,118 @@ static void raster_run(DrawCtx *d)
 /* Resolve (EDRAM_COPY)                                                */
 /* ------------------------------------------------------------------ */
 
+/* a resolve's copy, which may wait for the end of the command kick */
+struct AdrenoResolveJob {
+    Surface src;
+    unsigned sfmt, dfmt, sswap, dswap, dmask;
+    uint32_t dpitch, dbase;
+    int offx, offy, rx0, ry0, x0, y0, x1, y1;
+    bool raw, tiled;
+    int slot;               /* the GMEM snapshot it copies from */
+};
+
+/* copy the rectangle from GMEM (the copy at gmem) to memory */
+static void resolve_copy(MsmAdrenoState *s, AdrenoResolveJob *j,
+                         uint8_t *gmem)
+{
+    AdrenoTlb *tlb = &s->workers[0].tlb;
+    const ColorFmt *sf = &color_fmts[j->sfmt], *df = &color_fmts[j->dfmt];
+    Surface *src = &j->src;
+    g_autofree uint8_t *row = g_malloc((j->x1 - j->x0) *
+                                       MAX(sf->bpp, df->bpp));
+    int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
+    adreno_tlb_flush(tlb);
+    if (src->host) {
+        src->host = gmem;
+    }
+    for (int y = j->y0; y < j->y1; y++) {
+        uint32_t dy = y - j->ry0 + j->offy;
+        uint32_t daddr = j->dbase + (dy * j->dpitch +
+                                     (j->x0 - j->rx0 + j->offx)) * df->bpp;
+
+        if (j->raw && !j->tiled && src->host && src->sx == 1) {
+            uint64_t off = src->offset + ((uint64_t)y * src->pitch + j->x0) *
+                           sf->bpp;
+
+            if (off + (j->x1 - j->x0) * sf->bpp > ADRENO_GMEM_SIZE) {
+                break;
+            }
+            adreno_tlb_write(s, tlb, daddr, gmem + off,
+                             (j->x1 - j->x0) * sf->bpp);
+            continue;
+        }
+        for (int x = j->x0; x < j->x1; x++) {
+            uint8_t px[16] = {0};
+            uint8_t *o = j->tiled ? px : row + (x - j->x0) * df->bpp;
+            uint32_t dx = x - j->rx0 + j->offx;
+            float c[4];
+
+            surface_rw(s, tlb, src, x, y, px, false);
+            if (!j->raw) {
+                color_unpack(j->sfmt, px, c);
+                if (j->sswap == 1) {
+                    swap_rb(c);
+                }
+                if (j->dmask != 0xf) {
+                    uint8_t oldpx[16] = {0};
+                    float old[4];
+
+                    adreno_tlb_read(s, tlb, j->tiled ?
+                                    j->dbase + adreno_tiled_offset(dx, dy,
+                                        j->dpitch, ctz32(df->bpp)) :
+                                    daddr + (x - j->x0) * df->bpp,
+                                    oldpx, df->bpp);
+                    color_unpack(j->dfmt, oldpx, old);
+                    if (j->dswap == 1) {
+                        swap_rb(old);
+                    }
+                    for (int k = 0; k < 4; k++) {
+                        if (!(j->dmask & (1 << k))) {
+                            c[k] = old[k];
+                        }
+                    }
+                }
+                if (j->dswap == 1) {
+                    swap_rb(c);
+                }
+                color_pack(j->dfmt, c, o);
+            } else if (!j->tiled) {
+                memcpy(o, px, df->bpp);
+            }
+            if (j->tiled) {
+                /* a tiled destination (a texture): pixel by pixel */
+                adreno_tlb_write(s, tlb, j->dbase +
+                                 adreno_tiled_offset(dx, dy, j->dpitch,
+                                                     ctz32(df->bpp)),
+                                 o, df->bpp);
+            }
+        }
+        if (!j->tiled) {
+            adreno_tlb_write(s, tlb, daddr, row, (j->x1 - j->x0) * df->bpp);
+        }
+    }
+    if (s->stats_on) {
+        s->st.resolves++;
+        s->st.resolve += g_get_monotonic_time() - t0;
+    }
+}
+
+void adreno_resolves_flush(MsmAdrenoState *s)
+{
+    if (!s->nresolves) {
+        return;
+    }
+    adreno_gl_snapshots_wait(s);
+    for (uint32_t i = 0; i < s->nresolves; i++) {
+        AdrenoResolveJob *j = &s->resolves[i];
+
+        resolve_copy(s, j, adreno_gl_snapshot_ptr(s, j->slot));
+    }
+    s->nresolves = 0;
+    adreno_gl_snapshots_release(s);
+}
+
 static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
 {
     MsmAdrenoState *s = d->s;
@@ -1227,12 +1339,8 @@ static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
     int x0, y0, x1, y1, rx0, ry0;
     Surface src;
     const ColorFmt *sf = &color_fmts[sfmt], *df = &color_fmts[dfmt];
-    bool raw = sfmt == dfmt && sswap == dswap && dmask == 0xf &&
-               !(dinfo & 7);
-    bool tiled = !(dinfo & (1 << 3)) && is_power_of_2(df->bpp);
-    g_autofree uint8_t *row = NULL;
+    AdrenoResolveJob job;
 
-    adreno_tlb_flush(tlb);
     for (int i = 0; i < nv; i++) {
         SVert sv;
 
@@ -1266,72 +1374,38 @@ static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
     if (!dpitch) {
         dpitch = src.pitch;
     }
-    row = g_malloc((x1 - x0) * MAX(sf->bpp, df->bpp));
-    for (int y = y0; y < y1; y++) {
-        uint32_t dy = y - ry0 + offy;
-        uint32_t daddr = dbase + (dy * dpitch + (x0 - rx0 + offx)) * df->bpp;
+    job = (AdrenoResolveJob) {
+        .src = src, .sfmt = sfmt, .dfmt = dfmt, .sswap = sswap,
+        .dswap = dswap, .dmask = dmask, .dpitch = dpitch, .dbase = dbase,
+        .offx = offx, .offy = offy, .rx0 = rx0, .ry0 = ry0,
+        .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1,
+        .raw = sfmt == dfmt && sswap == dswap && dmask == 0xf && !(dinfo & 7),
+        .tiled = !(dinfo & (1 << 3)) && is_power_of_2(df->bpp),
+    };
+    {
+        /* the destination rows, whole tile rows when tiled */
+        uint64_t rowb = (uint64_t)dpitch * df->bpp;
+        uint64_t lo = dbase + ((y0 - ry0 + offy) & ~31) * rowb;
+        uint64_t hi = dbase + ROUND_UP(y1 - ry0 + offy, 32) * rowb;
 
-        if (raw && !tiled && src.host && src.sx == 1) {
-            uint64_t off = src.offset + ((uint64_t)y * src.pitch + x0) *
-                           sf->bpp;
-
-            if (off + (x1 - x0) * sf->bpp > ADRENO_GMEM_SIZE) {
-                break;
-            }
-            adreno_tlb_write(s, tlb, daddr, s->gmem + off,
-                             (x1 - x0) * sf->bpp);
-            continue;
-        }
-        for (int x = x0; x < x1; x++) {
-            uint8_t px[16] = {0};
-            uint8_t *o = tiled ? px : row + (x - x0) * df->bpp;
-            uint32_t dx = x - rx0 + offx;
-            float c[4];
-
-            surface_rw(s, tlb, &src, x, y, px, false);
-            if (!raw) {
-                color_unpack(sfmt, px, c);
-                if (sswap == 1) {
-                    swap_rb(c);
-                }
-                if (dmask != 0xf) {
-                    uint8_t oldpx[16] = {0};
-                    float old[4];
-
-                    adreno_tlb_read(s, tlb, tiled ?
-                                    dbase + adreno_tiled_offset(dx, dy,
-                                        dpitch, ctz32(df->bpp)) :
-                                    daddr + (x - x0) * df->bpp,
-                                    oldpx, df->bpp);
-                    color_unpack(dfmt, oldpx, old);
-                    if (dswap == 1) {
-                        swap_rb(old);
-                    }
-                    for (int k = 0; k < 4; k++) {
-                        if (!(dmask & (1 << k))) {
-                            c[k] = old[k];
-                        }
-                    }
-                }
-                if (dswap == 1) {
-                    swap_rb(c);
-                }
-                color_pack(dfmt, c, o);
-            } else if (!tiled) {
-                memcpy(o, px, df->bpp);
-            }
-            if (tiled) {
-                /* a tiled destination (a texture): pixel by pixel */
-                adreno_tlb_write(s, tlb, dbase +
-                                 adreno_tiled_offset(dx, dy, dpitch,
-                                                     ctz32(df->bpp)),
-                                 o, df->bpp);
-            }
-        }
-        if (!tiled) {
-            adreno_tlb_write(s, tlb, daddr, row, (x1 - x0) * df->bpp);
-        }
+        adreno_mem_written(s, lo, MIN(hi, UINT32_MAX));
     }
+    /*
+     * With the host GPU, a copy of GMEM is taken on the GPU and copied to
+     * memory when the commands are done: no waiting for the GPU per bin.
+     */
+    if (!(copyc & 0xf8) && src.host && adreno_gl_gmem_snapshot(s, &job.slot)) {
+        if (s->nresolves == s->cap_resolves) {
+            s->cap_resolves = MAX(16, s->cap_resolves * 2);
+            s->resolves = g_renew(AdrenoResolveJob, s->resolves,
+                                  s->cap_resolves);
+        }
+        s->resolves[s->nresolves++] = job;
+        return;
+    }
+    adreno_resolves_flush(s);
+    adreno_gl_gmem_to_cpu(s);
+    resolve_copy(s, &job, s->gmem);
 
     /* clear the source after the copy */
     if ((copyc >> 4) & 0xf) {
@@ -1366,48 +1440,53 @@ static void resolve(DrawCtx *d, const AdrenoVertex *vs, int nv)
             }
         }
     }
+    if (copyc & 0xf8) {
+        adreno_gl_gmem_from_cpu(s);
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* Draw                                                                */
 /* ------------------------------------------------------------------ */
 
-static uint32_t fetch_index(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t i,
-                            unsigned src, uint32_t init, uint32_t index_base,
-                            const uint32_t *imm, uint32_t imm_dwords)
+/* the draw's vertex indices, with VGT_INDX_OFFSET and the index clamp */
+static void fetch_indices(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t *idx,
+                          uint32_t n, unsigned src, uint32_t init,
+                          uint32_t index_base, const uint32_t *imm,
+                          uint32_t imm_dwords)
 {
     bool i32 = init & (1 << 11), i8 = init & (1 << 13);
-    uint32_t idx = i;
+    uint32_t ofs = s->regs[A2_VGT_INDX_OFFSET];
+    uint32_t lo = s->regs[A2_VGT_MIN_VTX_INDX];
+    uint32_t hi = s->regs[A2_VGT_MAX_VTX_INDX];
 
     if (src == 0) {
-        if (i32) {
-            uint32_t v = 0;
+        /* DMA: the index buffer in one read */
+        unsigned size = i32 ? 4 : i8 ? 1 : 2;
+        g_autofree uint8_t *buf = g_malloc((size_t)n * size);
 
-            adreno_tlb_read(s, tlb, index_base + i * 4, &v, 4);
-            idx = le32_to_cpu(v);
-        } else if (i8) {
-            uint8_t b = 0;
-
-            adreno_tlb_read(s, tlb, index_base + i, &b, 1);
-            idx = b;
-        } else {
-            uint16_t h = 0;
-
-            adreno_tlb_read(s, tlb, index_base + i * 2, &h, 2);
-            idx = le16_to_cpu(h);
+        adreno_tlb_read(s, tlb, index_base, buf, n * size);
+        for (uint32_t i = 0; i < n; i++) {
+            idx[i] = i32 ? ldl_le_p(buf + 4 * i) :
+                     i8 ? buf[i] : lduw_le_p(buf + 2 * i);
         }
     } else if (src == 1) {
-        if (i32) {
-            idx = i < imm_dwords ? imm[i] : 0;
-        } else {
-            idx = (i / 2) < imm_dwords ? (imm[i / 2] >> (16 * (i & 1))) &
-                                         0xffff : 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (i32) {
+                idx[i] = i < imm_dwords ? imm[i] : 0;
+            } else {
+                idx[i] = (i / 2) < imm_dwords ?
+                         (imm[i / 2] >> (16 * (i & 1))) & 0xffff : 0;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            idx[i] = i;
         }
     }
-    idx += s->regs[A2_VGT_INDX_OFFSET];
-    idx = MIN(MAX(idx, s->regs[A2_VGT_MIN_VTX_INDX]),
-              s->regs[A2_VGT_MAX_VTX_INDX]);
-    return idx;
+    for (uint32_t i = 0; i < n; i++) {
+        idx[i] = MIN(MAX(idx[i] + ofs, lo), hi);
+    }
 }
 
 /* shade the vertices of the index list, AL at a time */
@@ -1546,6 +1625,7 @@ static bool gl_draw_gpu(DrawCtx *d, unsigned prim, const uint32_t *idx,
         g.max_idx = MAX(g.max_idx, idx[i]);
     }
     adreno_gl_draw(s, &g);
+    s->st.gpu_draws++;
     return true;
 }
 
@@ -1662,10 +1742,8 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
     idx = g_new(uint32_t, n);
     slot = g_new(uint32_t, n);
     adreno_tlb_flush(&s->workers[0].tlb);
-    for (uint32_t i = 0; i < n; i++) {
-        idx[i] = fetch_index(s, &s->workers[0].tlb, i, src, init, index_base,
-                             imm, imm_dwords);
-    }
+    fetch_indices(s, &s->workers[0].tlb, idx, n, src, init, index_base, imm,
+                  imm_dwords);
     if (mode != A2_EDRAM_COPY && gl_draw_gpu(d, prim, idx, n)) {
         return;
     }
@@ -1677,17 +1755,12 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         for (uint32_t i = 0; i < n; i++) {
             rv[i] = verts[slot[i]];
         }
-        /* GMEM to memory: the CPU's copy, and back when cleared */
-        adreno_gl_gmem_to_cpu(s);
         resolve(d, rv, n);
-        if (r[A2_RB_COPY_CONTROL] & 0xf8) {
-            adreno_gl_gmem_from_cpu(s);
-        }
-        s->mem_epoch++;
         return;
     }
 
     if (!d->gl) {
+        adreno_resolves_flush(s);
         adreno_gl_gmem_to_cpu(s);
     }
 
@@ -1755,12 +1828,16 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         g.verts = d->glv;
         g.nverts = d->glv_n;
         adreno_gl_draw(s, &g);
+        s->st.cpu_draws++;
         g_free(d->glv);
     } else {
         raster_run(d);
+        s->st.soft_draws++;
         /* the CPU drew into GMEM or memory */
         adreno_gl_gmem_from_cpu(s);
-        s->mem_epoch++;
+        if (!d->color.host || !d->depth.host) {
+            adreno_mem_written(s, 0, UINT32_MAX);
+        }
     }
     g_free(d->prims);
     (void)index_size;

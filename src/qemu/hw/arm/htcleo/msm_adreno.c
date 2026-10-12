@@ -268,6 +268,48 @@ void adreno_stl(MsmAdrenoState *s, uint32_t va, uint32_t val)
     adreno_write(s, va & ~3u, &val, 4);
 }
 
+void adreno_mem_written(MsmAdrenoState *s, uint32_t lo, uint32_t hi)
+{
+    unsigned n = s->gpu_writes++ % ARRAY_SIZE(s->write_log);
+
+    s->write_log[n].lo = lo;
+    s->write_log[n].hi = hi;
+}
+
+bool adreno_gpu_wrote(MsmAdrenoState *s, const AdrenoMemStamp *st,
+                      uint32_t lo, uint32_t hi)
+{
+    if (s->gpu_writes - st->writes > ARRAY_SIZE(s->write_log)) {
+        return true;
+    }
+    for (uint32_t i = st->writes; i != s->gpu_writes; i++) {
+        unsigned n = i % ARRAY_SIZE(s->write_log);
+
+        if (s->write_log[n].lo < hi && lo < s->write_log[n].hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool adreno_mem_unchanged(MsmAdrenoState *s, AdrenoMemStamp *st, uint32_t lo,
+                          uint32_t hi)
+{
+    bool same = st->kick == s->kick_epoch &&
+                s->gpu_writes - st->writes <= ARRAY_SIZE(s->write_log);
+
+    for (uint32_t i = st->writes; same && i != s->gpu_writes; i++) {
+        unsigned n = i % ARRAY_SIZE(s->write_log);
+
+        if (s->write_log[n].lo < hi && lo < s->write_log[n].hi) {
+            same = false;
+        }
+    }
+    st->kick = s->kick_epoch;
+    st->writes = s->gpu_writes;
+    return same;
+}
+
 void adreno_tlb_flush(AdrenoTlb *tlb)
 {
     memset(tlb->tag, 0, sizeof(tlb->tag));
@@ -891,13 +933,40 @@ static void cp_run_ring(MsmAdrenoState *s)
         return;     /* micro engine halted */
     }
     /* the CPU may have written what the commands use */
-    s->mem_epoch++;
+    s->kick_epoch++;
     rb.base = r[A2_CP_RB_BASE];
     rb.size = size;
     rb.pos = r[A2_CP_RB_RPTR] % size;
     rb.end = r[A2_CP_RB_WPTR] % size;
     s->ib_depth = 0;
-    cp_exec_stream(s, &rb);
+    {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
+        cp_exec_stream(s, &rb);
+        if (s->stats_on) {
+            int64_t now = g_get_monotonic_time();
+
+            s->st.kicks++;
+            s->st.cp += now - t0;
+            if (now - s->st.last >= s->stats_us) {
+                fprintf(stderr, "adreno: %" PRIu64 " kicks, draws %" PRIu64
+                        " gpu %" PRIu64 " cpu-vertex %" PRIu64 " soft, %"
+                        PRIu64 " resolves, %" PRIu64 " texture hashes, %"
+                        PRIu64 " decodes (%.1f MB hashed); ms: cp %.1f, "
+                        "gmem sync %.1f, "
+                        "resolve %.1f, textures %.1f, vertex upload %.1f\n",
+                        s->st.kicks, s->st.gpu_draws, s->st.cpu_draws,
+                        s->st.soft_draws, s->st.resolves, s->st.hashes,
+                        s->st.decodes, s->st.hash_bytes / 1e6, s->st.cp / 1e3,
+                        s->st.sync / 1e3, s->st.resolve / 1e3, s->st.tex / 1e3,
+                        s->st.upload / 1e3);
+                memset(&s->st, 0, sizeof(s->st));
+                s->st.last = now;
+            }
+        }
+    }
+    /* the resolves are in memory before the CPU looks */
+    adreno_resolves_flush(s);
     r[A2_CP_RB_RPTR] = rb.pos;
     /* RB_NO_UPDATE clear: the read pointer goes to memory */
     if (!(r[A2_CP_RB_CNTL] & (1u << 27))) {
@@ -1072,6 +1141,11 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     s->pkt = g_new(uint32_t, 0x4000 + 1);
 
     s->const_dirty = true;
+    s->stats_on = getenv("ADRENO_STATS") != NULL;
+    s->stats_us = s->stats_on ? atof(getenv("ADRENO_STATS")) * 1e6 : 0;
+    if (s->stats_us < 100000) {
+        s->stats_us = 5000000;
+    }
     if (!s->backend) {
         s->backend = g_strdup("gl");
     }

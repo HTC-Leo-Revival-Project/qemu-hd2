@@ -27,6 +27,10 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "qemu/error-report.h"
+#include "qemu/rcu.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
+#include "system/physmem.h"
 #include "msm_adreno_gl.h"
 
 #ifdef CONFIG_OPENGL
@@ -66,7 +70,10 @@ typedef struct GlTex {
     GlTexKey key;
     GLuint tex;
     uint64_t hash;
-    uint32_t epoch;
+    AdrenoMemStamp stamp;       /* when hashed or checked */
+    uint32_t lo, hi;            /* the memory it was decoded from */
+    uint32_t npages;
+    uint64_t *pages;            /* its pages' RAM addresses + 1 (0: none) */
     uint64_t used;
     AdrenoTexImage im;
 } GlTex;
@@ -123,6 +130,10 @@ typedef struct AdrenoGl {
     GLuint gmem, consts, draw_ubo, vbo, ibo, vdata;
     GLuint gmem_stage;          /* GMEM's way to and from the CPU */
     uint8_t *gmem_map;
+    /* GMEM snapshots for resolves */
+    GLuint snap[32];
+    uint8_t *snap_map[32];
+    int nsnap, snap_used;
     GLsizeiptr vbo_size;
     uint8_t *vstage;
     size_t vstage_size;
@@ -134,6 +145,9 @@ typedef struct AdrenoGl {
     AdrenoTlb tlb;
     uint8_t *scratch;
     size_t scratch_size;
+    /* by RAM page: the command kick it last changed in (dirty logging) */
+    uint32_t *page_kick;
+    size_t npage_kick;
 } AdrenoGl;
 
 /* ------------------------------------------------------------------ */
@@ -904,7 +918,88 @@ static void tex_free(gpointer data)
     GlTex *t = data;
 
     glDeleteTextures(1, &t->tex);
+    g_free(t->pages);
     g_free(t);
+}
+
+/*
+ * The CPU's writes to textures: QEMU's dirty logging of guest RAM (client
+ * VGA, which nothing else here uses) tells which pages changed; the bits
+ * are folded into page_kick, so that textures sharing pages all see them.
+ */
+static uint64_t page_ram(MsmAdrenoState *s, uint32_t va)
+{
+    hwaddr pa, xlat, len = 0x1000;
+    MemoryRegion *mr;
+    uint64_t ram = 0;
+
+    if (!adreno_translate(s, va, &pa)) {
+        return 0;
+    }
+    WITH_RCU_READ_LOCK_GUARD() {
+        mr = address_space_translate(&address_space_memory, pa, &xlat, &len,
+                                     false, MEMTXATTRS_UNSPECIFIED);
+        if (memory_region_is_ram(mr) && len >= 0x1000 && !(xlat & 0xfff)) {
+            ram = memory_region_get_ram_addr(mr) + xlat + 1;
+        } else {
+            mr = NULL;
+        }
+    }
+    if (mr && !memory_region_is_logging(mr, DIRTY_MEMORY_VGA)) {
+        memory_region_set_log(mr, true, DIRTY_MEMORY_VGA);
+    }
+    return ram;
+}
+
+/* the kick a RAM page last changed in (as far as we have looked) */
+static uint32_t page_changed(AdrenoGl *gl, MsmAdrenoState *s, uint64_t ram)
+{
+    size_t pg = ram >> 12;
+
+    if (pg >= gl->npage_kick) {
+        size_t n = MAX(pg + 1, gl->npage_kick * 2);
+
+        gl->page_kick = g_renew(uint32_t, gl->page_kick, n);
+        memset(gl->page_kick + gl->npage_kick, 0,
+               (n - gl->npage_kick) * sizeof(uint32_t));
+        gl->npage_kick = n;
+    }
+    if (physical_memory_test_and_clear_dirty(ram, 0x1000, DIRTY_MEMORY_VGA,
+                                             NULL)) {
+        gl->page_kick[pg] = s->kick_epoch;
+    }
+    return gl->page_kick[pg];
+}
+
+/* note the texture's pages (and take their dirty bits) */
+static void tex_pages(AdrenoGl *gl, MsmAdrenoState *s, GlTex *t)
+{
+    uint32_t first = t->lo & ~0xfffu;
+
+    t->npages = t->hi > first ? DIV_ROUND_UP(t->hi - first, 0x1000) : 0;
+    t->pages = g_renew(uint64_t, t->pages, t->npages);
+    for (uint32_t i = 0; i < t->npages; i++) {
+        t->pages[i] = page_ram(s, first + i * 0x1000);
+        if (t->pages[i]) {
+            page_changed(gl, s, t->pages[i] - 1);
+        }
+    }
+}
+
+/* the texture's pages are where they were, and the CPU left them alone */
+static bool tex_pages_unchanged(AdrenoGl *gl, MsmAdrenoState *s, GlTex *t)
+{
+    uint32_t first = t->lo & ~0xfffu;
+
+    for (uint32_t i = 0; i < t->npages; i++) {
+        uint64_t ram = page_ram(s, first + i * 0x1000);
+
+        if (!ram || ram != t->pages[i] ||
+            (int32_t)(page_changed(gl, s, ram - 1) - t->stamp.kick) > 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static gboolean tex_stale(gpointer key, gpointer value, gpointer opaque)
@@ -923,6 +1018,7 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
     GlTex *t;
     AdrenoTexImage im;
     uint64_t h;
+    uint32_t lo, hi;
     bool fresh = false;
 
     /* what the texels depend on: not clamping, filters, swizzle, bias */
@@ -933,13 +1029,28 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
     key.fc[4] = fc[4] & 0x3fc;
     key.fc[5] = fc[5] & ~3u;
     t = g_hash_table_lookup(gl->texes, &key);
-    if (t && t->epoch == s->mem_epoch) {
+    if (t && !adreno_gpu_wrote(s, &t->stamp, t->lo, t->hi) &&
+        (t->stamp.kick == s->kick_epoch || tex_pages_unchanged(gl, s, t))) {
+        t->stamp.kick = s->kick_epoch;
+        t->stamp.writes = s->gpu_writes;
         t->used = gl->ndraw;
         return t->tex ? t : NULL;
     }
-    h = adreno_tex_hash(s, &gl->tlb, idx);
+    {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
+        /* resolves to memory not done yet may have written it */
+        adreno_resolves_flush(s);
+        h = adreno_tex_hash(s, &gl->tlb, idx, &lo, &hi);
+        if (s->stats_on) {
+            s->st.tex += g_get_monotonic_time() - t0;
+            s->st.hashes++;
+        }
+    }
     if (t && t->hash == h) {
-        t->epoch = s->mem_epoch;
+        t->stamp.kick = s->kick_epoch;
+        t->stamp.writes = s->gpu_writes;
+        tex_pages(gl, s, t);
         t->used = gl->ndraw;
         return t->tex ? t : NULL;
     }
@@ -955,8 +1066,15 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
         g_hash_table_insert(gl->texes, &t->key, t);
     }
     t->hash = h;
-    t->epoch = s->mem_epoch;
+    t->lo = lo;
+    t->hi = hi;
+    t->stamp.kick = s->kick_epoch;
+    t->stamp.writes = s->gpu_writes;
+    tex_pages(gl, s, t);
     t->used = gl->ndraw;
+    if (s->stats_on) {
+        s->st.decodes++;
+    }
     if (!adreno_tex_image(s, idx, &im)) {
         if (t->tex) {
             glDeleteTextures(1, &t->tex);
@@ -985,6 +1103,7 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
     }
     t->im = im;
     {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
         size_t texel = im.is_float ? 16 : 4;
         void *buf = scratch(gl, (size_t)im.w * im.h * texel);
         GLenum type = im.is_float ? GL_FLOAT : GL_UNSIGNED_BYTE;
@@ -1003,6 +1122,9 @@ static GlTex *gl_texture(AdrenoGl *gl, MsmAdrenoState *s, unsigned idx)
                                         type, buf);
                 }
             }
+        }
+        if (s->stats_on) {
+            s->st.tex += g_get_monotonic_time() - t0;
         }
     }
     adreno_trace(s, "  gl: texture %u %ux%u x%d levels %d %s (%s)\n", idx,
@@ -1111,6 +1233,7 @@ void adreno_gl_gmem_to_cpu(MsmAdrenoState *s)
     AdrenoGl *gl = s->gl;
 
     if (gl && gl->gpu_newer) {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
         GLsync fence;
 
         /* through a buffer in host memory: GMEM stays in video memory */
@@ -1122,7 +1245,74 @@ void adreno_gl_gmem_to_cpu(MsmAdrenoState *s)
         glDeleteSync(fence);
         memcpy(s->gmem, gl->gmem_map, ADRENO_GMEM_SIZE);
         gl->gpu_newer = false;
+        if (s->stats_on) {
+            s->st.sync += g_get_monotonic_time() - t0;
+        }
     }
+}
+
+static void gmem_upload(AdrenoGl *gl, MsmAdrenoState *s)
+{
+    if (gl->cpu_newer) {
+        /*
+         * The CPU changes GMEM only after copying it back, which waited
+         * for the staging buffer to be idle.
+         */
+        memcpy(gl->gmem_map, s->gmem, ADRENO_GMEM_SIZE);
+        glCopyNamedBufferSubData(gl->gmem_stage, gl->gmem, 0, 0,
+                                 ADRENO_GMEM_SIZE);
+        gl->cpu_newer = false;
+    }
+}
+
+bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot)
+{
+    AdrenoGl *gl = s->gl;
+
+    if (!gl || !qemu_thread_is_self(&gl->owner) ||
+        gl->snap_used == ARRAY_SIZE(gl->snap)) {
+        return false;
+    }
+    if (gl->snap_used == gl->nsnap) {
+        GLuint b;
+
+        glCreateBuffers(1, &b);
+        glNamedBufferStorage(b, ADRENO_GMEM_SIZE, NULL,
+                             GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT |
+                             GL_MAP_COHERENT_BIT | GL_CLIENT_STORAGE_BIT);
+        gl->snap_map[gl->nsnap] = glMapNamedBufferRange(
+            b, 0, ADRENO_GMEM_SIZE,
+            GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT);
+        gl->snap[gl->nsnap++] = b;
+    }
+    gmem_upload(gl, s);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glCopyNamedBufferSubData(gl->gmem, gl->snap[gl->snap_used], 0, 0,
+                             ADRENO_GMEM_SIZE);
+    *slot = gl->snap_used++;
+    return true;
+}
+
+void adreno_gl_snapshots_wait(MsmAdrenoState *s)
+{
+    int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+    glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, UINT64_MAX);
+    glDeleteSync(fence);
+    if (s->stats_on) {
+        s->st.sync += g_get_monotonic_time() - t0;
+    }
+}
+
+uint8_t *adreno_gl_snapshot_ptr(MsmAdrenoState *s, int slot)
+{
+    return s->gl->snap_map[slot];
+}
+
+void adreno_gl_snapshots_release(MsmAdrenoState *s)
+{
+    s->gl->snap_used = 0;
 }
 
 void adreno_gl_gmem_from_cpu(MsmAdrenoState *s)
@@ -1240,16 +1430,7 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         return;
     }
     geom = p->key.geom;
-    if (gl->cpu_newer) {
-        /*
-         * The CPU changes GMEM only after copying it back, which waited
-         * for the staging buffer to be idle.
-         */
-        memcpy(gl->gmem_map, s->gmem, ADRENO_GMEM_SIZE);
-        glCopyNamedBufferSubData(gl->gmem_stage, gl->gmem, 0, 0,
-                                 ADRENO_GMEM_SIZE);
-        gl->cpu_newer = false;
-    }
+    gmem_upload(gl, s);
     if (s->const_dirty) {
         glNamedBufferSubData(gl->consts, 0, 512 * 16,
                              &r[A2_SQ_CONSTANT_0]);
@@ -1305,9 +1486,14 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     } else {
         uint32_t mm = r[A2_PA_SU_POINT_MINMAX];
 
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
         bind_textures(gl, s, &p->vinfo, p->key.vs_cube_mask,
                       ADRENO_GL_MAX_UNITS, &du);
         upload_vertices(gl, s, p, g, &du);
+        if (s->stats_on) {
+            s->st.upload += g_get_monotonic_time() - t0;
+        }
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, gl->vdata);
         du.vp0[0] = adreno_f(r[A2_PA_CL_VPORT_XSCALE]);
         du.vp0[1] = adreno_f(r[A2_PA_CL_VPORT_XOFFSET]);
@@ -1341,7 +1527,9 @@ void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         glDrawElements(mode, g->nidx, GL_UNSIGNED_INT, NULL);
     }
     /* the next draw reads what this one wrote to GMEM */
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    if (!getenv("ADRENO_GL_NOBARRIER")) {
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
     gl->gpu_newer = true;
 }
 
@@ -1507,6 +1695,24 @@ void adreno_gl_gmem_to_cpu(MsmAdrenoState *s)
 }
 
 void adreno_gl_gmem_from_cpu(MsmAdrenoState *s)
+{
+}
+
+bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot)
+{
+    return false;
+}
+
+void adreno_gl_snapshots_wait(MsmAdrenoState *s)
+{
+}
+
+uint8_t *adreno_gl_snapshot_ptr(MsmAdrenoState *s, int slot)
+{
+    return NULL;
+}
+
+void adreno_gl_snapshots_release(MsmAdrenoState *s)
 {
 }
 
