@@ -115,6 +115,17 @@ The connection comes from the default `-nic`. To pick your own backend:
 tools/start.sh -nic user,model=bcm4329
 ```
 
+## Processors
+
+The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulated:
+
+| Processor | Role on the phone | Emulation |
+|---|---|---|
+| Scorpion (ARMv7, Qualcomm's own core) | Apps processor: cLK, Linux, Android | **Low level.** The instructions run on a Cortex-A8 model with Qualcomm's MIDR and the Scorpion CP15 registers (PLL, L2). |
+| ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1). The secure boot stages are skipped and their hand-off is reproduced. In progress, see below. |
+| QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, Android's "aDSP" | **High level.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. No Hexagon instructions run, so the DSP1 firmware image is never executed. |
+| QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated.** There is no radio. In HLE mode, registration, calls and data are modelled above it. In LLE mode, AMSS's accesses to the modem DSP's registers fall into an unmodelled register store. |
+
 ## Hardware status
 
 | Block | Model |
