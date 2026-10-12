@@ -1584,6 +1584,8 @@ void HELPER(ciad)(CPUHexagonState *env, uint32_t mask)
                                          env->threadId);
         hexagon_globalreg_write(cpu->globalregs, HEX_SREG_IPENDAD,
                                 ipendad & ~mask, env->threadId);
+        qemu_log_mask(CPU_LOG_INT, "ciad: thread %u mask 0x%08x, iad 0x%08x\n",
+                      env->threadId, mask, ipendad & ~mask);
         hex_interrupt_update(env);
         return;
     }

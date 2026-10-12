@@ -98,6 +98,9 @@ int64_t icount_percpu_budget(int cpu_count)
     if (timeslice == 0) {
         timeslice = limit;
     }
+    if (icount_rr_slice && timeslice > icount_rr_slice) {
+        timeslice = icount_rr_slice;
+    }
 
     return timeslice;
 }

@@ -52,6 +52,7 @@ bool icount_align_option;
 
 /* Do not count executed instructions */
 ICountMode use_icount = ICOUNT_DISABLED;
+int64_t icount_rr_slice;
 
 static void icount_enable_precise(void)
 {

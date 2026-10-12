@@ -25,6 +25,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/misc/unimp.h"
@@ -107,6 +108,9 @@ struct HtcleoMachineState {
     bool modem_lle;             /* run AMSS on a modem core (baseband=lle) */
     char *modem_fw;
     bool modem_trace;
+    bool q6_lle;                /* the QDSP6 runs its firmware (qdsp6=lle) */
+    char *q6_link_id;           /* chardev to the qemu-system-hexagon one */
+    DeviceState *q6_link;
     CPUClusterState apps_cluster;
     DeviceState *lle;
     gchar *fw_data;             /* -bios image, copied to RAM on reset */
@@ -548,7 +552,9 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * jumps to AMSS, so both run from here.
          */
         msm_modem_lle_reset(s->lle);
-        msm_modem_qdsp6_boot(MSM_MODEM(s->modem));
+        if (!s->q6_lle) {
+            msm_modem_qdsp6_boot(MSM_MODEM(s->modem));
+        }
     } else {
         /* AMSS has been running since power-on and owns shared memory */
         msm_modem_boot(MSM_MODEM(s->modem));
@@ -731,6 +737,21 @@ static void htcleo_init(MachineState *machine)
     /* Memory: SMI + EBI1 + PMEM pools are one flat 1 GiB space */
     memory_region_add_subregion(sysmem, HTCLEO_RAM_BASE, machine->ram);
 
+    /* qdsp6=lle: the QDSP6 runs in qemu-system-hexagon -M htcleo-q6 */
+    if (s->q6_lle) {
+        Chardev *chr = s->q6_link_id ? qemu_chr_find(s->q6_link_id) : NULL;
+
+        if (!chr) {
+            error_report("qdsp6=lle needs qdsp6-link=<chardev id>");
+            exit(1);
+        }
+        s->q6_link = qdev_new(TYPE_MSM_Q6_LINK);
+        object_property_add_child(OBJECT(machine), "q6-link",
+                                  OBJECT(s->q6_link));
+        qdev_prop_set_chr(s->q6_link, "chardev", chr);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(s->q6_link), &error_fatal);
+    }
+
     /* baseband=lle: the modem core (ARM926, cluster 1) runs the real AMSS */
     if (s->modem_lle) {
         s->lle = qdev_new(TYPE_MSM_MODEM_LLE);
@@ -799,6 +820,10 @@ static void htcleo_init(MachineState *machine)
             if (i < MIRQ_A2M_NUM) {
                 qdev_connect_gpio_out_named(s->csr, "a2m", i,
                         msm_modem_lle_irq(s->lle, MIRQ_A2M_0 + i));
+            } else if (i == 8 && s->q6_link) {
+                /* A2M 8 rings the QDSP6, which runs on its own */
+                qdev_connect_gpio_out_named(s->csr, "a2m", i,
+                        qdev_get_gpio_in_named(s->q6_link, "to-q6", 0));
             } else if (i == 8) {
                 /* A2M 8 rings the QDSP6, still modelled by msm_modem */
                 qdev_connect_gpio_out_named(s->csr, "a2m", i,
@@ -810,11 +835,26 @@ static void htcleo_init(MachineState *machine)
                                     qdev_get_gpio_in_named(s->modem, "a2m", i));
     }
     for (int i = 0; i < 7; i++) {
+        if (s->lle && s->q6_link && i == M2A_LLE_Q6) {
+            continue;
+        }
         qdev_connect_gpio_out_named(s->lle ? s->lle : s->modem, "m2a", i,
                                     vic_in[INT_A9_M2A_0 + i]);
     }
-    qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP,
-                                vic_in[INT_ADSP_A11]);
+    if (s->q6_link) {
+        qdev_connect_gpio_out_named(s->q6_link, "from-q6", 0,
+                                    vic_in[INT_ADSP_A11]);
+        if (s->lle) {
+            /* AMSS rings the QDSP6 ("SPSS2ADSP_INT") with outgoing 3 */
+            qdev_connect_gpio_out_named(s->lle, "m2a", M2A_LLE_Q6,
+                    qdev_get_gpio_in_named(s->q6_link, "to-q6", 1));
+            qdev_connect_gpio_out_named(s->q6_link, "from-q6", 1,
+                    qdev_get_gpio_in_named(s->lle, "sub0", MIRQ_SUB0_Q6));
+        }
+    } else {
+        qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP,
+                                    vic_in[INT_ADSP_A11]);
+    }
 
     /* GPIO */
     dev = qdev_new(TYPE_MSM_GPIO);
@@ -1170,8 +1210,38 @@ static void htcleo_set_modem_trace(Object *obj, bool v, Error **errp)
     HTCLEO_MACHINE(obj)->modem_trace = v;
 }
 
+static char *htcleo_get_q6(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_MACHINE(obj)->q6_lle ? "lle" : "hle");
+}
+
+static void htcleo_set_q6(Object *obj, const char *v, Error **errp)
+{
+    if (!strcmp(v, "lle")) {
+        HTCLEO_MACHINE(obj)->q6_lle = true;
+    } else if (!strcmp(v, "hle")) {
+        HTCLEO_MACHINE(obj)->q6_lle = false;
+    } else {
+        error_setg(errp, "qdsp6 must be hle or lle");
+    }
+}
+
+static char *htcleo_get_q6_link(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_MACHINE(obj)->q6_link_id);
+}
+
+static void htcleo_set_q6_link(Object *obj, const char *v, Error **errp)
+{
+    HtcleoMachineState *s = HTCLEO_MACHINE(obj);
+
+    g_free(s->q6_link_id);
+    s->q6_link_id = g_strdup(v);
+}
+
 static void htcleo_instance_init(Object *obj)
 {
+
     HTCLEO_MACHINE(obj)->panel_type = 10;
     HTCLEO_MACHINE(obj)->cable = CABLE_USB;     /* the adb cable */
 }
@@ -1195,6 +1265,12 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "baseband",
         "baseband: hle (modelled AMSS services) or lle (real AMSS firmware "
         "on an ARM926 modem core, see baseband-firmware)");
+    object_class_property_add_str(oc, "qdsp6", htcleo_get_q6, htcleo_set_q6);
+    object_class_property_set_description(oc, "qdsp6",
+        "hle: the multimedia DSP's DAL services modelled (default); lle: its "
+        "firmware runs in qemu-system-hexagon -M htcleo-q6 (see qdsp6-link)");
+    object_class_property_add_str(oc, "qdsp6-link", htcleo_get_q6_link,
+                                  htcleo_set_q6_link);
     object_class_property_add_str(oc, "baseband-firmware", htcleo_get_modem_fw,
                                   htcleo_set_modem_fw);
     object_class_property_set_description(oc, "baseband-firmware",

@@ -468,6 +468,7 @@ static void lle_realize(DeviceState *dev, Error **errp)
 
     s->vic = qdev_new(TYPE_MSM_VIC);
     qdev_prop_set_bit(s->vic, "l4", true);
+    qdev_prop_set_bit(s->vic, "trace", s->trace);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->vic), &error_fatal);
     memory_region_add_subregion(&s->mem, MODEM_VIC_PHYS,
                     sysbus_mmio_get_region(SYS_BUS_DEVICE(s->vic), 0));
@@ -484,10 +485,19 @@ static void lle_realize(DeviceState *dev, Error **errp)
 
     /* the modem's interrupts to the other processors: "m2a" 0-7 */
     qdev_pass_gpios(s->tmr, DEVICE(s), "m2a");
-    /* second-level interrupt controller 7 (UIM ...) on VIC line 37 */
-    qdev_connect_gpio_out_named(s->tmr, "sub7-irq", 0,
-                                qdev_get_gpio_in(s->vic, MIRQ_SUB7));
-    qdev_pass_gpios(s->tmr, DEVICE(s), "sub7");
+    /* second-level interrupt controllers, each on one VIC line */
+    static const struct { int k, line; } subs[] = {
+        { 0, 41 }, { 1, 54 }, { 2, 47 }, { 3, 40 },
+        { 6, 51 }, { 7, MIRQ_SUB7 }, { 8, 39 }, { 9, 42 },
+    };
+    for (int i = 0; i < ARRAY_SIZE(subs); i++) {
+        g_autofree char *in = g_strdup_printf("sub%d", subs[i].k);
+        g_autofree char *out = g_strdup_printf("sub%d-irq", subs[i].k);
+
+        qdev_connect_gpio_out_named(s->tmr, out, 0,
+                                    qdev_get_gpio_in(s->vic, subs[i].line));
+        qdev_pass_gpios(s->tmr, DEVICE(s), in);
+    }
 
     /*
      * SSBI controllers (msm_ssbi.c): two sit inside the timer block, so

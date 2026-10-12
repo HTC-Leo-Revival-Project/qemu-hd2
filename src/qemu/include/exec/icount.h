@@ -24,6 +24,13 @@ typedef enum {
 
 #ifdef CONFIG_TCG
 extern ICountMode use_icount;
+/*
+ * With icount and several vCPUs on one thread: the most instructions a
+ * vCPU runs before the next one gets its turn (0: no limit).  Boards
+ * whose CPUs are hardware threads of one core set this small so that
+ * they interleave the way the hardware does.
+ */
+extern int64_t icount_rr_slice;
 #define icount_enabled() (use_icount)
 #else
 #define icount_enabled() ICOUNT_DISABLED

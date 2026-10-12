@@ -12,12 +12,20 @@
  *   0x100..0x10c      watchdog; 0x108 is the free-running 32.768 kHz
  *                     slow-clock count (timetick), 0x10c is the kick
  *   0x594 + 4n        writing 1 interrupts another processor ("m2a" out
- *                     n): n = 0..6 the apps core's INT_A9_M2A_n, 7 the
- *                     QDSP6 (AMSS's HAL out ids 72-79)
- *   0x510..0x520      second-level interrupt controller 7 ("sub7" inputs
- *                     0-14, output "sub7-irq" to modem VIC line 37):
- *                     0x510 clear (write 1), 0x514 enable, 0x518 status
- *                     (input level or latched edge); bit 3 is the UIM
+ *                     n, AMSS's HAL out ids 72-79): the apps core's
+ *                     INT_A9_M2A_n, except n = 3 which is the QDSP6's
+ *                     ("SPSS2ADSP_INT")
+ *   0x510..0x598      second-level interrupt controllers: +0 clear (write
+ *                     1), +4 enable, +8 status (input level or latched
+ *                     edge), each cascading into one modem VIC line.  AMSS
+ *                     numbers them by its HAL descriptor table:
+ *                       0 0x544 -> line 41    1 0x574 -> line 54
+ *                       2 0x554 -> line 47    3 0x534 -> line 40
+ *                       6 0x564 -> line 51    7 0x510 -> line 37
+ *                       8 0x524 -> line 39    9 0x584 -> line 42
+ *                     (4 and 5 share 0x500, not modelled).  Inputs "subN",
+ *                     output "subN-irq".  Known inputs: sub7 bit 3 the UIM,
+ *                     sub0 bit 0 the QDSP6's SMD/SMSM interrupt.
  * Everything else is kept as plain registers and logged as unimplemented.
  *
  * This code is licensed under the GNU GPL v2 or later.
@@ -44,10 +52,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMtmrState, MSM_MTMR)
 #define R_DOG_KICK      0x10c
 #define R_IRQ_OUT       0x594
 #define IRQ_OUT_NUM     8
-#define R_SUB7_CLEAR    0x510
-#define R_SUB7_ENABLE   0x514
-#define R_SUB7_STATUS   0x518
-#define SUB7_INPUTS     15
+#define SUB_NUM         10
+#define SUB_INPUTS      16
+
+/* clear register of each second-level controller, 0 = not modelled */
+static const hwaddr sub_base[SUB_NUM] = {
+    0x544, 0x574, 0x554, 0x534, 0, 0, 0x564, 0x510, 0x524, 0x584,
+};
 
 struct MsmMtmrState {
     SysBusDevice parent_obj;
@@ -55,8 +66,8 @@ struct MsmMtmrState {
     qemu_irq tick_irq;
     qemu_irq sleep_irq;
     qemu_irq irq_out[IRQ_OUT_NUM];
-    qemu_irq sub7_irq;
-    uint32_t sub7_level, sub7_latch;
+    qemu_irq sub_irq[SUB_NUM];
+    uint32_t sub_level[SUB_NUM], sub_latch[SUB_NUM];
     QEMUTimer *tick_timer;
     QEMUTimer *sleep_timer;
 
@@ -114,38 +125,62 @@ static void mtmr_sleep(void *opaque)
     qemu_irq_pulse(s->sleep_irq);
 }
 
-static uint32_t sub7_status(MsmMtmrState *s)
+static uint32_t sub_status(MsmMtmrState *s, int k)
 {
-    return s->sub7_level | s->sub7_latch;
+    return s->sub_level[k] | s->sub_latch[k];
 }
 
-static void sub7_update(MsmMtmrState *s)
+static void sub_update(MsmMtmrState *s, int k)
 {
-    qemu_set_irq(s->sub7_irq,
-                 !!(sub7_status(s) & s->regs[R_SUB7_ENABLE / 4]));
+    qemu_set_irq(s->sub_irq[k], !!(sub_status(s, k) &
+                                   s->regs[(sub_base[k] + 4) / 4]));
 }
 
-static void sub7_set(void *opaque, int n, int level)
+static void sub_set(MsmMtmrState *s, int k, int n, int level)
 {
-    MsmMtmrState *s = opaque;
     uint32_t bit = 1u << n;
 
-    if (level && !(s->sub7_level & bit)) {
-        s->sub7_latch |= bit;
+    if (level && !(s->sub_level[k] & bit)) {
+        s->sub_latch[k] |= bit;
     }
-    s->sub7_level = level ? s->sub7_level | bit : s->sub7_level & ~bit;
-    sub7_update(s);
+    s->sub_level[k] = level ? s->sub_level[k] | bit : s->sub_level[k] & ~bit;
+    sub_update(s, k);
+}
+
+#define SUB_SET_FN(k) \
+    static void sub##k##_set(void *opaque, int n, int level) \
+    { \
+        sub_set(opaque, k, n, level); \
+    }
+SUB_SET_FN(0) SUB_SET_FN(1) SUB_SET_FN(2) SUB_SET_FN(3)
+SUB_SET_FN(6) SUB_SET_FN(7) SUB_SET_FN(8) SUB_SET_FN(9)
+
+static const qemu_irq_handler sub_set_fn[SUB_NUM] = {
+    sub0_set, sub1_set, sub2_set, sub3_set, NULL, NULL,
+    sub6_set, sub7_set, sub8_set, sub9_set,
+};
+
+/* the controller whose registers are at off, its register in *reg */
+static int sub_find(hwaddr off, int *reg)
+{
+    for (int k = 0; k < SUB_NUM; k++) {
+        if (sub_base[k] && off >= sub_base[k] && off < sub_base[k] + 12) {
+            *reg = (off - sub_base[k]) / 4;
+            return k;
+        }
+    }
+    return -1;
 }
 
 static uint64_t mtmr_read(void *opaque, hwaddr off, unsigned size)
 {
     MsmMtmrState *s = opaque;
+    int reg, k = sub_find(off, &reg);
 
+    if (k >= 0) {
+        return reg == 2 ? sub_status(s, k) : s->regs[off / 4];
+    }
     switch (off) {
-    case R_SUB7_STATUS:
-        return sub7_status(s);
-    case R_SUB7_ENABLE:
-        return s->regs[off / 4];
     case R_TICK_COUNT:
         if (!(s->regs[R_TICK_EN / 4] & 1)) {
             return 0;
@@ -172,8 +207,16 @@ static void mtmr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     MsmMtmrState *s = opaque;
     uint32_t old = s->regs[off / 4];
+    int reg, k = sub_find(off, &reg);
 
     s->regs[off / 4] = val;
+    if (k >= 0) {
+        if (reg == 0) {
+            s->sub_latch[k] &= ~val;
+        }
+        sub_update(s, k);
+        return;
+    }
     switch (off) {
     case R_TICK_EN:
         if ((val & 1) && !(old & 1)) {
@@ -188,13 +231,6 @@ static void mtmr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         mtmr_sleep_arm(s);
         return;
     case R_DOG_BASE ... R_DOG_KICK:
-        return;
-    case R_SUB7_CLEAR:
-        s->sub7_latch &= ~val;
-        sub7_update(s);
-        return;
-    case R_SUB7_ENABLE:
-        sub7_update(s);
         return;
     case R_IRQ_OUT ... R_IRQ_OUT + 4 * (IRQ_OUT_NUM - 1):
         if (val & 1) {
@@ -218,8 +254,12 @@ static void mtmr_reset(DeviceState *dev)
     MsmMtmrState *s = MSM_MTMR(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
-    s->sub7_latch = 0;
-    sub7_update(s);
+    for (int k = 0; k < SUB_NUM; k++) {
+        s->sub_latch[k] = 0;
+        if (sub_base[k]) {
+            sub_update(s, k);
+        }
+    }
     timer_del(s->tick_timer);
     timer_del(s->sleep_timer);
 }
@@ -234,8 +274,16 @@ static void mtmr_init(Object *obj)
     sysbus_init_irq(sbd, &s->tick_irq);
     sysbus_init_irq(sbd, &s->sleep_irq);
     qdev_init_gpio_out_named(DEVICE(obj), s->irq_out, "m2a", IRQ_OUT_NUM);
-    qdev_init_gpio_out_named(DEVICE(obj), &s->sub7_irq, "sub7-irq", 1);
-    qdev_init_gpio_in_named(DEVICE(obj), sub7_set, "sub7", SUB7_INPUTS);
+    for (int k = 0; k < SUB_NUM; k++) {
+        g_autofree char *in = g_strdup_printf("sub%d", k);
+        g_autofree char *out = g_strdup_printf("sub%d-irq", k);
+
+        if (!sub_base[k]) {
+            continue;
+        }
+        qdev_init_gpio_out_named(DEVICE(obj), &s->sub_irq[k], out, 1);
+        qdev_init_gpio_in_named(DEVICE(obj), sub_set_fn[k], in, SUB_INPUTS);
+    }
     s->tick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtmr_tick, s);
     s->sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mtmr_sleep, s);
 }

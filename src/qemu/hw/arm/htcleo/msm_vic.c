@@ -45,7 +45,8 @@ struct MsmVicState {
     uint32_t vecaddr[VIC_NUM_IRQS];
     uint32_t security[2];
     int32_t last_irq;
-    bool l4;                /* VEC_RD returns NO_PEND_VAL when idle */
+    bool l4;
+    bool trace;             /* log the lines software enables */                /* VEC_RD returns NO_PEND_VAL when idle */
 };
 
 static void vic_pending(MsmVicState *s, uint32_t pend[2])
@@ -169,9 +170,23 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 
     switch (off) {
     case 0x00: case 0x04: s->select[b] = val; break;
-    case 0x10: case 0x14: s->enable[b] = val; break;
+    case 0x10: case 0x14: case 0x30: case 0x34:
+        if (s->trace && (val & ~s->enable[b])) {
+            uint32_t on = val & ~s->enable[b];
+
+            for (int i = 0; i < 32; i++) {
+                if (on & (1u << i)) {
+                    qemu_log("msm-vic: line %d enabled\n", b * 32 + i);
+                }
+            }
+        }
+        if (off & 0x20) {
+            s->enable[b] |= val;
+        } else {
+            s->enable[b] = val;
+        }
+        break;
     case 0x20: case 0x24: s->enable[b] &= ~val; break;
-    case 0x30: case 0x34: s->enable[b] |= val; break;
     case 0x40: case 0x44: s->type[b] = val; break;
     case 0x50: case 0x54: s->polarity[b] = val; break;
     case 0x60: s->no_pend_val = val; break;
@@ -237,6 +252,7 @@ static void vic_init(Object *obj)
 
 static const Property vic_props[] = {
     DEFINE_PROP_BOOL("l4", MsmVicState, l4, false),
+    DEFINE_PROP_BOOL("trace", MsmVicState, trace, false),
 };
 
 static void vic_class_init(ObjectClass *oc, const void *data)

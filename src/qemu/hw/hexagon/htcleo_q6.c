@@ -19,10 +19,26 @@
  *   0xAB000000  timer, the MSM GPT block: +0 match, +4 count, +8 enable
  *               (bit 0 enable, bit 1 clear on match), +C clear.  It
  *               interrupts on line 3 ("Qube Timer INT Number: 3").
+ *   0xAB005000  outgoing interrupts, write 1: +0 to the modem, +4 to the
+ *               apps processor (the SMSM interrupt table's second byte
+ *               picks the register)
  *   0xABF00000  "TCM IO": interrupt routing the kernel sets up at boot
  *
- *   qemu-system-hexagon -M htcleo-q6 -kernel dsp1.elf \
+ * The six hardware threads share one pipeline and take turns every cycle,
+ * so a thread another one wakes runs at once.  Run with -icount: each
+ * vCPU then gets smt-slice packets (default 64) per turn instead of a
+ * whole host timeslice.
+ *
+ * The interrupt lines between the two processes go over a chardev
+ * (link=<chardev id>), one byte per edge carrying the line number, the
+ * other end being msm-q6-link in the htcleo machine:
+ *   in  0  apps -> DSP, raises interrupt apps-irq
+ *   in  1  modem -> DSP, raises interrupt modem-irq
+ *   out 0  DSP -> apps, out 1 DSP -> modem
+ *
+ *   qemu-system-hexagon -M htcleo-q6,link=q6 -kernel dsp1.elf \
  *     -object memory-backend-file,id=htcleo.ram,size=1G,mem-path=...,share=on
+ *     -chardev socket,id=q6,path=...
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -35,9 +51,12 @@
 #include "hw/core/irq.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
+#include "chardev/char.h"
+#include "chardev/char-fe.h"
 #include "hw/core/sysbus.h"
 #include "hw/hexagon/hexagon.h"
 #include "hw/hexagon/hexagon_globalreg.h"
@@ -45,6 +64,7 @@
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
+#include "exec/icount.h"
 #include "elf.h"
 #include "cpu.h"
 
@@ -55,6 +75,7 @@
 #define Q6_TIMER_BASE           0xAB000000
 #define Q6_TIMER_IRQ            3
 #define Q6_TIMER_HZ             32768       /* sleep clock */
+#define Q6_IPC_BASE             0xAB005000
 
 #define TAP_BASE                0x40000000ULL
 #define TAP_SIZE                0xC0000000ULL
@@ -77,6 +98,13 @@ struct HtcleoQ6MachineState {
     QEMUTimer *timer;
     uint32_t tmr_match, tmr_enable;
     int64_t tmr_base;           /* virtual time of count 0 */
+
+    /* interrupt lines to and from the htcleo machine */
+    char *link_id;
+    CharFrontend link;
+    int32_t apps_irq, modem_irq;
+    uint32_t smt_slice;
+    MemoryRegion ipc_io;
 };
 
 /* ---------------------------------------------------------------- */
@@ -230,6 +258,72 @@ static const MemoryRegionOps q6_timer_ops = {
 };
 
 /* ---------------------------------------------------------------- */
+/* Interrupt link                                                    */
+/* ---------------------------------------------------------------- */
+
+static void q6_link_send(HtcleoQ6MachineState *s, int line)
+{
+    uint8_t b = line;
+
+    if (s->trace) {
+        qemu_log("q6-link: -> line %d pc %08x\n", line, q6_pc());
+    }
+    qemu_chr_fe_write_all(&s->link, &b, 1);
+}
+
+static int q6_link_can_receive(void *opaque)
+{
+    return 64;
+}
+
+static void q6_link_receive(void *opaque, const uint8_t *buf, int size)
+{
+    HtcleoQ6MachineState *s = opaque;
+
+    for (int i = 0; i < size; i++) {
+        int line = buf[i] & 0x7F;
+        int irq = line == 0 ? s->apps_irq : line == 1 ? s->modem_irq : -1;
+
+        if (s->trace) {
+            qemu_log("q6-link: <- line %d, interrupt %d\n", line, irq);
+        }
+        if (irq >= 0 && irq < 32) {
+            qemu_irq_pulse(qdev_get_gpio_in(DEVICE(s->cpu[0]), irq));
+        }
+    }
+}
+
+static uint64_t q6_ipc_read(void *opaque, hwaddr off, unsigned size)
+{
+    return 0;
+}
+
+static void q6_ipc_write(void *opaque, hwaddr off, uint64_t val,
+                         unsigned size)
+{
+    HtcleoQ6MachineState *s = opaque;
+
+    if (!(val & 1)) {
+        return;
+    }
+    switch (off) {
+    case 0x0:
+        q6_link_send(s, 1);     /* modem */
+        break;
+    case 0x4:
+        q6_link_send(s, 0);     /* apps */
+        break;
+    }
+}
+
+static const MemoryRegionOps q6_ipc_ops = {
+    .read = q6_ipc_read,
+    .write = q6_ipc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ---------------------------------------------------------------- */
 /* Machine                                                           */
 /* ---------------------------------------------------------------- */
 
@@ -256,6 +350,12 @@ static void htcleo_q6_init(MachineState *machine)
         exit(1);
     }
     memory_region_add_subregion(sysmem, 0, machine->ram);
+    if (icount_enabled()) {
+        icount_rr_slice = s->smt_slice;
+    } else {
+        warn_report("htcleo-q6: without -icount the hardware threads run "
+                    "in long timeslices, not interleaved");
+    }
 
     s->regs = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->seen = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -266,6 +366,9 @@ static void htcleo_q6_init(MachineState *machine)
                           "q6-timer", 0x10);
     memory_region_add_subregion(sysmem, Q6_TIMER_BASE, &s->timer_io);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, q6_timer_fire, s);
+    memory_region_init_io(&s->ipc_io, OBJECT(machine), &q6_ipc_ops, s,
+                          "q6-ipc", 0x8);
+    memory_region_add_subregion(sysmem, Q6_IPC_BASE, &s->ipc_io);
 
     glob = qdev_new(TYPE_HEXAGON_GLOBALREG);
     object_property_add_child(OBJECT(machine), "global-regs", OBJECT(glob));
@@ -301,6 +404,43 @@ static void htcleo_q6_init(MachineState *machine)
                                  &error_fatal);
         qdev_realize_and_unref(DEVICE(cpu), NULL, &error_fatal);
     }
+
+    if (s->link_id) {
+        Chardev *chr = qemu_chr_find(s->link_id);
+
+        if (!chr) {
+            error_report("htcleo-q6: no chardev %s for link", s->link_id);
+            exit(1);
+        }
+        qemu_chr_fe_init(&s->link, chr, &error_fatal);
+        qemu_chr_fe_set_handlers(&s->link, q6_link_can_receive,
+                                 q6_link_receive, NULL, NULL, s, NULL, true);
+    }
+}
+
+static char *htcleo_q6_get_link(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_Q6_MACHINE(obj)->link_id);
+}
+
+static void htcleo_q6_set_link(Object *obj, const char *v, Error **errp)
+{
+    HtcleoQ6MachineState *s = HTCLEO_Q6_MACHINE(obj);
+
+    g_free(s->link_id);
+    s->link_id = g_strdup(v);
+}
+
+static void htcleo_q6_get_irq(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    visit_type_int32(v, name, (int32_t *)opaque, errp);
+}
+
+static void htcleo_q6_set_irq(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    visit_type_int32(v, name, (int32_t *)opaque, errp);
 }
 
 static bool htcleo_q6_get_trace(Object *obj, Error **errp)
@@ -315,7 +455,18 @@ static void htcleo_q6_set_trace(Object *obj, bool value, Error **errp)
 
 static void htcleo_q6_instance_init(Object *obj)
 {
-    HTCLEO_Q6_MACHINE(obj)->trace = true;
+    HtcleoQ6MachineState *s = HTCLEO_Q6_MACHINE(obj);
+
+    s->trace = true;
+    s->smt_slice = 64;
+    object_property_add_uint32_ptr(obj, "smt-slice", &s->smt_slice,
+                                   OBJ_PROP_FLAG_READWRITE);
+    s->apps_irq = -1;
+    s->modem_irq = -1;
+    object_property_add(obj, "apps-irq", "int32", htcleo_q6_get_irq,
+                        htcleo_q6_set_irq, NULL, &s->apps_irq);
+    object_property_add(obj, "modem-irq", "int32", htcleo_q6_get_irq,
+                        htcleo_q6_set_irq, NULL, &s->modem_irq);
 }
 
 static void htcleo_q6_class_init(ObjectClass *oc, const void *data)
@@ -335,6 +486,8 @@ static void htcleo_q6_class_init(ObjectClass *oc, const void *data)
     mc->no_serial = 1;
     object_class_property_add_bool(oc, "trace", htcleo_q6_get_trace,
                                    htcleo_q6_set_trace);
+    object_class_property_add_str(oc, "link", htcleo_q6_get_link,
+                                  htcleo_q6_set_link);
 }
 
 static const TypeInfo htcleo_q6_info = {

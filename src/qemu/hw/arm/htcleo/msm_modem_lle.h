@@ -28,6 +28,16 @@
 #define MIRQ_GPIO_GROUP2    45  /* tramp 61 */
 #define MIRQ_SUB7           37  /* second-level controller 7 */
 #define MIRQ_SUB7_UIM       3   /* its input for the UIM (UART2) */
+/*
+ * AMSS's outgoing interrupt to the QDSP6: smd_target.c's "SPSS2ADSP_INT"
+ * is tramp 83 -> HAL 75, the fourth write-1 register (0xB80005A0)
+ */
+#define M2A_LLE_Q6          3
+#define MIRQ_SUB0_Q6        0   /* controller 0 (line 41): the QDSP6's
+                                   SMD/SMSM interrupt, tramp 89 / HAL 94.
+                                   Second-level HAL records, 16 B from
+                                   [[0x9d1c4c]+68] + 24*222 + 8: HAL id,
+                                   type, controller, mask */
 #define MIRQ_A2M_0          56
 #define MIRQ_A2M_NUM        7
 
