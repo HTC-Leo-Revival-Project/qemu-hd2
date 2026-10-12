@@ -151,7 +151,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | NAND | Controller (16-bit ECC layout) + ADM data mover; yaffs2 read/write |
 | microSD | SDCC (SDC2) on QEMU's SD card model; mounted by vold |
 | WiFi | BCM4329 on SDC1: SDIO card, backplane, firmware download. The firmware is emulated at protocol level (SDPCM/CDC/BDC, scan, join, events) and bridged to a QEMU NIC. |
-| Modem | SMEM, proc_comm, DEX, SMSM, SMD, RPC router (RTC, PMIC, battery…); or the real AMSS on an ARM926 core (`baseband=lle`, in progress) |
+| Modem | SMEM, proc_comm, DEX, SMSM, SMD, RPC router (RTC, PMIC, battery…); or the real AMSS on an ARM926 core (`baseband=lle`, boots Android; no SIM or radio) |
 | Cellular | AT modem on SMD with a T-Mobile US (310/260) SIM, UMTS registration, PPP data call to QEMU user networking |
 | GPS | gpsOne PDAPI over ONC RPC: position callbacks to the HAL's client endpoint, 1 Hz fixes, runtime `gps-fix` |
 | Bluetooth | UART1DM (msm_serial_hs) with paced ADM DMA, host-wake LPM; BCM4329 HCI controller (patchram, BT 2.1 + EDR) |

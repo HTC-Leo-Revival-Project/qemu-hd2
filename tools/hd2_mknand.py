@@ -414,19 +414,21 @@ def parse_edify_calls(script, names):
         pos = i
 
 
-def install_rom(z, system, data, softkeys=True):
+def install_rom(z, system, data, softkeys=True, gpu=False):
     script = z.read('META-INF/com/google/android/updater-script').decode()
     # NAND install branch (installtype 1), cLK bootloader:
     zip_tree(z, 'system/', system)
     zip_tree(z, 'data/', data)
     # cLK cannot use RMNET: the installer applies the PPP patch to /system
     zip_tree(z, 'mods/clk-ppp-patch/', system)
-    # No Adreno in the emulator.  libhwui treats any ro.kernel.qemu as "an
-    # emulator, GPU only if ro.kernel.qemu.gles=1", so hwui stays off;
-    # debug.egl.hw=0 keeps libEGL on the PixelFlinger renderer.  The value is
-    # 0, not 1: SystemServer skips the Bluetooth service when it is "1".
-    props = (b'\n# emulator\nro.kernel.qemu=0\nro.kernel.qemu.gles=0\n'
-             b'debug.egl.hw=0\n')
+    # Without --gpu: libhwui treats any ro.kernel.qemu as "an emulator, GPU
+    # only if ro.kernel.qemu.gles=1", so hwui stays off; debug.egl.hw=0 keeps
+    # libEGL on the PixelFlinger renderer.  The value is 0, not 1:
+    # SystemServer skips the Bluetooth service when it is "1".  With --gpu
+    # the ROM uses the Adreno 200 libraries as on the phone.
+    props = b'\n# emulator\n'
+    if not gpu:
+        props += b'ro.kernel.qemu=0\nro.kernel.qemu.gles=0\ndebug.egl.hw=0\n'
     if softkeys:
         props += b'qemu.hw.mainkeys=0\n'
     bp = system.lookup('build.prop')
@@ -469,6 +471,8 @@ def main():
     ap.add_argument('--system-mb', type=int, default=220)
     ap.add_argument('--cache-mb', type=int, default=30)
     ap.add_argument('--no-softkeys', action='store_true')
+    ap.add_argument('--gpu', action='store_true',
+                    help='render with the emulated Adreno 200 (no emulator props)')
     ap.add_argument('--wifi-mac', default='00:23:76:48:44:32')
     ap.add_argument('--bt-mac', default='00:23:76:48:44:33')
     ap.add_argument('-o', '--output', required=True)
@@ -557,7 +561,7 @@ def main():
     # 4. yaffs2 system and userdata
     system, data = Tree(), Tree()
     system.root.mode, system.root.uid, system.root.gid = 0o755, 0, 0
-    install_rom(z, system, data, softkeys=not a.no_softkeys)
+    install_rom(z, system, data, softkeys=not a.no_softkeys, gpu=a.gpu)
     for name, tree in (('system', system), ('userdata', data)):
         first, size = layout[name]
         used = Yaffs2Writer(nand, first, size).write_tree(tree)
