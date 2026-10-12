@@ -66,6 +66,15 @@ Headless helpers:
 - `tools/touch.py SOCK x,y | swipe:x0,y0,x1,y1` sends taps and swipes in screen pixels.
 - `tools/logcat.sh` dumps logcat from guest RAM, for use when adb isn't up yet.
 
+### Battery and USB cable
+
+The DS2746 gauge models a 1230 mAh battery. It charges while a cable is plugged in and Linux enables the charger (GPIO 22, fast rate on GPIO 16), and it drains otherwise. The machine starts with the adb cable plugged in. To unplug it, plug in a wall charger or set the charge level, like the AOSP emulator's `power` commands:
+```bash
+python3 tools/qmon.py images/qmp.sock "qom-set /machine cable none"   # usb | ac | none
+python3 tools/qmon.py images/qmp.sock "qom-set /machine battery-capacity 15"
+```
+With `baseband=lle` the cable state goes to the PM7540, and the real AMSS updates HTC's VBUS word and notifies Linux. With the modelled baseband, the modem model does the same.
+
 ### GPS
 
 Location requests get a 1 Hz fix with eight satellites in view. The default position is 37.4220 N, 122.0841 W at 10 m; `-global msm-modem.gps-latitude=…` (and `gps-longitude`, `gps-altitude`) set a different one at startup. To move the phone while it runs (like the AOSP emulator's `geo fix`):
@@ -108,11 +117,16 @@ cd .. && tools/start-lle.sh          # start.sh with BASEBAND=lle and nand-lle.i
 | 0xB8000000 | timers, watchdog; writing 1 to 0x594 + 4n interrupts the apps core (INT_A9_M2A_n) |
 | 0xB8001000 | modem VIC: the L4 tick on line 32, the ADM on 52, the watchdog bark (FIQ) on 55, apps doorbells A2M 0-6 on 56-62 |
 | 0xB8000300, 0xB8000400, 0xA8100000, 0xB0007580 | SSBI controllers; the PM7540 PMIC behind the first (`msm_ssbi.c`) |
+| 0xA8E00000, 0xA8F00400 | the modem's own shadow of the GPIO registers; its group interrupts are lines 44 and 45 |
 | 0xB1000000 | modem DSP (QDSP4) memories and control, high level: image download and the boot handshake (`msm_mdsp.c`) |
 | 0xA9400000 | ADM security domain 0, shared with the apps data mover |
 | 0xFFFC0000, 0x9C000000 | internal SRAM, modem RAM |
 
-- Not modelled yet: the SIM (UIM), the radio front end (no network), PMIC functions beyond detection (the RTC, so the clock starts in 1980; charging).
+- The PM7540 PMIC is modelled with:
+  - its RTC (the clock comes from QEMU's);
+  - its interrupt controller, wired to MSM GPIO 24 and the modem's GPIO interrupt shadow;
+  - the power key, USB power and charger sources.
+- Not modelled yet: the SIM (UIM) and the radio front end, so there is no network.
 - AMSS prints fatal errors on UART1 (`images/uart1.log`).
 
 Debugging:
@@ -159,7 +173,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | Audio | QDSP6 DAL playback → QEMU audio backend (verified bit-exact) |
 | Display | MDP 3.1 DMA_P scanout + PPP blitter; backlight via microP |
 | GPU | ICS software fallback (PixelFlinger); Adreno is not emulated |
-| I2C | Touchscreen, microP (backlight, G-sensor, light sensor), battery gauge, PMIC, compass |
+| I2C | Touchscreen, microP (backlight, G-sensor, light sensor), battery gauge (charging and draining), PMIC, compass |
 | Buttons | GPIO key matrix + power key |
 | USB | HSUSB (ChipIdea) device controller with a built-in host. It enumerates the gadget and bridges adb to TCP. |
 
