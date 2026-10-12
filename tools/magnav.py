@@ -40,7 +40,9 @@ def cursor(sock):
     run, edges = [], None
     for y in range(80, h + 1):
         span = row_span(px, w, y) if y < h else None
-        if span and span[1] - span[0] >= 12 and span[:2] == edges:
+        # same right edge; the left edge moves where a black glyph touches it
+        if (span and span[1] - span[0] >= 12 and edges and
+                span[1] == edges[1] and abs(span[0] - edges[0]) <= 8):
             run.append(span)
             continue
         if len(run) >= 10 and sum(1 for r in run if r[2]) >= 2:
