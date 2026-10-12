@@ -93,6 +93,9 @@ struct HtcleoTs {
     I2CSlave parent_obj;
     qemu_irq irq;           /* GPIO 92, active low */
     bool powered;
+    bool enabled;           /* got the D0 00 01 enable command */
+    uint8_t cmd[4];
+    int cmd_len;
     bool data_pending;
     bool down;
     bool was_down;
@@ -124,13 +127,24 @@ static int ts_event(I2CSlave *i2c, enum i2c_event ev)
 {
     HtcleoTs *s = HTCLEO_TS(i2c);
 
+    if (ev == I2C_START_SEND) {
+        s->cmd_len = 0;
+        s->pos = 0;
+    } else if (ev == I2C_FINISH && s->cmd_len) {
+        if (s->cmd_len == 3 && s->cmd[0] == 0xD0 && s->cmd[1] == 0x00 &&
+            s->cmd[2] == 0x01) {
+            s->enabled = true;          /* start reporting */
+        }
+        s->cmd_len = 0;
+    }
     if (ev == I2C_START_RECV) {
         s->pos = 0;
-        if (!s->data_pending && s->powered) {
-            /* identification read after power-up */
+        if (!s->enabled) {
+            /* until it is enabled the controller answers with its ID */
             memset(s->buf, 0, sizeof(s->buf));
             s->buf[0] = 0x55;
         } else {
+            /* the current contact state; no contact is a valid report */
             ts_build_report(s);
         }
     } else if (ev == I2C_FINISH && s->pos > 0) {
@@ -148,7 +162,12 @@ static int ts_event(I2CSlave *i2c, enum i2c_event ev)
 
 static int ts_send(I2CSlave *i2c, uint8_t data)
 {
-    return 0;                           /* init command D0 00 01 */
+    HtcleoTs *s = HTCLEO_TS(i2c);
+
+    if (s->cmd_len < (int)sizeof(s->cmd)) {
+        s->cmd[s->cmd_len++] = data;    /* the enable command is D0 00 01 */
+    }
+    return 0;
 }
 
 static uint8_t ts_recv(I2CSlave *i2c)
@@ -184,6 +203,7 @@ void htcleo_ts_set_power(I2CSlave *d, bool on)
     s->powered = on;
     if (!on) {
         s->data_pending = false;
+        s->enabled = false;
     }
     ts_update_irq(s);
 }
