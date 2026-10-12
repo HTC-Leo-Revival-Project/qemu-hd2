@@ -108,7 +108,7 @@ static void tap_log(MsmModemLleState *s, hwaddr a, bool wr, uint64_t v,
         return;
     }
     n = GPOINTER_TO_UINT(g_hash_table_lookup(s->seen, key));
-    if (n >= TRACE_REPEATS && r == MEMTX_OK) {
+    if (n >= TRACE_REPEATS) {
         return;
     }
     g_hash_table_insert(s->seen, key, GUINT_TO_POINTER(n + 1));
@@ -509,7 +509,11 @@ static void lle_realize(DeviceState *dev, Error **errp)
         }
     }
 
-    s->mdsp = lle_private_device(s, TYPE_MSM_MDSP, MODEM_MDSP_PHYS);
+    s->mdsp = qdev_new(TYPE_MSM_MDSP);
+    object_property_add_child(OBJECT(dev), "mdsp", OBJECT(s->mdsp));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mdsp), &error_fatal);
+    memory_region_add_subregion(&s->mem, MODEM_MDSP_PHYS,
+                    sysbus_mmio_get_region(SYS_BUS_DEVICE(s->mdsp), 0));
     sysbus_connect_irq(SYS_BUS_DEVICE(s->mdsp), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_MDSP));
 
@@ -524,9 +528,23 @@ static void lle_realize(DeviceState *dev, Error **errp)
     }
 }
 
+static bool lle_get_trace_now(Object *obj, Error **errp)
+{
+    return MSM_MODEM_LLE(obj)->trace;
+}
+
+/* trace-now: switch the bus trace on and off while running (qom-set) */
+static void lle_set_trace_now(Object *obj, bool value, Error **errp)
+{
+    MSM_MODEM_LLE(obj)->trace = value;
+}
+
 static void lle_init(Object *obj)
 {
     MsmModemLleState *s = MSM_MODEM_LLE(obj);
+
+    object_property_add_bool(obj, "trace-now", lle_get_trace_now,
+                             lle_set_trace_now);
 
     object_initialize_child(obj, "cluster", &s->cluster, TYPE_CPU_CLUSTER);
     s->seen = g_hash_table_new(g_direct_hash, g_direct_equal);

@@ -59,6 +59,8 @@
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
 #include "htcleo.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
@@ -101,6 +103,8 @@ struct MsmMdspState {
     uint8_t *mem;
     uint32_t ctl;
     uint32_t ctl_regs[0x400];
+    bool trace;                 /* log doorbells and first writes (+PC) */
+    GHashTable *seen;
 };
 
 static void mdsp_boot(MsmMdspState *s)
@@ -124,6 +128,24 @@ static void mdsp_search_done(void *opaque)
     qemu_irq_pulse(s->irq);
 }
 
+static void mdsp_trace(MsmMdspState *s, const char *what, hwaddr off,
+                       uint64_t val, unsigned size)
+{
+    uint32_t pc = current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0;
+    gpointer key = (gpointer)(uintptr_t)(off | (uint64_t)(*what == 'R') << 40);
+    uintptr_t n = GPOINTER_TO_UINT(g_hash_table_lookup(s->seen, key));
+
+    if (n >= 2) {
+        return;
+    }
+    g_hash_table_insert(s->seen, key, GUINT_TO_POINTER(n + 1));
+    qemu_log("msm-mdsp: %s %c+%06x = %0*x pc %08x\n", what,
+             off >= MEM_P ? 'P' : off >= MEM_C ? 'C' : off >= MEM_B ? 'B' : 'A',
+             (unsigned)(off >= MEM_P ? off - MEM_P : off >= MEM_C ? off - MEM_C :
+                        off >= MEM_B ? off - MEM_B : off),
+             size * 2, (unsigned)val, pc);
+}
+
 static uint64_t mdsp_read(void *opaque, hwaddr off, unsigned size)
 {
     MsmMdspState *s = opaque;
@@ -134,6 +156,9 @@ static uint64_t mdsp_read(void *opaque, hwaddr off, unsigned size)
     if (off > MDSP_CTL) {
         return s->ctl_regs[((off - MDSP_CTL) >> 2) & 0x3FF];
     }
+    if (s->trace) {
+        mdsp_trace(s, "R", off, ldn_le_p(s->mem + off, size), size);
+    }
     return ldn_le_p(s->mem + off, size);
 }
 
@@ -143,6 +168,10 @@ static void mdsp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 
     if (off == MDSP_CTL + CTL_DOORBELL) {
         s->ctl_regs[CTL_DOORBELL >> 2] = val;
+        if (s->trace) {
+            qemu_log("msm-mdsp: doorbell %08x pc %08x\n", (unsigned)val,
+                     current_cpu ? ARM_CPU(current_cpu)->env.regs[15] : 0);
+        }
         if (s->ctl != CTL_RUN || lduw_le_p(s->mem + MEM_A) != IMG_1406) {
             qemu_irq_pulse(s->irq);
             return;
@@ -186,6 +215,9 @@ static void mdsp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         }
         return;
     }
+    if (s->trace) {
+        mdsp_trace(s, "W", off, val, size);
+    }
     stn_le_p(s->mem + off, size, val);
 }
 
@@ -207,6 +239,16 @@ static void mdsp_reset(DeviceState *dev)
     timer_del(s->search);
 }
 
+static bool mdsp_get_trace(Object *obj, Error **errp)
+{
+    return MSM_MDSP(obj)->trace;
+}
+
+static void mdsp_set_trace(Object *obj, bool value, Error **errp)
+{
+    MSM_MDSP(obj)->trace = value;
+}
+
 static void mdsp_init(Object *obj)
 {
     MsmMdspState *s = MSM_MDSP(obj);
@@ -217,6 +259,8 @@ static void mdsp_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
     s->search = timer_new_ns(QEMU_CLOCK_VIRTUAL, mdsp_search_done, s);
+    s->seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    object_property_add_bool(obj, "trace", mdsp_get_trace, mdsp_set_trace);
 }
 
 static void mdsp_class_init(ObjectClass *oc, const void *data)

@@ -13,6 +13,9 @@
  *     vcpu=N    the vCPU index to watch (default 1: the -M htcleo modem)
  *     msg=VA    a msg_send entry point (any number of them)
  *     hook=VA   print r0-r3 and lr whenever VA runs
+ *     mem=LO-HI log the device (non-DRAM) accesses of the code between
+ *               LO and HI: pc, virtual and physical address, value (the
+ *               first 4 per pc and address)
  * Output goes to the QEMU log (-D file).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -35,6 +38,9 @@ typedef struct {
 } Watch;
 
 static GArray *watches;
+static GArray *mem_ranges;      /* pairs of uint64_t lo, hi */
+static GHashTable *mem_seen;
+static GMutex mem_lock;
 static unsigned watch_vcpu = 1;
 /* handles are opaque and may be NULL (r0 is register 0) */
 static struct qemu_plugin_register *reg_r[4], *reg_lr;
@@ -159,6 +165,45 @@ static void on_exec(unsigned int vcpu, void *udata)
     qemu_plugin_outs(o->str);
 }
 
+static void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
+                   uint64_t vaddr, void *udata)
+{
+    struct qemu_plugin_hwaddr *hw = qemu_plugin_get_hwaddr(info, vaddr);
+    uint64_t pa = hw ? qemu_plugin_hwaddr_phys_addr(hw) : 0;
+    uint64_t pc = (uintptr_t)udata;
+    qemu_plugin_mem_value v;
+    gpointer key;
+    uintptr_t n;
+    uint64_t val = 0;
+
+    if (vcpu != watch_vcpu || (pa < 0x40000000 && !(hw && qemu_plugin_hwaddr_is_io(hw)))) {
+        return;
+    }
+    key = (gpointer)(uintptr_t)(pa * 0x9E3779B97F4A7C15ULL ^ pc);
+    g_mutex_lock(&mem_lock);
+    n = GPOINTER_TO_UINT(g_hash_table_lookup(mem_seen, key));
+    if (n < 4) {
+        g_hash_table_insert(mem_seen, key, GUINT_TO_POINTER(n + 1));
+    }
+    g_mutex_unlock(&mem_lock);
+    if (n >= 4) {
+        return;
+    }
+    v = qemu_plugin_mem_get_value(info);
+    switch (v.type) {
+    case QEMU_PLUGIN_MEM_VALUE_U8: val = v.data.u8; break;
+    case QEMU_PLUGIN_MEM_VALUE_U16: val = v.data.u16; break;
+    case QEMU_PLUGIN_MEM_VALUE_U32: val = v.data.u32; break;
+    case QEMU_PLUGIN_MEM_VALUE_U64: val = v.data.u64; break;
+    default: break;
+    }
+    g_autofree char *o = g_strdup_printf(
+        "amss: %6.3f mem %c pc %08" PRIx64 " va %08" PRIx64 " pa %08" PRIx64
+        " = %08" PRIx64 "\n", now(), qemu_plugin_mem_is_store(info) ? 'W' : 'R',
+        pc, vaddr, pa, val);
+    qemu_plugin_outs(o);
+}
+
 static void on_tb(struct qemu_plugin_tb *tb, void *userdata)
 {
     size_t n = qemu_plugin_tb_n_insns(tb);
@@ -167,6 +212,15 @@ static void on_tb(struct qemu_plugin_tb *tb, void *userdata)
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t va = qemu_plugin_insn_vaddr(insn);
 
+        for (guint k = 0; k + 1 < mem_ranges->len; k += 2) {
+            if (va >= g_array_index(mem_ranges, uint64_t, k) &&
+                va < g_array_index(mem_ranges, uint64_t, k + 1)) {
+                qemu_plugin_register_vcpu_mem_cb(insn, on_mem,
+                                                 QEMU_PLUGIN_CB_NO_REGS,
+                                                 QEMU_PLUGIN_MEM_RW,
+                                                 (void *)(uintptr_t)va);
+            }
+        }
         for (guint k = 0; k < watches->len; k++) {
             if (g_array_index(watches, Watch, k).va == (va & ~1ULL)) {
                 qemu_plugin_register_vcpu_insn_exec_cb(
@@ -208,6 +262,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 {
     t0 = g_get_monotonic_time();
     watches = g_array_new(false, true, sizeof(Watch));
+    mem_ranges = g_array_new(false, true, sizeof(uint64_t));
+    mem_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     for (int i = 0; i < argc; i++) {
         g_auto(GStrv) kv = g_strsplit(argv[i], "=", 2);
         Watch w = { 0 };
@@ -218,6 +274,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         }
         if (!strcmp(kv[0], "vcpu")) {
             watch_vcpu = strtoul(kv[1], NULL, 0);
+            continue;
+        }
+        if (!strcmp(kv[0], "mem")) {
+            char *end;
+            uint64_t lo = strtoull(kv[1], &end, 0), hi;
+
+            hi = *end == '-' ? strtoull(end + 1, NULL, 0) : lo + 4;
+            g_array_append_val(mem_ranges, lo);
+            g_array_append_val(mem_ranges, hi);
             continue;
         }
         if (!strcmp(kv[0], "msg")) {
