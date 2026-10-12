@@ -174,6 +174,7 @@
 #define TYPE_MSM_MTMR       "msm-mtmr"
 #define TYPE_MSM_MDSP       "msm-mdsp"
 #define TYPE_MSM_GSTMR      "msm-gstmr"
+#define TYPE_MSM_WSTMR      "msm-wstmr"
 #define TYPE_MSM_SSBI       "msm-ssbi"
 #define TYPE_MSM_UIM        "msm-uim"
 #define MSM_SSBI_NUM        6   /* SSBI controllers, see msm_ssbi.c */

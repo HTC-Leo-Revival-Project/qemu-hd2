@@ -38,6 +38,10 @@
  *           overwrites the code with a status, 0 = done, and sets B+0x4E5E
  *           (event 0, "synchronous command done") which WL1's ISR clears
  *           before it runs the command's callback
+ *           Command 0x13 starts the receive AGC: with no RF signal the AGC
+ *           sits at its floor, -512 (dBm = (AGC + 512) / 12 - 106, so the
+ *           -106 dBm noise floor), in A+0x1F3C (chain 0) and B+0x4E96/98
+ *           (the filtered values), and WL1's frequency scan finds no carrier
  *   bit 26  GSM L1 frame commands (not modelled)
  *
  * This code is licensed under the GNU GPL v2 or later.
@@ -71,6 +75,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define A_WCDMA_READY   (MEM_A + 0x2148)
 #define B_SYNC_CMD      (MEM_B + 0x4958)
 #define B_SYNC_DONE     (MEM_B + 0x4E5E)
+#define A_RXAGC0        (MEM_A + 0x1F3C)
+#define B_RXAGC_FILT    (MEM_B + 0x4E96)
+#define SYNC_START_AGC  0x13
+#define RXAGC_FLOOR     (-512)
 #define DB_MC           (1u << 19)
 #define DB_SYNC         (1u << 15)
 #define CTL_DOORBELL    0x08
@@ -124,8 +132,15 @@ static void mdsp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             stw_le_p(s->mem + A_WCDMA_READY, 1);
         }
         if (val & DB_SYNC) {
+            uint16_t cmd = lduw_le_p(s->mem + B_SYNC_CMD);
+
             qemu_log_mask(LOG_UNIMP, "msm-mdsp: WCDMA sync command %04x\n",
-                          lduw_le_p(s->mem + B_SYNC_CMD));
+                          cmd);
+            if (cmd == SYNC_START_AGC) {
+                stw_le_p(s->mem + A_RXAGC0, RXAGC_FLOOR);
+                stw_le_p(s->mem + B_RXAGC_FILT, RXAGC_FLOOR);
+                stw_le_p(s->mem + B_RXAGC_FILT + 2, RXAGC_FLOOR);
+            }
             stw_le_p(s->mem + B_SYNC_CMD, 0);
             stw_le_p(s->mem + B_SYNC_DONE, 1);
         }

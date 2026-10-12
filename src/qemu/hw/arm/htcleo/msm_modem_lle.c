@@ -29,6 +29,7 @@
  *               0xB8000400, 0xA8100000 and 0xB0007580-0xB00075DF (msm_ssbi.c)
  *   0xB1000000  the modem DSP's memories and control (msm_mdsp.c)
  *   0xB0007B00  the GSM frame timer, frame tick on VIC line 18 (msm_gstmr.c)
+ *   0xB0005D00  the WCDMA system timer, VIC lines 12-14 (msm_wstmr.c)
  *   0xFFFC0000  internal SRAM; AMSS puts its TLB-locked sleep code at
  *               0xFFFEF800 (L4 maps 0xFFF00000 at 0xF9600000)
  *
@@ -63,6 +64,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmModemLleState, MSM_MODEM_LLE)
 #define MIRQ_MDSP       27
 #define MODEM_GSTMR_PHYS 0xB0007B00
 #define MIRQ_GSTMR      18      /* GSM frame tick */
+#define MODEM_WSTMR_PHYS 0xB0005D00
+#define MIRQ_WSTMR      12      /* WCDMA STMR interrupts 0-2: lines 12-14 */
 
 #define TAP_BASE        0x40000000ULL
 #define TAP_SIZE        0xC0000000ULL
@@ -77,7 +80,7 @@ struct MsmModemLleState {
     MemoryRegion ram_alias;
     MemoryRegion tap;
     MemoryRegion ram9c, imem;
-    DeviceState *vic, *tmr, *mdsp, *ssbi, *gstmr;
+    DeviceState *vic, *tmr, *mdsp, *ssbi, *gstmr, *wstmr;
 
     MemoryRegion *ram;
     char *firmware;
@@ -513,6 +516,12 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->gstmr = lle_private_device(s, TYPE_MSM_GSTMR, MODEM_GSTMR_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->gstmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_GSTMR));
+
+    s->wstmr = lle_private_device(s, TYPE_MSM_WSTMR, MODEM_WSTMR_PHYS);
+    for (int i = 0; i < 3; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->wstmr), i,
+                           qdev_get_gpio_in(s->vic, MIRQ_WSTMR + i));
+    }
 }
 
 static void lle_init(Object *obj)
