@@ -42,6 +42,7 @@ struct MsmModemState {
     bool trace;
     qemu_irq m2a[M2A_NUM];
     QEMUTimer *wake_timer;
+    QEMUTimer *park_timer;      /* watches MAGLDR's modem mailbox */
     uint32_t last_apps;
     GByteArray *pkt_acc[SMD_NUM_CH];
 

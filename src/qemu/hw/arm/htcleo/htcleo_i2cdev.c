@@ -281,6 +281,9 @@ static int microp_event(I2CSlave *i2c, enum i2c_event ev)
     case I2C_FINISH:
         if (s->have_cmd && s->wlen) {
             memcpy(s->reg[s->cmd], s->wbuf, MIN(s->wlen, 8));
+            qemu_log_mask(LOG_TRACE, "htcleo-microp: cmd 0x%02x len %d "
+                          "data %02x %02x\n", s->cmd, s->wlen, s->wbuf[0],
+                          s->wlen > 1 ? s->wbuf[1] : 0);
             if (s->cmd == MICROP_WCMD_BL_EN) {
                 s->bl_en = s->wbuf[0] & 1;
                 microp_update_backlight(s);

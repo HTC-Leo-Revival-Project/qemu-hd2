@@ -353,6 +353,35 @@ static bool amss_hook_patched(uint32_t *target)
     return true;
 }
 
+/*
+ * The parked core waits in MAGLDR's RAM until the mailbox reads 0x300d300d,
+ * stores the entry point MAGLDR left next to it to 0x1E0000 and jumps
+ * there: into the AMSS MAGLDR has just loaded from NAND.  The HLE modem
+ * plays that cold start by bringing its state back to "AMSS booted".
+ */
+#define MAGLDR_MAILBOX_PA   0x280b7a70
+#define MAGLDR_MAILBOX_GO   0x300d300d
+
+static void modem_park_poll(void *opaque)
+{
+    MsmModemState *s = opaque;
+    uint32_t mb[2];
+
+    if (!s->taken_over) {
+        return;
+    }
+    physical_memory_read(MAGLDR_MAILBOX_PA, mb, sizeof(mb));
+    if (le32_to_cpu(mb[0]) != MAGLDR_MAILBOX_GO) {
+        timer_mod(s->park_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  SCALE_MS);
+        return;
+    }
+    physical_memory_write(AMSS_HOOK_STATUS_PA, &mb[1], sizeof(mb[1]));
+    qemu_log_mask(LOG_UNIMP, "msm-modem: modem core released to 0x%x: "
+                  "AMSS restarts\n", le32_to_cpu(mb[1]));
+    msm_modem_boot(s);
+}
+
 static void modem_take_over(MsmModemState *s, uint32_t target)
 {
     uint32_t done = cpu_to_le32(0x50000);
@@ -361,6 +390,8 @@ static void modem_take_over(MsmModemState *s, uint32_t target)
                   "the modem core is parked\n", target);
     s->taken_over = true;
     physical_memory_write(AMSS_HOOK_STATUS_PA, &done, sizeof(done));
+    timer_mod(s->park_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              SCALE_MS);
 }
 
 static void proc_comm_handle(MsmModemState *s)
@@ -914,6 +945,7 @@ static void modem_reset(DeviceState *dev)
 {
     MsmModemState *s = MSM_MODEM(dev);
     timer_del(s->wake_timer);
+    timer_del(s->park_timer);
 }
 
 static void modem_realize(DeviceState *dev, Error **errp)
@@ -925,6 +957,7 @@ static void modem_realize(DeviceState *dev, Error **errp)
         s->tx_backlog[i] = g_byte_array_new();
     }
     s->wake_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, modem_wake_apps, s);
+    s->park_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, modem_park_poll, s);
     msm_modem_rpc_init(s);
     msm_atmodem_init(s);
     msm_gps_init(s);
