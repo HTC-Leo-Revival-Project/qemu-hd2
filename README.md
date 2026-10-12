@@ -144,6 +144,42 @@ The connection comes from the default `-nic`. To pick your own backend:
 tools/start.sh -nic user,model=bcm4329
 ```
 
+### GPU (Adreno 200)
+
+The Adreno 200 is emulated (QEMU branch `adreno`, `src/qemu-gpu`), so Android can render with the ROM's own Qualcomm libraries instead of the PixelFlinger software renderer. Build a NAND image without the emulator's GPU properties:
+```bash
+python3 ../tools/hd2_mknand.py --lk ../firmware/lk-user.bin --rom ../firmware/dl/NexusHD2-ICS-CM9-HWA_V2.8.zip --gpu -o nand-gpu.img
+```
+Then SurfaceFlinger, the boot animation and apps (hwui) all render on the emulated GPU. For an image built without `--gpu`, the GPU is idle and nothing changes.
+
+What is modelled:
+- the KGSL-facing hardware: interrupts, the GPU MMU, and the command processor running the ring buffer and indirect buffers (PM4 packets);
+- the a2xx shader core: an interpreter for the driver's compiled shader microcode, run on 16 lanes (batches of vertices, or 4x4 pixel blocks);
+- the 3D pipe: vertex fetch, triangles, strips, fans, rectangles, points and lines, clipping, scissors, perspective-correct interpolation, depth/stencil, alpha test and blending, rendered in bins into GMEM and resolved to memory;
+- textures: 8/16/32-bit and float formats, ETC1, ATC, DXT and 3DC, mipmaps with the Xenos layout (packed mip tails), bilinear/trilinear filtering, and tiled surfaces.
+
+It runs on the host CPU, with 6 rasterizer threads by default (`-global msm-adreno.threads=N`). Measured with the test programs below:
+
+| Workload | Time per frame |
+|---|---|
+| Full-screen clear + one triangle | ~15 ms |
+| Spinning depth-tested cube | ~16 ms |
+| 8 full-screen blended, trilinear-textured layers | ~150 ms |
+
+Not modelled:
+- hardware video decode/encode (the QDSP6 video DAL), so video uses Android's software codecs;
+- occlusion queries and the Z180 2D core.
+
+Test programs (NDK r23, non-PIE; see the headers for build lines):
+- `tools/gltri.c` draws an RGB triangle with EGL/GLES2 on the framebuffer, reads pixels back and times the frames;
+- `tools/gltest.c` checks mipmaps, compressed textures, points and lines, depth, and a fill-rate scene.
+
+Run them with SurfaceFlinger stopped (`adb shell stop`).
+
+Debugging:
+- `qom-set /machine/gpu trace FILE` logs every packet and draw, with screen-space vertices (`""` stops it);
+- `qom-set /machine/gpu dump GPUADDR,SIZE,FILE` saves GPU memory (`0xffffffff` saves GMEM).
+
 ## Processors
 
 The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulated:
@@ -172,7 +208,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | FM radio | BCM4329 FM core via HCI `0xFC15` (tune, seek, RSSI, flags/interrupts, volume); audio through the codec aux loopback (DEX `0x51`) |
 | Audio | QDSP6 DAL playback → QEMU audio backend (verified bit-exact) |
 | Display | MDP 3.1 DMA_P scanout + PPP blitter; backlight via microP |
-| GPU | ICS software fallback (PixelFlinger); Adreno is not emulated |
+| GPU | Adreno 200: command processor, MMU, a2xx shader interpreter, threaded rasterizer, GMEM bins and resolves, textures incl. ETC1/ATC (branch `adreno`; images built with `--gpu`). Otherwise the ICS software fallback (PixelFlinger). |
 | I2C | Touchscreen, microP (backlight, G-sensor, light sensor), battery gauge (charging and draining), PMIC, compass |
 | Buttons | GPIO key matrix + power key |
 | USB | HSUSB (ChipIdea) device controller with a built-in host. It enumerates the gadget and bridges adb to TCP. |
@@ -199,3 +235,12 @@ Not emulated:
 | `hd2_radio.py` | Radio NBH unpacker: partition table and AMSS ELF |
 | `start-lle.sh` | Launch with the real baseband firmware |
 | `amss_dis.py` / `amss_xref.py` / `amss_fatal.py` | AMSS reverse-engineering helpers |
+| `gltri.c` / `gltest.c` | GLES2 test programs for the emulated GPU |
+
+## Credits
+
+The Adreno 200 model is written from scratch for QEMU, but it stands on the work of these projects:
+- **[freedreno](https://docs.mesa3d.org/drivers/freedreno.html)** (Mesa; Rob Clark and contributors): the a2xx register and PM4 packet definitions (`registers/adreno/a2xx.xml`, `adreno_pm4.xml`), the a2xx shader instruction formats and disassembler (`ir2/instr-a2xx.h`, `disasm-a2xx.c`), and the a2xx driver (`gallium/drivers/freedreno/a2xx`). The driver shows how binning, resolves, fast clears and surface layouts work.
+- **[Xenia](https://xenia.jp)** (the Xbox 360 emulator, whose Xenos GPU shares the Adreno 200's design): the shader microcode definitions and interpreter semantics (`src/xenia/gpu/ucode.h`, `shader_interpreter.cc`), the command processor's packet handling, the tiled texture addressing (`texture_address.h`) and the packed mip tail layout (`texture_util.cc`).
+- **[texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder)**: the reference for decoding ATC (Adreno texture compression) blocks.
+- The kernel's KGSL driver (`drivers/gpu/msm` in the htcleo kernel) defines the register interface the model answers.
