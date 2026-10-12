@@ -7,6 +7,13 @@
  * an enabled pending interrupt raise INT_GPIO_GROUP1 (GPIO1) or
  * INT_GPIO_GROUP2 (GPIO2), both routed through the SIRC.
  *
+ * The modem core has its own shadow of the same registers: GPIO1's banks
+ * at 0xA8E00000 + 0x000 and bank 1 at 0xA8F00000 + 0x400 (MMIO regions 2
+ * and 3 here, seen through AMSS's GPIO interrupt table).  Both shadows
+ * drive the same pins (out/oe/in are shared); interrupt enable, trigger
+ * and pending state are per processor, and the modem's group interrupts
+ * are outputs 2 and 3.
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
@@ -35,16 +42,23 @@ static const GpioBank banks[NUM_BANKS] = {
     { 153, 164, 0, 0x18, 0x38, 0x68, 0x88, 0xA8, 0xC8, 0xE8, 0x108 },
 };
 
-struct MsmGpioState {
-    SysBusDevice parent_obj;
-    MemoryRegion iomem[2];
-    qemu_irq irq[2];        /* group1, group2 */
+#define PROC_APPS   0
+#define PROC_MODEM  1
 
-    uint32_t out[NUM_BANKS], oe[NUM_BANKS];
+typedef struct GpioIrqState {
     uint32_t edge[NUM_BANKS], pos[NUM_BANKS], en[NUM_BANKS];
     uint32_t latch[NUM_BANKS];
-    uint32_t ext[NUM_BANKS];        /* externally driven input levels */
     uint32_t last_in[NUM_BANKS];
+} GpioIrqState;
+
+struct MsmGpioState {
+    SysBusDevice parent_obj;
+    MemoryRegion iomem[4];  /* apps GPIO1, GPIO2, modem GPIO1, GPIO2 */
+    qemu_irq irq[4];        /* apps group1, group2, modem group1, group2 */
+
+    uint32_t out[NUM_BANKS], oe[NUM_BANKS];
+    uint32_t ext[NUM_BANKS];        /* externally driven input levels */
+    GpioIrqState pi[2];             /* per processor */
     uint32_t other[2][0x400];       /* TLMM/config words: readback only */
 
     MsmGpioOutputNotify notify;
@@ -56,30 +70,34 @@ static uint32_t bank_in(MsmGpioState *s, int b)
     return (s->out[b] & s->oe[b]) | (s->ext[b] & ~s->oe[b]);
 }
 
-static uint32_t bank_status(MsmGpioState *s, int b)
+static uint32_t bank_status(MsmGpioState *s, GpioIrqState *p, int b)
 {
     uint32_t in = bank_in(s, b);
-    uint32_t lvl = ~(in ^ s->pos[b]) & ~s->edge[b];   /* level active */
-    return (s->latch[b] & s->edge[b]) | lvl;
+    uint32_t lvl = ~(in ^ p->pos[b]) & ~p->edge[b];   /* level active */
+    return (p->latch[b] & p->edge[b]) | lvl;
 }
 
 static void gpio_update(MsmGpioState *s)
 {
-    bool grp[2] = { false, false };
+    for (int proc = 0; proc < 2; proc++) {
+        GpioIrqState *p = &s->pi[proc];
+        bool grp[2] = { false, false };
 
-    for (int b = 0; b < NUM_BANKS; b++) {
-        uint32_t in = bank_in(s, b);
-        uint32_t chg = in ^ s->last_in[b];
-        uint32_t rise = chg & in, fall = chg & ~in;
-        /* edge interrupts: pos=1 rising, pos=0 falling */
-        s->latch[b] |= ((rise & s->pos[b]) | (fall & ~s->pos[b])) & s->edge[b];
-        s->last_in[b] = in;
-        if (bank_status(s, b) & s->en[b]) {
-            grp[banks[b].block] = true;
+        for (int b = 0; b < NUM_BANKS; b++) {
+            uint32_t in = bank_in(s, b);
+            uint32_t chg = in ^ p->last_in[b];
+            uint32_t rise = chg & in, fall = chg & ~in;
+            /* edge interrupts: pos=1 rising, pos=0 falling */
+            p->latch[b] |= ((rise & p->pos[b]) | (fall & ~p->pos[b])) &
+                           p->edge[b];
+            p->last_in[b] = in;
+            if (bank_status(s, p, b) & p->en[b]) {
+                grp[banks[b].block] = true;
+            }
         }
+        qemu_set_irq(s->irq[2 * proc], grp[0]);
+        qemu_set_irq(s->irq[2 * proc + 1], grp[1]);
     }
-    qemu_set_irq(s->irq[0], grp[0]);
-    qemu_set_irq(s->irq[1], grp[1]);
 }
 
 static int pin_bank(int pin, int *bit)
@@ -154,9 +172,16 @@ static void notify_changes(MsmGpioState *s, int b, uint32_t before)
     s->notify(s->notify_opaque, -1, 0);
 }
 
-static uint64_t gpio_read(MsmGpioState *s, int block, hwaddr off)
+/* bank registers of `proc` start at this offset in their MMIO window */
+static hwaddr bank_base(int proc, int block)
 {
-    hwaddr base = block ? 0xC00 : 0x800;
+    return proc == PROC_APPS ? (block ? 0xC00 : 0x800) : 0;
+}
+
+static uint64_t gpio_read(MsmGpioState *s, int proc, int block, hwaddr off)
+{
+    GpioIrqState *p = &s->pi[proc];
+    hwaddr base = bank_base(proc, block);
 
     if (off >= base && off < base + 0x110) {
         hwaddr r = off - base;
@@ -171,24 +196,26 @@ static uint64_t gpio_read(MsmGpioState *s, int block, hwaddr off)
             } else if (r == banks[b].in) {
                 return bank_in(s, b);
             } else if (r == banks[b].edge) {
-                return s->edge[b];
+                return p->edge[b];
             } else if (r == banks[b].pos) {
-                return s->pos[b];
+                return p->pos[b];
             } else if (r == banks[b].en) {
-                return s->en[b];
+                return p->en[b];
             } else if (r == banks[b].status) {
-                return bank_status(s, b);
+                return bank_status(s, p, b);
             } else if (r == banks[b].clr) {
                 return 0;
             }
         }
     }
-    return s->other[block][(off >> 2) & 0x3ff];
+    return proc == PROC_APPS ? s->other[block][(off >> 2) & 0x3ff] : 0;
 }
 
-static void gpio_write(MsmGpioState *s, int block, hwaddr off, uint32_t val)
+static void gpio_write(MsmGpioState *s, int proc, int block, hwaddr off,
+                       uint32_t val)
 {
-    hwaddr base = block ? 0xC00 : 0x800;
+    GpioIrqState *p = &s->pi[proc];
+    hwaddr base = bank_base(proc, block);
 
     if (off >= base && off < base + 0x110) {
         hwaddr r = off - base;
@@ -205,13 +232,13 @@ static void gpio_write(MsmGpioState *s, int block, hwaddr off, uint32_t val)
                 s->oe[b] = val;
                 notify_changes(s, b, before);
             } else if (r == banks[b].edge) {
-                s->edge[b] = val;
+                p->edge[b] = val;
             } else if (r == banks[b].pos) {
-                s->pos[b] = val;
+                p->pos[b] = val;
             } else if (r == banks[b].en) {
-                s->en[b] = val;
+                p->en[b] = val;
             } else if (r == banks[b].clr) {
-                s->latch[b] &= ~val;
+                p->latch[b] &= ~val;
             } else {
                 continue;
             }
@@ -219,51 +246,45 @@ static void gpio_write(MsmGpioState *s, int block, hwaddr off, uint32_t val)
             return;
         }
     }
-    s->other[block][(off >> 2) & 0x3ff] = val;
+    if (proc == PROC_APPS) {
+        s->other[block][(off >> 2) & 0x3ff] = val;
+    }
 }
 
-static uint64_t gpio1_read(void *opaque, hwaddr off, unsigned size)
-{
-    return gpio_read(opaque, 0, off);
-}
-
-static void gpio1_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
-{
-    gpio_write(opaque, 0, off, val);
-}
-
-static uint64_t gpio2_read(void *opaque, hwaddr off, unsigned size)
-{
-    return gpio_read(opaque, 1, off);
-}
-
-static void gpio2_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
-{
-    gpio_write(opaque, 1, off, val);
-}
-
-static const MemoryRegionOps gpio1_ops = {
-    .read = gpio1_read,
-    .write = gpio1_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+#define GPIO_OPS(name, proc, block)                                     \
+static uint64_t name##_read(void *opaque, hwaddr off, unsigned size)      \
+{                                                                         \
+    return gpio_read(opaque, proc, block, off);                           \
+}                                                                         \
+static void name##_write(void *opaque, hwaddr off, uint64_t val,          \
+                         unsigned size)                                   \
+{                                                                         \
+    gpio_write(opaque, proc, block, off, val);                            \
+}                                                                         \
+static const MemoryRegionOps name##_ops = {                               \
+    .read = name##_read,                                                  \
+    .write = name##_write,                                                \
+    .endianness = DEVICE_LITTLE_ENDIAN,                                   \
+    .valid = { .min_access_size = 4, .max_access_size = 4 },              \
 };
 
-static const MemoryRegionOps gpio2_ops = {
-    .read = gpio2_read,
-    .write = gpio2_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
-};
+GPIO_OPS(gpio1, PROC_APPS, 0)
+GPIO_OPS(gpio2, PROC_APPS, 1)
+GPIO_OPS(mgpio1, PROC_MODEM, 0)
+GPIO_OPS(mgpio2, PROC_MODEM, 1)
 
 static void gpio_reset(DeviceState *dev)
 {
     MsmGpioState *s = MSM_GPIO(dev);
 
     for (int b = 0; b < NUM_BANKS; b++) {
-        s->out[b] = s->oe[b] = s->edge[b] = s->pos[b] = s->en[b] = 0;
-        s->latch[b] = 0;
-        s->last_in[b] = bank_in(s, b);
+        s->out[b] = s->oe[b] = 0;
+    }
+    memset(s->pi, 0, sizeof(s->pi));
+    for (int proc = 0; proc < 2; proc++) {
+        for (int b = 0; b < NUM_BANKS; b++) {
+            s->pi[proc].last_in[b] = bank_in(s, b);
+        }
     }
     gpio_update(s);
 }
@@ -277,10 +298,14 @@ static void gpio_init(Object *obj)
                           0x1000);
     memory_region_init_io(&s->iomem[1], obj, &gpio2_ops, s, "msm-gpio2",
                           0x1000);
-    sysbus_init_mmio(sbd, &s->iomem[0]);
-    sysbus_init_mmio(sbd, &s->iomem[1]);
-    sysbus_init_irq(sbd, &s->irq[0]);
-    sysbus_init_irq(sbd, &s->irq[1]);
+    memory_region_init_io(&s->iomem[2], obj, &mgpio1_ops, s, "msm-gpio1-modem",
+                          0x110);
+    memory_region_init_io(&s->iomem[3], obj, &mgpio2_ops, s, "msm-gpio2-modem",
+                          0x80);
+    for (int i = 0; i < 4; i++) {
+        sysbus_init_mmio(sbd, &s->iomem[i]);
+        sysbus_init_irq(sbd, &s->irq[i]);
+    }
     /* undriven inputs float high (pull-ups on the board) */
     for (int b = 0; b < NUM_BANKS; b++) {
         s->ext[b] = 0xFFFFFFFF;

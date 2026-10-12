@@ -95,6 +95,8 @@ struct HtcleoMachineState {
     DeviceState *nand;
     DeviceState *wifi;
     DeviceState *adm, *bt;
+    I2CSlave *gauge;
+    int cable;                  /* CABLE_NONE / CABLE_USB / CABLE_AC */
     bool keys[HD2_NKEYS];
     QemuInputHandlerState *kbd;
     QemuInputHandlerState *touch;
@@ -185,6 +187,11 @@ static void htcleo_update_keys(HtcleoMachineState *s)
         msm_gpio_set_input(s->gpio, kp_rows[r], level);
     }
     msm_gpio_set_input(s->gpio, HTCLEO_GPIO_POWER_KEY, !s->keys[HD2_KEY_POWER]);
+    /* the button also drives the PMIC's KPD_PWR input (baseband=lle) */
+    if (s->lle) {
+        msm_ssbi_pmic_set_power_key(msm_modem_lle_pmic(s->lle),
+                                    s->keys[HD2_KEY_POWER]);
+    }
 }
 
 static void htcleo_wifi_irq(void *opaque, int n, int level)
@@ -215,6 +222,42 @@ static void htcleo_backlight(void *opaque, int n, int level)
     msm_mdp_set_backlight(s->mdp, level);
 }
 
+/*
+ * Charging: the external charger runs while a cable is in and the apps
+ * core drives MCHG_EN_N (GPIO 22) low; ISET (GPIO 16) high asks for the
+ * fast rate, which a USB port caps at 500 mA.
+ */
+enum { CABLE_NONE, CABLE_USB, CABLE_AC };
+static const char *const cable_names[] = { "none", "usb", "ac" };
+
+static void htcleo_update_charger(HtcleoMachineState *s)
+{
+    int mA = 0;
+
+    if (!s->gauge) {
+        return;
+    }
+    if (s->cable != CABLE_NONE &&
+        msm_gpio_get_output(s->gpio, HTCLEO_GPIO_BATTERY_CHARGER_ENABLE) == 0) {
+        bool fast = msm_gpio_get_output(s->gpio,
+                                        HTCLEO_GPIO_BATTERY_CHARGER_CURRENT) == 1;
+        mA = !fast ? 450 : s->cable == CABLE_AC ? 800 : 500;
+    }
+    htcleo_battery_set_charge(s->gauge, mA);
+}
+
+static void htcleo_set_vbus(HtcleoMachineState *s, bool notify)
+{
+    bool vbus = s->cable != CABLE_NONE;
+
+    if (s->lle) {
+        msm_ssbi_pmic_set_vbus(msm_modem_lle_pmic(s->lle), vbus);
+    } else if (notify) {
+        msm_modem_set_vbus(MSM_MODEM(s->modem), vbus);
+    }
+    htcleo_update_charger(s);
+}
+
 static void htcleo_gpio_out(void *opaque, int pin, int level)
 {
     HtcleoMachineState *s = opaque;
@@ -233,6 +276,10 @@ static void htcleo_gpio_out(void *opaque, int pin, int level)
         bcm4329_bt_set_power(s->bt,
             msm_gpio_get_output_latch(s->gpio, HTCLEO_GPIO_BT_SHUTDOWN_N) == 1 &&
             msm_gpio_get_output_latch(s->gpio, HTCLEO_GPIO_BT_RESET_N) == 1);
+    }
+    if (pin == HTCLEO_GPIO_BATTERY_CHARGER_ENABLE ||
+        pin == HTCLEO_GPIO_BATTERY_CHARGER_CURRENT || pin == -1) {
+        htcleo_update_charger(s);
     }
     if (pin == HTCLEO_GPIO_TS_POWER && s->ts) {
         htcleo_ts_set_power(s->ts, msm_gpio_get_output(s->gpio, pin) == 1);
@@ -319,6 +366,12 @@ static void htcleo_ts_irq(void *opaque, int n, int level)
 {
     HtcleoMachineState *s = opaque;
     msm_gpio_set_input(s->gpio, HTCLEO_GPIO_TS_IRQ, level);
+}
+
+static void htcleo_pmic_irq(void *opaque, int n, int level)
+{
+    HtcleoMachineState *s = opaque;
+    msm_gpio_set_input(s->gpio, HTCLEO_GPIO_PMIC_INT, level);
 }
 
 static void htcleo_akm_irq(void *opaque, int n, int level)
@@ -500,6 +553,7 @@ static void htcleo_reset(MachineState *machine, ResetType type)
         /* AMSS has been running since power-on and owns shared memory */
         msm_modem_boot(MSM_MODEM(s->modem));
     }
+    htcleo_set_vbus(s, true);
 
     if (s->fw_data) {
         physical_memory_write(HTCLEO_KERNEL_BASE, s->fw_data, s->fw_len);
@@ -772,6 +826,16 @@ static void htcleo_init(MachineState *machine)
     sysbus_connect_irq(sbd, 1, sirc_in[SIRC_GPIO_GROUP2]);
     s->gpio = (MsmGpioState *)dev;
     msm_gpio_set_output_notify(s->gpio, htcleo_gpio_out, s);
+    if (s->lle) {
+        /* the modem's shadow of the GPIO registers and its group interrupts */
+        sysbus_mmio_map_overlap(sbd, 2, 0xA8E00000, 1);
+        sysbus_mmio_map_overlap(sbd, 3, 0xA8F00400, 1);
+        sysbus_connect_irq(sbd, 2, msm_modem_lle_irq(s->lle, MIRQ_GPIO_GROUP1));
+        sysbus_connect_irq(sbd, 3, msm_modem_lle_irq(s->lle, MIRQ_GPIO_GROUP2));
+        /* the PM7540's interrupt output, active low, on GPIO 24 */
+        qdev_connect_gpio_out_named(msm_modem_lle_pmic(s->lle), "pmic-irq", 0,
+                                    qemu_allocate_irq(htcleo_pmic_irq, s, 0));
+    }
 
     /* UART1 (SPL console, kernel debug) on serial0 */
     dev = qdev_new(TYPE_MSM_UART);
@@ -961,14 +1025,6 @@ static void htcleo_init(MachineState *machine)
     {
         I2CBus *bus;
         I2CSlave *microp;
-        static const uint8_t ds2746_init[] = {
-            0x01, 0x03,             /* status: AIN0/AIN1 ready, no POR */
-            0x08, 0x1E, 0x09, 0x00, /* AUX0: 480 -> 25 C, Samsung 1230 mAh */
-            0x0A, 0x1E, 0x0B, 0x00, /* AUX1 */
-            0x0C, 0x6A, 0x0D, 0x40, /* VOLT: 1700 * 2.44 mV = 4.15 V */
-            0x0E, 0x00, 0x0F, 0x00, /* CURRENT: 0 mA */
-            0x10, 0x11, 0x11, 0x15, /* ACR: ~1230 mAh remaining */
-        };
         static const uint8_t tps65023_init[] = {
             0x00, 0x2B,             /* VERSION */
             0x03, 0x7F,             /* REG_CTRL: all rails on */
@@ -990,7 +1046,9 @@ static void htcleo_init(MachineState *machine)
                                     qemu_allocate_irq(htcleo_backlight, s, 0));
         htcleo_regdev_create(bus, 0x48, tps65023_init,
                              ARRAY_SIZE(tps65023_init));
-        htcleo_regdev_create(bus, 0x26, ds2746_init, ARRAY_SIZE(ds2746_init));
+        s->gauge = i2c_slave_create_simple(bus, TYPE_HTCLEO_GAUGE, 0x26);
+        object_property_add_alias(OBJECT(machine), "battery-capacity",
+                                  OBJECT(s->gauge), "capacity");
         dev = DEVICE(i2c_slave_create_simple(bus, TYPE_HTCLEO_AKM, 0x1C));
         qdev_connect_gpio_out_named(dev, "irq", 0,
                                     qemu_allocate_irq(htcleo_akm_irq, s, 0));
@@ -1037,6 +1095,29 @@ static void htcleo_set_panel(Object *obj, Visitor *v, const char *name,
     g_free(str);
 }
 
+static char *htcleo_get_cable(Object *obj, Error **errp)
+{
+    return g_strdup(cable_names[HTCLEO_MACHINE(obj)->cable]);
+}
+
+static void htcleo_set_cable(Object *obj, const char *v, Error **errp)
+{
+    HtcleoMachineState *s = HTCLEO_MACHINE(obj);
+
+    for (int i = 0; i < ARRAY_SIZE(cable_names); i++) {
+        if (!strcmp(v, cable_names[i])) {
+            bool changed = s->cable != i;
+            s->cable = i;
+            /* at run time: the PMIC / the modem tell the OS */
+            if (changed && s->gpio) {
+                htcleo_set_vbus(s, true);
+            }
+            return;
+        }
+    }
+    error_setg(errp, "cable must be none, usb or ac");
+}
+
 static char *htcleo_get_modem(Object *obj, Error **errp)
 {
     return g_strdup(HTCLEO_MACHINE(obj)->modem_lle ? "lle" : "hle");
@@ -1081,6 +1162,7 @@ static void htcleo_set_modem_trace(Object *obj, bool v, Error **errp)
 static void htcleo_instance_init(Object *obj)
 {
     HTCLEO_MACHINE(obj)->panel_type = 10;
+    HTCLEO_MACHINE(obj)->cable = CABLE_USB;     /* the adb cable */
 }
 
 static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
@@ -1092,6 +1174,11 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
                               htcleo_set_panel, NULL, NULL);
     object_class_property_set_description(oc, "panel",
                                           "LCD panel fitted: sharp or auo");
+    object_class_property_add_str(oc, "cable", htcleo_get_cable,
+                                  htcleo_set_cable);
+    object_class_property_set_description(oc, "cable",
+        "what is plugged into the USB port: none, usb (a PC) or ac (a charger);"
+        " can be changed at run time with qom-set /machine cable ...");
     object_class_property_add_str(oc, "baseband", htcleo_get_modem,
                                   htcleo_set_modem);
     object_class_property_set_description(oc, "baseband",

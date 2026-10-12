@@ -135,6 +135,7 @@
 #define HTCLEO_GPIO_UP_RESET_N          91
 #define HTCLEO_GPIO_TS_IRQ              92
 #define HTCLEO_GPIO_COMPASS_INT         39  /* AKM8973 INT, level high */
+#define HTCLEO_GPIO_PMIC_INT            24  /* PM7540 interrupt to the modem, low */
 #define HTCLEO_GPIO_POWER_KEY           94
 #define HTCLEO_GPIO_POWER_USB           109
 #define HTCLEO_GPIO_SD_STATUS           153
@@ -148,6 +149,8 @@
 #define HTCLEO_GPIO_HDS_DET             145
 #define HTCLEO_GPIO_COMPASS_INT_N       39
 #define HTCLEO_GPIO_BATTERY_OVER_CHG    147
+#define HTCLEO_GPIO_BATTERY_CHARGER_ENABLE  22  /* MCHG_EN_N, low = charge */
+#define HTCLEO_GPIO_BATTERY_CHARGER_CURRENT 16  /* ISET, high = fast */
 
 /* ------------------------------------------------------------------ */
 /* Device type names                                                   */
@@ -172,9 +175,12 @@
 #define TYPE_MSM_MDSP       "msm-mdsp"
 #define TYPE_MSM_SSBI       "msm-ssbi"
 #define MSM_SSBI_NUM        6   /* SSBI controllers, see msm_ssbi.c */
+void msm_ssbi_pmic_set_vbus(DeviceState *dev, bool present);
+void msm_ssbi_pmic_set_power_key(DeviceState *dev, bool pressed);
 #define TYPE_HTCLEO_MICROP  "htcleo-microp"
 #define TYPE_HTCLEO_TS      "htcleo-ts"
 #define TYPE_HTCLEO_AKM     "htcleo-akm8973"
+#define TYPE_HTCLEO_GAUGE   "htcleo-ds2746"
 #define TYPE_TPS65023       "tps65023"
 #define TYPE_AKM8973        "akm8973"
 #define TYPE_HTCLEO_RAMCON  "htcleo-ramconsole"

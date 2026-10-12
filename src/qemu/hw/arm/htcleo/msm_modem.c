@@ -1033,6 +1033,20 @@ static void q6_poll(void *opaque)
     m2a(s, M2A_DSP);
 }
 
+#define HTC_SMEM_VBUS       0xEF20C
+#define DEX_NOTIFY_VBUS     0x02
+
+void msm_modem_set_vbus(MsmModemState *s, bool present)
+{
+    if (!s->smem || s->qdsp6_only) {
+        return;
+    }
+    smem_wr(s, HTC_SMEM_VBUS, present);
+    smem_wr(s, DEX_BASE + DEX_PC_NOTIFY,
+            smem_rd(s, DEX_BASE + DEX_PC_NOTIFY) | DEX_NOTIFY_VBUS);
+    m2a(s, 4);                          /* dex_comm's callback interrupt */
+}
+
 void msm_modem_qdsp6_boot(MsmModemState *s)
 {
     s->qdsp6_only = true;

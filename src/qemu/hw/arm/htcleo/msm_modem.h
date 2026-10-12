@@ -93,6 +93,8 @@ void msm_modem_set_smem(MsmModemState *s, uint8_t *smem);
 void msm_modem_boot(MsmModemState *s);
 /* baseband=lle: the real AMSS owns SMEM; bring up only the QDSP6 side */
 void msm_modem_qdsp6_boot(MsmModemState *s);
+/* USB/charger power plugged in or out: HTC's VBUS word and a DEX notify */
+void msm_modem_set_vbus(MsmModemState *s, bool present);
 
 int smd_modem_write(MsmModemState *s, SmdChan *c, const void *buf, int len);
 int smd_modem_send_packet(MsmModemState *s, SmdChan *c, const void *buf,

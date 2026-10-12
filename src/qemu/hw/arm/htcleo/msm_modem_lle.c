@@ -73,7 +73,7 @@ struct MsmModemLleState {
     MemoryRegion ram_alias;
     MemoryRegion tap;
     MemoryRegion ram9c, imem;
-    DeviceState *vic, *tmr, *mdsp;
+    DeviceState *vic, *tmr, *mdsp, *ssbi;
 
     MemoryRegion *ram;
     char *firmware;
@@ -392,6 +392,11 @@ MemoryRegion *msm_modem_lle_bus(DeviceState *dev)
     return &MSM_MODEM_LLE(dev)->mem;
 }
 
+DeviceState *msm_modem_lle_pmic(DeviceState *dev)
+{
+    return MSM_MODEM_LLE(dev)->ssbi;
+}
+
 qemu_irq msm_modem_lle_irq(DeviceState *dev, int n)
 {
     return qdev_get_gpio_in(MSM_MODEM_LLE(dev)->vic, n);
@@ -482,6 +487,8 @@ static void lle_realize(DeviceState *dev, Error **errp)
         };
         DeviceState *d = qdev_new(TYPE_MSM_SSBI);
 
+        s->ssbi = d;
+        object_property_add_child(OBJECT(dev), "ssbi", OBJECT(d));
         sysbus_realize_and_unref(SYS_BUS_DEVICE(d), &error_fatal);
         for (int i = 0; i < MSM_SSBI_NUM; i++) {
             memory_region_add_subregion_overlap(&s->mem, base[i],

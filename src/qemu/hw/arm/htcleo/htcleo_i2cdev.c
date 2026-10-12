@@ -5,7 +5,12 @@
  *  0x66  HTC microP (atmega): LEDs, LCD backlight, light/proximity sensor,
  *        BMA150 G-sensor, button backlight (board-htcleo-microp.c)
  *  0x48  TI TPS65023 PMIC (CPU core voltage)
- *  0x26  Maxim DS2746 battery gauge (drivers/power/ds2746_*.c)
+ *  0x26  Maxim DS2746 battery gauge (drivers/power/ds2746_*.c): a 1230 mAh
+ *        cell that charges at the current the board's charger delivers
+ *        (htcleo_battery_set_charge(), tapering off near full) and
+ *        otherwise discharges; voltage, current and the accumulated
+ *        charge (ACR, which the driver may rewrite) follow it.  "capacity"
+ *        (percent) can be set at run time.
  *  0x1C  AKM8973 compass: a measurement (MS1 = 0) completes 10 ms later
  *        and raises INT (GPIO 39, level high) until ST is read; then the
  *        part is back in power-down.  The field is a constant one.
@@ -17,6 +22,8 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/i2c/i2c.h"
+#include "qapi/visitor.h"
+#include "qemu/bswap.h"
 #include "hw/core/qdev-properties.h"
 #include "htcleo.h"
 #include "htcleo_i2cdev.h"
@@ -398,6 +405,198 @@ static void microp_class_init(ObjectClass *oc, const void *data)
 }
 
 /* ------------------------------------------------------------------ */
+/* DS2746 battery gauge                                                */
+/* ------------------------------------------------------------------ */
+
+#define DS_STATUS       0x01
+#define DS_AUX0         0x08
+#define DS_AUX1         0x0A
+#define DS_VOLT         0x0C
+#define DS_CURRENT      0x0E
+#define DS_ACR          0x10
+#define BATT_FULL_MAH   1230
+#define BATT_IDLE_MA    (-150)      /* phone running, screen on */
+
+OBJECT_DECLARE_SIMPLE_TYPE(HtcleoGauge, HTCLEO_GAUGE)
+
+struct HtcleoGauge {
+    I2CSlave parent_obj;
+    QEMUTimer *timer;
+    uint8_t regs[256];
+    uint8_t ptr;
+    bool have_ptr;
+    int64_t charge_uAms;        /* charge in mA*ms */
+    int charger_mA;             /* what the charger can deliver, 0 = none */
+    int current_mA;             /* into the cell, negative when draining */
+    int64_t last_ns;
+};
+
+static int gauge_mAh(HtcleoGauge *s)
+{
+    return s->charge_uAms / 3600000;
+}
+
+static int gauge_percent(HtcleoGauge *s)
+{
+    return MIN(100, MAX(0, gauge_mAh(s) * 100 / BATT_FULL_MAH));
+}
+
+/* regs from the cell state, in the units ds2746_param.c converts back */
+static void gauge_regs(HtcleoGauge *s)
+{
+    int pct = gauge_percent(s);
+    /* open-circuit voltage 3.45-4.2 V plus the drop across the cell */
+    int mv = 3450 + pct * 750 / 100 + s->current_mA / 8;
+    int raw_v = (mv * 100 / 244) << 4;
+    int raw_i = s->current_mA * 1580 / 625 * 4;
+    int acr = (gauge_mAh(s) + 500) * 1580 / 625;
+
+    stw_be_p(&s->regs[DS_VOLT], raw_v);
+    stw_be_p(&s->regs[DS_CURRENT], (uint16_t)raw_i);
+    stw_be_p(&s->regs[DS_ACR], (uint16_t)acr);
+}
+
+static void gauge_step(HtcleoGauge *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t ms = (now - s->last_ns) / 1000000;
+    int pct;
+
+    if (ms <= 0) {
+        return;
+    }
+    s->last_ns = now;
+    s->charge_uAms += (int64_t)s->current_mA * ms;
+    s->charge_uAms = MAX(0, MIN(s->charge_uAms,
+                                (int64_t)BATT_FULL_MAH * 3600000));
+    pct = gauge_percent(s);
+    if (s->charger_mA > 0) {
+        /* constant current, then the charger tapers and terminates */
+        s->current_mA = pct >= 100 ? 0 :
+                        pct >= 95 ? MAX(50, s->charger_mA * (100 - pct) / 5) :
+                        s->charger_mA;
+    } else {
+        s->current_mA = BATT_IDLE_MA;
+    }
+    gauge_regs(s);
+}
+
+static void gauge_tick(void *opaque)
+{
+    HtcleoGauge *s = opaque;
+
+    gauge_step(s);
+    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+}
+
+void htcleo_battery_set_charge(I2CSlave *dev, int mA)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(dev);
+
+    gauge_step(s);
+    s->charger_mA = mA;
+    s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->current_mA = mA > 0 ? mA : BATT_IDLE_MA;
+    gauge_step(s);
+    gauge_regs(s);
+}
+
+static int gauge_event(I2CSlave *i2c, enum i2c_event ev)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(i2c);
+
+    if (ev == I2C_START_SEND) {
+        s->have_ptr = false;
+    } else if (ev == I2C_START_RECV) {
+        gauge_step(s);
+    }
+    return 0;
+}
+
+static int gauge_send(I2CSlave *i2c, uint8_t data)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(i2c);
+
+    if (!s->have_ptr) {
+        s->ptr = data;
+        s->have_ptr = true;
+        return 0;
+    }
+    s->regs[s->ptr] = data;
+    if (s->ptr == DS_ACR + 1) {
+        /* the driver recalibrated the accumulated charge */
+        int acr = (int16_t)lduw_be_p(&s->regs[DS_ACR]);
+        int mah = acr * 625 / 1580 - 500;
+        s->charge_uAms = (int64_t)MAX(0, MIN(mah, BATT_FULL_MAH)) * 3600000;
+    }
+    s->ptr++;
+    return 0;
+}
+
+static uint8_t gauge_recv(I2CSlave *i2c)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(i2c);
+    return s->regs[s->ptr++];
+}
+
+static void gauge_get_capacity(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(obj);
+    int64_t pct = gauge_percent(s);
+
+    visit_type_int(v, name, &pct, errp);
+}
+
+static void gauge_set_capacity(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(obj);
+    int64_t pct;
+
+    if (!visit_type_int(v, name, &pct, errp)) {
+        return;
+    }
+    pct = MIN(100, MAX(0, pct));
+    s->charge_uAms = pct * BATT_FULL_MAH * 3600000 / 100;
+    gauge_regs(s);
+}
+
+static void gauge_reset(DeviceState *dev)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(dev);
+
+    memset(s->regs, 0, sizeof(s->regs));
+    s->regs[DS_STATUS] = 0x03;                  /* AIN0/AIN1 ready, no POR */
+    stw_be_p(&s->regs[DS_AUX0], 0x1E00);        /* ID: Samsung 1230 mAh */
+    stw_be_p(&s->regs[DS_AUX1], 0x1E00);        /* NTC: 25 C */
+    s->last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->current_mA = s->charger_mA > 0 ? s->charger_mA : BATT_IDLE_MA;
+    gauge_regs(s);
+    timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+}
+
+static void gauge_init(Object *obj)
+{
+    HtcleoGauge *s = HTCLEO_GAUGE(obj);
+
+    s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, gauge_tick, s);
+    s->charge_uAms = (int64_t)BATT_FULL_MAH * 3600000 * 75 / 100;
+    object_property_add(obj, "capacity", "int", gauge_get_capacity,
+                        gauge_set_capacity, NULL, NULL);
+}
+
+static void gauge_class_init(ObjectClass *oc, const void *data)
+{
+    I2CSlaveClass *k = I2C_SLAVE_CLASS(oc);
+
+    k->event = gauge_event;
+    k->send = gauge_send;
+    k->recv = gauge_recv;
+    device_class_set_legacy_reset(DEVICE_CLASS(oc), gauge_reset);
+}
+
+/* ------------------------------------------------------------------ */
 /* AKM8973 compass                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -520,6 +719,12 @@ static const TypeInfo htcleo_i2c_types[] = {
         .instance_size = sizeof(HtcleoMicrop),
         .instance_init = microp_init,
         .class_init = microp_class_init,
+    }, {
+        .name = TYPE_HTCLEO_GAUGE,
+        .parent = TYPE_I2C_SLAVE,
+        .instance_size = sizeof(HtcleoGauge),
+        .instance_init = gauge_init,
+        .class_init = gauge_class_init,
     }, {
         .name = TYPE_HTCLEO_AKM,
         .parent = TYPE_I2C_SLAVE,

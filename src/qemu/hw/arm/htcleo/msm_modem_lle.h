@@ -24,6 +24,8 @@
  * proc_comm ISR is tramp 77 -> HAL 71 -> line 62 (A2M 6), SMSM tramp 76 ->
  * line 61 (A2M 5), SMD tramp 71 -> line 56 (A2M 0).
  */
+#define MIRQ_GPIO_GROUP1    44  /* tramp 60 */
+#define MIRQ_GPIO_GROUP2    45  /* tramp 61 */
 #define MIRQ_A2M_0          56
 #define MIRQ_A2M_NUM        7
 
@@ -32,6 +34,8 @@ void msm_modem_lle_reset(DeviceState *dev);
 ARMCPU *msm_modem_lle_cpu(DeviceState *dev);
 /* the modem core's bus, for mapping modem-private peripherals */
 MemoryRegion *msm_modem_lle_bus(DeviceState *dev);
+/* the SSBI controllers with the PM7540 ("pmic-irq" out, msm_ssbi_pmic_*) */
+DeviceState *msm_modem_lle_pmic(DeviceState *dev);
 /* input n of the modem core's interrupt controller */
 qemu_irq msm_modem_lle_irq(DeviceState *dev, int n);
 
