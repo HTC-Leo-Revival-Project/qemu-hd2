@@ -31,6 +31,8 @@
 #include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "qemu/main-loop.h"
+#include "qemu/rcu.h"
 #include "msm_adreno.h"
 
 /* chip id 0x00020100: core 0, major 2, minor 1, patch 0 (Yamato DX 2.1) */
@@ -198,12 +200,17 @@ bool adreno_translate(MsmAdrenoState *s, uint32_t va, hwaddr *pa)
     pte = ldl_le_phys(&address_space_memory, s->regs[A2_MH_MMU_PT_BASE] +
                       ((va - base) >> 12) * 4);
     if (!(pte & 3)) {
+        /* rasterizer threads only note it; the next CP access raises it */
         if (!(s->regs[A2_MH_INTERRUPT_STATUS] & A2_MH_INT_PAGE_FAULT)) {
             s->regs[A2_MH_MMU_PAGE_FAULT] = (va & 0xfffff000) | 1;
             s->regs[A2_MH_INTERRUPT_STATUS] |= A2_MH_INT_PAGE_FAULT;
-            adreno_update_irq(s);
+            if (bql_locked()) {
+                adreno_update_irq(s);
+            }
         }
-        adreno_trace(s, "mmu: page fault at %08x\n", va);
+        if (bql_locked()) {
+            adreno_trace(s, "mmu: page fault at %08x\n", va);
+        }
         return false;
     }
     *pa = (pte & 0xfffff000) | (va & 0xfff);
@@ -259,6 +266,79 @@ void adreno_stl(MsmAdrenoState *s, uint32_t va, uint32_t val)
 {
     val = cpu_to_le32(val);
     adreno_write(s, va & ~3u, &val, 4);
+}
+
+void adreno_tlb_flush(AdrenoTlb *tlb)
+{
+    memset(tlb->tag, 0, sizeof(tlb->tag));
+}
+
+/* Host pointer to the GPU address (valid to the end of its page), or NULL */
+uint8_t *adreno_host_ptr(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t va)
+{
+    uint32_t page = va >> 12;
+    unsigned slot = page % ADRENO_TLB_SIZE;
+    uint8_t *host = NULL;
+
+    if (tlb->tag[slot] == page + 1) {
+        host = tlb->host[slot];
+    } else {
+        hwaddr pa, xlat, len = 0x1000;
+
+        if (adreno_translate(s, va & ~0xfffu, &pa)) {
+            MemoryRegion *mr;
+
+            RCU_READ_LOCK_GUARD();
+            mr = address_space_translate(&address_space_memory, pa, &xlat,
+                                         &len, false, MEMTXATTRS_UNSPECIFIED);
+            if (memory_region_is_ram(mr) && len >= 0x1000) {
+                host = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+            }
+        }
+        tlb->tag[slot] = page + 1;
+        tlb->host[slot] = host;
+    }
+    return host ? host + (va & 0xfff) : NULL;
+}
+
+void adreno_tlb_read(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t va,
+                     void *buf, uint32_t len)
+{
+    uint8_t *p = buf;
+
+    while (len) {
+        uint32_t chunk = MIN(len, 0x1000 - (va & 0xfff));
+        uint8_t *h = adreno_host_ptr(s, tlb, va);
+
+        if (h) {
+            memcpy(p, h, chunk);
+        } else {
+            adreno_read(s, va, p, chunk);
+        }
+        va += chunk;
+        p += chunk;
+        len -= chunk;
+    }
+}
+
+void adreno_tlb_write(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t va,
+                      const void *buf, uint32_t len)
+{
+    const uint8_t *p = buf;
+
+    while (len) {
+        uint32_t chunk = MIN(len, 0x1000 - (va & 0xfff));
+        uint8_t *h = adreno_host_ptr(s, tlb, va);
+
+        if (h) {
+            memcpy(h, p, chunk);
+        } else {
+            adreno_write(s, va, p, chunk);
+        }
+        va += chunk;
+        p += chunk;
+        len -= chunk;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -956,6 +1036,25 @@ static void adreno_set_dump(Object *obj, const char *value, Error **errp)
     }
 }
 
+static void *adreno_worker_thread(void *opaque)
+{
+    AdrenoWorker *w = opaque;
+
+    rcu_register_thread();
+    for (;;) {
+        qemu_sem_wait(&w->go);
+        if (w->s->quit) {
+            break;
+        }
+        WITH_RCU_READ_LOCK_GUARD() {
+            adreno_raster_worker(w);
+        }
+        qemu_sem_post(&w->s->done);
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
 static void adreno_realize(DeviceState *dev, Error **errp)
 {
     MsmAdrenoState *s = MSM_ADRENO(dev);
@@ -966,13 +1065,49 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     s->gmem = g_malloc0(ADRENO_GMEM_SIZE);
     s->pkt = g_new(uint32_t, 0x4000 + 1);
+
+    /* worker 0 is the vCPU thread itself; the rest are rasterizer threads */
+    s->nthreads = MAX(1, MIN(s->nthreads, ADRENO_MAX_THREADS));
+    s->workers = g_new0(AdrenoWorker, s->nthreads);
+    qemu_sem_init(&s->done, 0);
+    for (uint32_t i = 0; i < s->nthreads; i++) {
+        AdrenoWorker *w = &s->workers[i];
+
+        w->s = s;
+        w->index = i;
+        w->lanes.texcache = g_new0(AdrenoTexTile, ADRENO_TEXCACHE);
+        if (i) {
+            qemu_sem_init(&w->go, 0);
+            qemu_thread_create(&w->thread, "adreno-raster",
+                               adreno_worker_thread, w, QEMU_THREAD_JOINABLE);
+        }
+    }
 }
+
+static void adreno_unrealize(DeviceState *dev)
+{
+    MsmAdrenoState *s = MSM_ADRENO(dev);
+
+    s->quit = true;
+    for (uint32_t i = 1; i < s->nthreads; i++) {
+        qemu_sem_post(&s->workers[i].go);
+        qemu_thread_join(&s->workers[i].thread);
+    }
+    adreno_programs_free(s);
+}
+
+static const Property adreno_props[] = {
+    /* rasterizer threads, the vCPU's included */
+    DEFINE_PROP_UINT32("threads", MsmAdrenoState, nthreads, 6),
+};
 
 static void adreno_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = adreno_realize;
+    dc->unrealize = adreno_unrealize;
+    device_class_set_props(dc, adreno_props);
     device_class_set_legacy_reset(dc, adreno_reset);
     object_class_property_add_str(klass, "trace", adreno_get_trace,
                                   adreno_set_trace);

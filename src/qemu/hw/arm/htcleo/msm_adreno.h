@@ -205,24 +205,70 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmAdrenoState, MSM_ADRENO)
 #define A2_SHADER_PS            1
 
 /*
- * One shader invocation: up to 64 four-component temporaries.  The vertex
- * shader exports a position (and a point size) plus up to 16 interpolators;
- * the pixel shader exports up to 4 colours and depth.
+ * Shaders run on AL lanes at once: vertices in batches, or a 4x4 block of
+ * pixels made of four 2x2 quads (lanes 4q..4q+3 = (x,y) (x+1,y) (x,y+1)
+ * (x+1,y+1)), whose neighbours give the texture derivatives.
  */
-#define A2_MAX_INTERP 16
+#define AL              16
+#define A2_MAX_INTERP   16
+
+#define ADRENO_MAX_THREADS 16
+
+#include "qemu/thread.h"
 
 typedef struct AdrenoVertex {
-    float pos[4];       /* clip space, then window space after the viewport */
+    float pos[4];       /* clip space */
     float psize;
     float interp[A2_MAX_INTERP][4];
 } AdrenoVertex;
 
-typedef struct AdrenoPixelOut {
-    float color[4][4];
-    float depth;
-    bool depth_written;
-    bool killed;
-} AdrenoPixelOut;
+/* A per-thread cache of GPU page -> host pointer (RAM only) */
+#define ADRENO_TLB_SIZE 256
+typedef struct AdrenoTlb {
+    uint32_t tag[ADRENO_TLB_SIZE];      /* page number + 1, 0 = empty */
+    uint8_t *host[ADRENO_TLB_SIZE];     /* NULL: not RAM or a fault */
+} AdrenoTlb;
+
+typedef struct AdrenoProgram AdrenoProgram;
+
+/*
+ * Decoded 32x32 texel tiles (RGBA8) of the textures a draw samples, per
+ * thread; a draw's generation number invalidates them.
+ */
+#define ADRENO_TEXCACHE 128
+typedef struct AdrenoTexTile {
+    uint32_t gen;
+    uint32_t base, pitch, key, tx, ty;
+    uint8_t rgba[32 * 32 * 4];
+} AdrenoTexTile;
+
+typedef struct AdrenoLanes {
+    struct MsmAdrenoState *s;
+    const AdrenoProgram *prog;
+    AdrenoTlb *tlb;
+    AdrenoTexTile *texcache;
+    uint32_t texgen;
+    bool quads;                 /* pixel lanes: derivatives available */
+    float r[64][4][AL];         /* temporaries */
+    /* vertex shader outputs */
+    float pos[4][AL];
+    float psize[AL];
+    float interp[A2_MAX_INTERP][4][AL];
+    /* pixel shader outputs */
+    float color[4][AL];
+    float depth[AL];
+    uint32_t killed;
+} AdrenoLanes;
+
+typedef struct AdrenoWorker {
+    struct MsmAdrenoState *s;
+    QemuThread thread;
+    QemuSemaphore go;
+    int index;
+    AdrenoTlb tlb;
+    AdrenoLanes lanes;
+    uint64_t pixels;
+} AdrenoWorker;
 
 struct MsmAdrenoState {
     SysBusDevice parent_obj;
@@ -246,8 +292,19 @@ struct MsmAdrenoState {
     uint32_t shadow_addr[5];
     uint32_t me_ram_addr, pfp_addr;
 
+    /* decoded shaders, by content */
+    GHashTable *programs;
+
+    /* rasterizer threads */
+    uint32_t nthreads;
+    AdrenoWorker *workers;
+    QemuSemaphore done;
+    void *job;                  /* the raster job in progress */
+    bool quit;
+
     /* draw statistics */
     uint64_t draws, pixels;
+    uint32_t texgen;            /* texture cache generation, per draw */
 
     char *trace_path;
     FILE *trace;
@@ -262,6 +319,14 @@ uint32_t adreno_ldl(MsmAdrenoState *s, uint32_t gpuaddr);
 void adreno_stl(MsmAdrenoState *s, uint32_t gpuaddr, uint32_t val);
 /* translate one page; returns false on a fault */
 bool adreno_translate(MsmAdrenoState *s, uint32_t gpuaddr, hwaddr *pa);
+/* host pointer to the byte at gpuaddr, valid to the end of its page */
+uint8_t *adreno_host_ptr(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t gpuaddr);
+void adreno_tlb_flush(AdrenoTlb *tlb);
+/* read/write through the TLB (falls back to the slow path) */
+void adreno_tlb_read(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t gpuaddr,
+                     void *buf, uint32_t len);
+void adreno_tlb_write(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t gpuaddr,
+                      const void *buf, uint32_t len);
 
 void adreno_trace(MsmAdrenoState *s, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
 
@@ -281,25 +346,39 @@ static inline uint32_t adreno_u(float f)
 void adreno_draw(MsmAdrenoState *s, uint32_t initiator, uint32_t num_indices,
                  uint32_t index_base, uint32_t index_size,
                  const uint32_t *immediate, uint32_t immediate_dwords);
+void adreno_raster_worker(AdrenoWorker *w);
+float adreno_half_to_float(uint16_t h);
+/* Xenos 2D tiling: byte offset of block (x, y), pitch in blocks */
+uint32_t adreno_tiled_offset(int x, int y, uint32_t pitch, unsigned bpb_log2);
+uint16_t adreno_float_to_half(float f);
 
 /* msm_adreno_sq.c */
-typedef struct AdrenoShaderCtx {
-    MsmAdrenoState *s;
-    int type;                       /* A2_SHADER_VS / A2_SHADER_PS */
-    const uint32_t *code;           /* instruction memory of this type */
-    uint32_t code_size;             /* in dwords */
-    float r[64][4];                 /* temporaries */
-    /* outputs */
-    AdrenoVertex *vout;
-    AdrenoPixelOut *pout;
-    /* pixel shader: screen position for gl_FragCoord-style param gen */
-    float frag_pos[4];
-} AdrenoShaderCtx;
+struct AdrenoProgram {
+    int type;
+    uint32_t ncf;
+    struct SqCf *cf;
+    struct SqInsn *insn;
+    uint32_t ninsn;
+    bool kills;             /* pixel shader may discard */
+    bool exports_depth;
+    uint32_t tex_mask;      /* texture fetch constants used */
+};
 
-void adreno_shader_run(AdrenoShaderCtx *c);
-void adreno_sample_texture(MsmAdrenoState *s, unsigned fetch_const,
-                           const float coord[4], uint32_t insn_dword1,
-                           uint32_t insn_dword2, float out[4]);
-const char *adreno_shader_disasm_type(int type);
+const AdrenoProgram *adreno_program(MsmAdrenoState *s, int type);
+void adreno_programs_free(MsmAdrenoState *s);
+void adreno_shader_exec(AdrenoLanes *L, uint32_t mask);
+
+/* msm_adreno_tex.c: sample fetch constant idx for the lanes in mask */
+typedef struct AdrenoTexArgs {
+    unsigned const_idx;
+    unsigned mag, min, mip;         /* filters, resolved */
+    bool unnormalized;
+    float lod_bias;                 /* instruction bias */
+    bool use_reg_lod;
+    float offset[3];
+} AdrenoTexArgs;
+
+void adreno_sample(AdrenoLanes *L, const AdrenoTexArgs *a,
+                   float coord[3][AL], uint32_t mask, float out[4][AL]);
 
 #endif
