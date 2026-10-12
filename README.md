@@ -86,25 +86,40 @@ hcitool cmd 0x3f 0x15 0x12 0x01                 # read FLAG0: 0x01 done, 0x20 st
 ```
 `AUDIO_START_FM` on `/dev/msm_audio_ctl` turns on the codec's aux loopback, and the tuned station plays through the audio backend. Stations are set with `-global bcm4329-bt.fm-stations="MHZ=SOURCE;…"`, where SOURCE is `tone:HZ` or any file or stream URL that ffmpeg can decode. Without it, test tones play on 88.1, 94.7, 101.5 and 105.9 MHz, with static between stations. The ROM itself has no FM app.
 
-### Real baseband firmware (work in progress)
+### Real baseband firmware
 
-`baseband=lle` runs the radio ROM's own AMSS on an emulated ARM926 modem core, next to the Scorpion, instead of the modelled baseband services:
+`baseband=lle` runs the radio ROM's own AMSS on an emulated ARM926 modem core, next to the Scorpion, instead of the modelled baseband services. cLK, Linux and Android boot on top of it to the lock screen, and adb works:
 ```bash
-python3 tools/hd2_radio.py RUU_signed.nbh -o images/amss.elf   # e.g. radio 2.15.50.14
-tools/start-lle.sh                                             # TRACE=on logs modem I/O
+cd images
+python3 ../tools/hd2_radio.py RUU_signed.nbh -o amss.elf          # e.g. radio 2.15.50.14
+cp nand.img nand-lle.img
+python3 ../tools/hd2_radio.py RUU_signed.nbh --write-nand nand-lle.img   # MIBIB, AMSS, DSP1 ...
+cd .. && tools/start-lle.sh          # start.sh with BASEBAND=lle and nand-lle.img
 ```
-- `hd2_radio.py` unwraps the signed NBH, prints the radio's MIBIB partition table and extracts the AMSS ELF.
-- The modem core (cluster 1) sees the shared DRAM and peripherals. It also has its own devices:
-  - the modem VIC and timers at 0xB8000000;
-  - internal SRAM at 0xFFFC0000 and RAM at 0x9C000000;
-  - a register store for modem hardware that has no model yet.
-- The secure boot stages (DBL/FSBL/OSBL) are skipped. Their hand-off to AMSS is reproduced instead: the SMEM heap, the fixed items, and the boot segment info (item 98).
+- `hd2_radio.py` unwraps the signed NBH, prints the radio's MIBIB partition table and extracts the AMSS ELF. `--write-nand` puts the radio partitions into a NAND image. AMSS then finds its MIBIB at block 2 and formats EFS2 on first boot.
+- The secure boot stages (DBL/FSBL/OSBL) are skipped. Their hand-off is reproduced instead:
+  - the SMEM heap, the fixed items and the boot segment info (item 98);
+  - HTC's configuration block at SMEM + 0xEF000 (board ID, radio version, CID, NAND ID, USB cable present);
+  - the apps core and the QDSP6, which OSBL starts before it jumps to AMSS, run from reset.
+- The modem core (cluster 1) sees the shared DRAM and peripherals and has its own devices:
+
+| Address | Device |
+|---|---|
+| 0xB8000000 | timers, watchdog; writing 1 to 0x594 + 4n interrupts the apps core (INT_A9_M2A_n) |
+| 0xB8001000 | modem VIC: the L4 tick on line 32, the ADM on 52, the watchdog bark (FIQ) on 55, apps doorbells A2M 0-6 on 56-62 |
+| 0xB8000300, 0xB8000400, 0xA8100000, 0xB0007580 | SSBI controllers; the PM7540 PMIC behind the first (`msm_ssbi.c`) |
+| 0xB1000000 | modem DSP (QDSP4) memories and control, high level: image download and the boot handshake (`msm_mdsp.c`) |
+| 0xA9400000 | ADM security domain 0, shared with the apps data mover |
+| 0xFFFC0000, 0x9C000000 | internal SRAM, modem RAM |
+
+- Not modelled yet: the SIM (UIM), the radio front end (no network), PMIC functions beyond detection (the RTC, so the clock starts in 1980; charging).
 - AMSS prints fatal errors on UART1 (`images/uart1.log`).
-- The apps core is held in reset until AMSS starts it.
 
-Current state: the OKL4 kernel and AMSS's tasks start. Shared memory gets SMSM, the SMEM logs and the version info. The sleep controller and DRAM self-refresh cycle run, and the chip identifies as a QSD8250. The File System task then stops in AMSS's NAND driver (`flash_nand_ctlr_d.c:518`): the radio partitions (MIBIB, EFS2) are not on the emulated NAND yet. The apps core is not released yet, so Android does not boot in this mode.
-
-Helpers: `tools/amss_dis.py` (disassembles by AMSS virtual address, ARM or Thumb), `tools/amss_xref.py` (finds the code that loads a literal), `tools/amss_fatal.py` (finds ERR_FATAL sites). `QMON_CPU=1 tools/qmon.py` runs monitor commands on the modem core. `-global msm-modem-lle.dump-on-write=0xA9A0000C` dumps the modem stack at the first fatal message.
+Debugging:
+- `AMSSLOG=1 tools/start-lle.sh` writes AMSS's own debug log ("F3" messages) to `images/qemu.log`. It uses the TCG plugin `contrib/plugins/amsslog.c`, which hooks the msg_send functions. `AMSSLOG="1 hook=0xVA"` also reports each call of a function.
+- `TRACE=on` logs the modem core's peripheral accesses.
+- `tools/amss_dis.py` disassembles by AMSS virtual address (ARM or Thumb). `tools/amss_xref.py` finds the code that loads a literal, and `tools/amss_fatal.py` finds ERR_FATAL sites.
+- `QMON_CPU=1 tools/qmon.py` runs monitor commands on the modem core. gdb (multiprocess stub, inferior 2) works, but it slows AMSS enough to trip its watchdog.
 
 ### WiFi
 
@@ -122,9 +137,9 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | Processor | Role on the phone | Emulation |
 |---|---|---|
 | Scorpion (ARMv7, Qualcomm's own core) | Apps processor: cLK, Linux, Android | **Low level.** The instructions run on a Cortex-A8 model with Qualcomm's MIDR and the Scorpion CP15 registers (PLL, L2). |
-| ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1). The secure boot stages are skipped and their hand-off is reproduced. In progress, see below. |
-| QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, Android's "aDSP" | **High level.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. No Hexagon instructions run, so the DSP1 firmware image is never executed. |
-| QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated.** There is no radio. In HLE mode, registration, calls and data are modelled above it. In LLE mode, AMSS's accesses to the modem DSP's registers fall into an unmodelled register store. |
+| ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1) and Android boots on it. The secure boot stages are skipped and their hand-off is reproduced. No SIM or network yet, see below. |
+| QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, Android's "aDSP" | **High level.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. No Hexagon instructions run, so the DSP1 firmware image is never executed. With `baseband=lle` it acts as its own processor: it creates its SMD channels in AMSS's shared memory like the DSP firmware would. |
+| QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated** in HLE mode, where registration, calls and data are modelled above it. **High level in LLE mode** (`msm_mdsp.c`): AMSS downloads the mDSP image into modelled memories and gets the boot handshake. No DSP instructions run and there is no radio. |
 
 ## Hardware status
 
