@@ -8,7 +8,9 @@
  *         colours (whatever the driver lists in GL_EXTENSIONS)
  *   pts   40-pixel points coloured by gl_PointCoord, and lines
  *   cube  a spinning depth-tested cube (frame time is reported)
- *   pb565 the triangle of gltri on a 480x800 RGB565 pbuffer
+ *   pb565 a clear of a 480x800 RGB565 pbuffer
+ *   fill  8 full-screen blended, mipmapped, bilinear textured quads per
+ *         frame (overdraw like a game's; frame time is reported)
  * Each scene prints read-back pixels and their expected values.
  */
 #include <dlfcn.h>
@@ -347,6 +349,47 @@ static void scene_cube(int frames)
     printf("%.1f ms per frame\n", busy / frames);
 }
 
+static void scene_fill(int frames)
+{
+    GLuint prog = program(tex_vs, tex_fs), tex;
+    GLubyte *img = malloc(256 * 256 * 4);
+    double busy = 0;
+
+    for (int i = 0; i < 256 * 256; i++) {
+        img[4 * i + 0] = i & 0xff;
+        img[4 * i + 1] = (i >> 8) & 0xff;
+        img[4 * i + 2] = ((i >> 4) ^ (i >> 12)) & 0xff;
+        img[4 * i + 3] = 64;
+    }
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 256, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, img);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    for (int fr = 0; fr < frames; fr++) {
+        double t0 = now_ms();
+
+        glClearColor(0.1f, 0.1f, 0.1f, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        for (int q = 0; q < 8; q++) {
+            quad_px(prog, W / 2 + q, H / 2, W, H, 1.0f + q * 0.25f);
+        }
+        eglSwapBuffers(dpy, surf);
+        glFinish();
+        if (fr) {
+            busy += now_ms() - t0;
+        }
+    }
+    printf("%.1f ms per frame (8 full-screen layers)\n",
+           busy / (frames - 1));
+    free(img);
+}
+
 int main(int argc, char **argv)
 {
     static const EGLint cfg_attr[] = {
@@ -396,6 +439,8 @@ int main(int argc, char **argv)
 
     if (!strcmp(scene, "cube")) {
         scene_cube(seconds * 10);
+    } else if (!strcmp(scene, "fill")) {
+        scene_fill(seconds * 2);
     } else {
         if (!strcmp(scene, "comp")) {
             scene_comp();
