@@ -11,10 +11,17 @@
 - the QDSP6 in "only" mode creates its SMD channels;
 - the AKM8973 compass INT storm (also helped HLE).
 
+Later the same day (see README "Real baseband firmware"):
+- PMIC (`msm_ssbi.c`): RTC, interrupt controller on GPIO 24, charger/USB and power key.
+- SIM: `msm_uim.c` (UART2 in SIM mode) + `sim_card.c`; Android shows `gsm.sim.state=READY`.
+- GSM frame timer (`msm_gstmr.c`, line 18), WCDMA STMR (`msm_wstmr.c`, lines 12-14), modem timer match IRQ on line 34 (REX timers).
+- mDSP: doorbell bits 19 (MC), 15 (WCDMA sync/search commands at B+0x4958, done event B+0x4E5E), search done = HPQ/LPQ events B+0x4E56/4E54, AGC floor at A+0x1F3C. Image 0x1406 swaps per-app overlays while running, each with its own symbol table ([0x1350B0C]).
+- Result: stack cycles WCDMA scan/acq -> GSM pscan -> NO SERVICE -> power save; GPS sessions start and time out without a fix. No crash in long runs.
+
 Open items:
-- SIM/UIM, so there is no network;
-- the PMIC RTC, so the clock starts in 1980 (also charging and the power key: "PMIC API ERROR" lines);
-- the RF SSBI chips.
+- GSM per-frame DSP interface (doorbell bit 26): power measurements read -70 dBm, so GSM tries a few ACQs per cycle;
+- the RF SSBI chips;
+- real network/GPS fix are out of reach (no DSP code runs).
 
 HLE Android and the MAGLDR→iOS path were re-tested after these changes.
 

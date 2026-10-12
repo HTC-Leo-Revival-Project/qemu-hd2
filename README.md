@@ -118,7 +118,10 @@ cd .. && tools/start-lle.sh          # start.sh with BASEBAND=lle and nand-lle.i
 | 0xB8001000 | modem VIC: the L4 tick on line 32, the ADM on 52, the watchdog bark (FIQ) on 55, apps doorbells A2M 0-6 on 56-62 |
 | 0xB8000300, 0xB8000400, 0xA8100000, 0xB0007580 | SSBI controllers; the PM7540 PMIC behind the first (`msm_ssbi.c`) |
 | 0xA8E00000, 0xA8F00400 | the modem's own shadow of the GPIO registers; its group interrupts are lines 44 and 45 |
-| 0xB1000000 | modem DSP (QDSP4) memories and control, high level: image download and the boot handshake (`msm_mdsp.c`) |
+| 0xB1000000 | modem DSP (QDSP4) memories and control, high level: image download, the boot handshake, master controller commands, the GSM/WCDMA ready flags, WCDMA synchronous and search commands, the receive AGC (`msm_mdsp.c`) |
+| 0xB0007B00 | GSM frame timer: quarter-symbol counter, frame number, the frame tick every 120/26 ms on line 18 (`msm_gstmr.c`) |
+| 0xB0005D00 | WCDMA system timer: chip counter, 10 ms frames, three event interrupts on lines 12-14 (`msm_wstmr.c`) |
+| 0xA9B00000 | UIM: UART2 in SIM mode with a GSM SIM card behind it, interrupt through the second-level controller 7 on line 37 (`msm_uim.c`, `sim_card.c`) |
 | 0xA9400000 | ADM security domain 0, shared with the apps data mover |
 | 0xFFFC0000, 0x9C000000 | internal SRAM, modem RAM |
 
@@ -126,7 +129,12 @@ cd .. && tools/start-lle.sh          # start.sh with BASEBAND=lle and nand-lle.i
   - its RTC (the clock comes from QEMU's);
   - its interrupt controller, wired to MSM GPIO 24 and the modem's GPIO interrupt shadow;
   - the power key, USB power and charger sources.
-- Not modelled yet: the SIM (UIM) and the radio front end, so there is no network.
+- The SIM is the same T-Mobile US card as in the default mode (IMSI 310260000000000), here a real ISO 7816 card: AMSS's UIM driver powers it through the PMIC, gets its ATR, falls back from USIM to GSM commands and reads it over T=0. AMSS reports it present and ready, and Android's RIL reads it with AT+CRSM.
+- The modem DSP runs no code. The model answers what AMSS's GSM and WCDMA layers wait for: firmware ready, master controller and synchronous commands, and the searcher. With no RF signal the receiver sits at its noise floor (−106 dBm) and searches find no peaks.
+- So the radio stack behaves like a phone with no network around: WCDMA frequency scans and acquisition, then GSM power scans, then NO SERVICE and power save, retried periodically. Android shows the SIM READY and "out of service".
+- GPS requests reach AMSS's gpsOne engine. The receiver turns on, finds no satellites and times out every 2 s, like a phone indoors.
+- Out of reach in this mode: registering on a network and getting a GPS fix. Both need the DSP's signal processing and the RF front end, and the DSP firmware cannot be run. Use the default mode for those.
+- Known gaps: GSM power measurements read −70 dBm rather than the noise floor (the DSP's per-frame GSM interface is not modelled), so GSM tries to acquire a few channels before it gives up.
 - AMSS prints fatal errors on UART1 (`images/uart1.log`).
 
 Debugging:
@@ -187,9 +195,9 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | Processor | Role on the phone | Emulation |
 |---|---|---|
 | Scorpion (ARMv7, Qualcomm's own core) | Apps processor: cLK, Linux, Android | **Low level.** The instructions run on a Cortex-A8 model with Qualcomm's MIDR and the Scorpion CP15 registers (PLL, L2). |
-| ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1) and Android boots on it. The secure boot stages are skipped and their hand-off is reproduced. No SIM or network yet, see below. |
+| ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1) and Android boots on it. The secure boot stages are skipped and their hand-off is reproduced. The SIM works; the radio stack runs but finds no network, see below. |
 | QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, Android's "aDSP" | **High level.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. No Hexagon instructions run, so the DSP1 firmware image is never executed. With `baseband=lle` it acts as its own processor: it creates its SMD channels in AMSS's shared memory like the DSP firmware would. |
-| QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated** in HLE mode, where registration, calls and data are modelled above it. **High level in LLE mode** (`msm_mdsp.c`): AMSS downloads the mDSP image into modelled memories and gets the boot handshake. No DSP instructions run and there is no radio. |
+| QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated** in HLE mode, where registration, calls and data are modelled above it. **High level in LLE mode** (`msm_mdsp.c`): AMSS downloads the mDSP image and its overlays into modelled memories; the model answers the boot handshake, master controller commands, WCDMA synchronous and search commands, and reports a receiver with no signal. No DSP instructions run. |
 
 ## Hardware status
 
@@ -201,7 +209,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | NAND | Controller (16-bit ECC layout) + ADM data mover; yaffs2 read/write |
 | microSD | SDCC (SDC2) on QEMU's SD card model; mounted by vold |
 | WiFi | BCM4329 on SDC1: SDIO card, backplane, firmware download. The firmware is emulated at protocol level (SDPCM/CDC/BDC, scan, join, events) and bridged to a QEMU NIC. |
-| Modem | SMEM, proc_comm, DEX, SMSM, SMD, RPC router (RTC, PMIC, battery…); or the real AMSS on an ARM926 core (`baseband=lle`, boots Android; no SIM or radio) |
+| Modem | SMEM, proc_comm, DEX, SMSM, SMD, RPC router (RTC, PMIC, battery…); or the real AMSS on an ARM926 core (`baseband=lle`, boots Android with the SIM; no network) |
 | Cellular | AT modem on SMD with a T-Mobile US (310/260) SIM, UMTS registration, PPP data call to QEMU user networking |
 | GPS | gpsOne PDAPI over ONC RPC: position callbacks to the HAL's client endpoint, 1 Hz fixes, runtime `gps-fix` |
 | Bluetooth | UART1DM (msm_serial_hs) with paced ADM DMA, host-wake LPM; BCM4329 HCI controller (patchram, BT 2.1 + EDR) |
