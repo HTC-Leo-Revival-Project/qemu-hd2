@@ -20,32 +20,35 @@ SHOT = os.path.join(HERE, '../build-tmp/magnav.ppm')
 FIRST_Y, STEP = 98, 33
 
 
-def longest_white(px, w, y):
-    best = n = 0
-    for x in range(w):
-        n = n + 1 if px[x, y] == (255, 255, 255) else 0
-        best = max(best, n)
-    return best
+def row_span(px, w, y):
+    """(first, last, solid) white columns of row y, or None"""
+    xs = [x for x in range(w) if px[x, y] == (255, 255, 255)]
+    if not xs:
+        return None
+    return xs[0], xs[-1], len(xs) == xs[-1] - xs[0] + 1
 
 
 def cursor(sock):
+    """Menu row under the highlight bar: a block of rows whose white pixels
+    all start and end on the same columns, with solid top and bottom."""
     subprocess.run([sys.executable, os.path.join(HERE, 'qmon.py'), sock,
                     'screendump ' + os.path.abspath(SHOT)], check=True,
                    stdout=subprocess.DEVNULL)
     im = Image.open(SHOT).convert('RGB')
     w, h = im.size
     px = im.load()
-    run = []
-    for y in range(80, h):
-        if longest_white(px, w, y) >= 12:
-            run.append(y)
-        elif len(run) >= 10:
-            break
-        else:
-            run = []
-    if len(run) < 10:
-        return None
-    return round(((run[0] + run[-1]) / 2 - FIRST_Y) / STEP) + 1
+    run, edges = [], None
+    for y in range(80, h + 1):
+        span = row_span(px, w, y) if y < h else None
+        if span and span[1] - span[0] >= 12 and span[:2] == edges:
+            run.append(span)
+            continue
+        if len(run) >= 10 and sum(1 for r in run if r[2]) >= 2:
+            top = y - len(run)
+            return round(((top + y - 1) / 2 - FIRST_Y) / STEP) + 1
+        run = [span] if span and span[1] - span[0] >= 12 else []
+        edges = span[:2] if run else None
+    return None
 
 
 def press(sock, key):
@@ -64,8 +67,11 @@ def main():
             if again == cur:
                 break
             cur = again
-        if cur is None:
-            sys.exit('no menu cursor on screen')
+        if cur is None:         # caught mid-redraw?
+            time.sleep(0.5)
+            cur = cursor(sock)
+            if cur is None:
+                sys.exit('no menu cursor on screen')
         if cur == target:
             break
         press(sock, 'pgdn' if cur < target else 'pgup')
