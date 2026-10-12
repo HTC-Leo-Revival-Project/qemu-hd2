@@ -14,7 +14,8 @@
  *         "fill SECONDS LAYERS noswap" times LAYERS of them without the
  *         buffer swap (and its wait for the display)
  *   mesh  a lit, textured, depth-tested sphere of 2 x 96 x 96 triangles
- *         (a game's vertex load); "mesh SECONDS GRID noswap"
+ *         (a game's vertex load); "mesh SECONDS GRID noswap";
+ *         GLTEST_DUMP=FILE saves the probed frame's pixels
  * Each scene prints read-back pixels and their expected values.
  */
 #include <dlfcn.h>
@@ -75,6 +76,23 @@ static void probe(const char *what, int x, int y, const char *expect)
     glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     printf("%-22s (%3d,%3d): %3d %3d %3d %3d   expect %s\n", what, x, y,
            px[0], px[1], px[2], px[3], expect);
+}
+
+/* GLTEST_DUMP=FILE: the frame's RGBA pixels (bottom row first) */
+static void dump_frame(void)
+{
+    const char *path = getenv("GLTEST_DUMP");
+    GLubyte *px;
+    FILE *f;
+
+    if (!path || !(f = fopen(path, "wb"))) {
+        return;
+    }
+    px = malloc(W * H * 4);
+    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    fwrite(px, 4, W * H, f);
+    fclose(f);
+    free(px);
 }
 
 static double now_ms(void)
@@ -452,9 +470,15 @@ static void scene_mesh(int frames, int g)
         glUniformMatrix4fv(mloc, 1, GL_FALSE, m);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glDrawElements(GL_TRIANGLES, ni, GL_UNSIGNED_SHORT, idx);
-        if (fr == 0) {
+        /*
+         * Not the first frame: the driver sets the render target bases to
+         * 0 before that frame's clear, which then misses the depth buffer
+         * (in GMEM, depth is what the last app left).
+         */
+        if (fr == 2) {
             probe("mesh centre", W / 2, H / 2, "lit checker");
             probe("mesh background", 5, 5, "26 26 26");
+            dump_frame();
         }
         present();
         if (fr) {

@@ -162,17 +162,28 @@ Then SurfaceFlinger, the boot animation and apps (hwui) all render on the emulat
 
 What is modelled:
 - the KGSL-facing hardware: interrupts, the GPU MMU, and the command processor running the ring buffer and indirect buffers (PM4 packets);
-- the a2xx shader core: an interpreter for the driver's compiled shader microcode, run on 16 lanes (batches of vertices, or 4x4 pixel blocks);
+- the a2xx shader core: the driver's compiled shader microcode, translated to GLSL for the host GPU, or interpreted on the CPU;
 - the 3D pipe: vertex fetch, triangles, strips, fans, rectangles, points and lines, clipping, scissors, perspective-correct interpolation, depth/stencil, alpha test and blending, rendered in bins into GMEM and resolved to memory;
 - textures: 8/16/32-bit and float formats, ETC1, ATC, DXT and 3DC, mipmaps with the Xenos layout (packed mip tails), bilinear/trilinear filtering, and tiled surfaces.
 
-It runs on the host CPU, with 6 rasterizer threads by default (`-global msm-adreno.threads=N`). Measured with the test programs below:
+There are two renderers (`-global msm-adreno.backend=gl|soft`):
+- **`gl`, the default: the host GPU**, through OpenGL 4.5 on a surfaceless EGL context, the way Xenia emulates the Xbox 360's Xenos (the Adreno 200's sibling). The guest's vertex and pixel shaders are translated from a2xx microcode to GLSL. GMEM, the 256 KiB of on-chip memory the driver renders bins into, is a host GPU buffer that the translated pixel shaders read and write themselves, in the guest's byte layout. Fragment shader interlock keeps those accesses in primitive order, as in Xenia's rasterizer-ordered-view render backend. So depth/stencil, blending, MSAA and the driver's fast clears (which reinterpret GMEM) behave exactly as in the software renderer. Textures are decoded to host textures and kept until QEMU's dirty-page tracking or the GPU's own writes show their memory changed. Resolves copy GMEM to memory when the commands are done, without waiting for the host GPU at every bin. It needs OpenGL 4.5 with `GL_ARB_fragment_shader_interlock` (NVIDIA, recent Intel); without it, QEMU says so and uses `soft`.
+- **`soft`: the CPU.** It interprets the shaders on 16 lanes, with 6 rasterizer threads (`-global msm-adreno.threads=N`).
 
-| Workload | Time per frame |
-|---|---|
-| Full-screen clear + one triangle | ~15 ms |
-| Spinning depth-tested cube | ~16 ms |
-| 8 full-screen blended, trilinear-textured layers | ~150 ms |
+Measured with the test programs below on an RTX 3080 (with the buffer swap, frames wait for the display's 60 Hz):
+
+| Workload | `soft` | `gl` |
+|---|---|---|
+| Full-screen clear + one triangle | ~15 ms | ~4 ms |
+| Spinning depth-tested cube | ~16 ms | ~16 ms (display) |
+| 8 full-screen blended, trilinear-textured layers | ~150 ms | ~18 ms (display); ~5 ms without the swap |
+| 64 such layers, without the swap | | ~33 ms (~750 Mpixels/s, about 5x a real Adreno 200) |
+| Lit, textured sphere of 18 432 triangles, without the swap | ~49 ms | ~3 ms |
+| The same with 51 200 triangles | | ~6.5 ms |
+
+Scrolling the Settings list, the GPU emulation costs about 0.4 ms of CPU and 0.9 ms of host GPU time per frame. The guest's own CPU work under TCG is now what limits apps.
+
+Rectangles and lines still have their vertices shaded on the CPU, and so do draws into memory instead of GMEM (the driver's texture copies and mipmap generation), which the `soft` renderer draws.
 
 Not modelled:
 - hardware video decode/encode (the QDSP6 video DAL), so video uses Android's software codecs;
@@ -185,8 +196,13 @@ Test programs (NDK r23, non-PIE; see the headers for build lines):
 Run them with SurfaceFlinger stopped (`adb shell stop`).
 
 Debugging:
-- `qom-set /machine/gpu trace FILE` logs every packet and draw, with screen-space vertices (`""` stops it);
-- `qom-set /machine/gpu dump GPUADDR,SIZE,FILE` saves GPU memory (`0xffffffff` saves GMEM).
+- `qom-set /machine/gpu trace FILE` logs every packet and draw, with screen-space vertices for the draws whose vertices the CPU shades, and the host GPU's programs and textures (`""` stops it);
+- `qom-set /machine/gpu dump GPUADDR,SIZE,FILE` saves GPU memory (`0xffffffff` saves GMEM; with `gl`, GMEM as of the last time the CPU needed it);
+- `ADRENO_STATS=SECONDS` prints where the GPU emulation's time goes, every few seconds;
+- `ADRENO_GL_DEBUG=1` reports OpenGL errors and saves every generated GLSL program in the working directory;
+- `ADRENO_GL_BARRIER=1` puts a memory barrier between all host draws, not only where the shader program changes.
+
+The driver points the render targets at GMEM offset 0 before the first frame's clear, so that clear misses the depth buffer. An app's first frame is therefore depth tested against whatever the previous app left in GMEM, with either renderer (and presumably on the phone).
 
 ## Processors
 
@@ -216,7 +232,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | FM radio | BCM4329 FM core via HCI `0xFC15` (tune, seek, RSSI, flags/interrupts, volume); audio through the codec aux loopback (DEX `0x51`) |
 | Audio | QDSP6 DAL playback → QEMU audio backend (verified bit-exact) |
 | Display | MDP 3.1 DMA_P scanout + PPP blitter; backlight via microP |
-| GPU | Adreno 200: command processor, MMU, a2xx shader interpreter, threaded rasterizer, GMEM bins and resolves, textures incl. ETC1/ATC (branch `adreno`; images built with `--gpu`). Otherwise the ICS software fallback (PixelFlinger). |
+| GPU | Adreno 200: command processor, MMU, a2xx shaders translated to GLSL and rendered on the host GPU (OpenGL 4.5), or interpreted with a threaded CPU rasterizer; GMEM bins and resolves, textures incl. ETC1/ATC (branch `adreno`; images built with `--gpu`). Otherwise the ICS software fallback (PixelFlinger). |
 | I2C | Touchscreen, microP (backlight, G-sensor, light sensor), battery gauge (charging and draining), PMIC, compass |
 | Buttons | GPIO key matrix + power key |
 | USB | HSUSB (ChipIdea) device controller with a built-in host. It enumerates the gadget and bridges adb to TCP. |
@@ -250,6 +266,6 @@ Not emulated:
 
 The Adreno 200 model is written from scratch for QEMU, but it stands on the work of these projects:
 - **[freedreno](https://docs.mesa3d.org/drivers/freedreno.html)** (Mesa; Rob Clark and contributors): the a2xx register and PM4 packet definitions (`registers/adreno/a2xx.xml`, `adreno_pm4.xml`), the a2xx shader instruction formats and disassembler (`ir2/instr-a2xx.h`, `disasm-a2xx.c`), and the a2xx driver (`gallium/drivers/freedreno/a2xx`). The driver shows how binning, resolves, fast clears and surface layouts work.
-- **[Xenia](https://xenia.jp)** (the Xbox 360 emulator, whose Xenos GPU shares the Adreno 200's design): the shader microcode definitions and interpreter semantics (`src/xenia/gpu/ucode.h`, `shader_interpreter.cc`), the command processor's packet handling, the tiled texture addressing (`texture_address.h`) and the packed mip tail layout (`texture_util.cc`).
+- **[Xenia](https://xenia.jp)** (the Xbox 360 emulator, whose Xenos GPU shares the Adreno 200's design): the shader microcode definitions and interpreter semantics (`src/xenia/gpu/ucode.h`, `shader_interpreter.cc`), the command processor's packet handling, the tiled texture addressing (`texture_address.h`) and the packed mip tail layout (`texture_util.cc`). The host GPU renderer follows Xenia's approach: microcode translated to host shaders (its DXBC and SPIR-V shader translators), and EDRAM emulated in a buffer that pixel shaders access in order through rasterizer-ordered views or fragment shader interlock (its ROV/FSI render backend).
 - **[texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder)**: the reference for decoding ATC (Adreno texture compression) blocks.
 - The kernel's KGSL driver (`drivers/gpu/msm` in the htcleo kernel) defines the register interface the model answers.
