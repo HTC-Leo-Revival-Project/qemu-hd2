@@ -754,8 +754,9 @@ static void htcleo_init(MachineState *machine)
         qdev_connect_gpio_out_named(s->csr, "a2m", i,
                                     qdev_get_gpio_in_named(s->modem, "a2m", i));
     }
-    for (int i = 0; i < 7 && !s->lle; i++) {
-        qdev_connect_gpio_out_named(s->modem, "m2a", i, vic_in[INT_A9_M2A_0 + i]);
+    for (int i = 0; i < 7; i++) {
+        qdev_connect_gpio_out_named(s->lle ? s->lle : s->modem, "m2a", i,
+                                    vic_in[INT_A9_M2A_0 + i]);
     }
     qdev_connect_gpio_out_named(s->modem, "m2a", M2A_DSP,
                                 vic_in[INT_ADSP_A11]);

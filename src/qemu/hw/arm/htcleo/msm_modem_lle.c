@@ -422,6 +422,9 @@ static void lle_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(s->tmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_TICK));
 
+    /* the modem's interrupts to the other processors: "m2a" 0-7 */
+    qdev_pass_gpios(s->tmr, DEVICE(s), "m2a");
+
     s->mdsp = lle_private_device(s, TYPE_MSM_MDSP, MODEM_MDSP_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->mdsp), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_MDSP));
