@@ -14,6 +14,8 @@ def packets(w, start=0):
             yield i, 'W3', [(h >> 16) & 0xff, (h >> 8) & 0xff, h & 0xff], w[i+1:i+4]; i += 4
         elif op == 0x08:        # memory -> reg
             yield i, 'MEM', [h & 0xffffff], w[i+1:i+3]; i += 3
+        elif op == 0x01:        # end of the command buffer
+            yield i, 'STOP', [], []; return
         elif op == 0x0a:
             yield i, 'END', [], []; i += 1
         elif op == 0x00 and h:
