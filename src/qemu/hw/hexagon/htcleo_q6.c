@@ -61,10 +61,12 @@
 #include "hw/hexagon/hexagon.h"
 #include "hw/hexagon/hexagon_globalreg.h"
 #include "hw/hexagon/hexagon_tlb.h"
+#include "hw/hexagon/htcleo_q6_vdc.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "exec/icount.h"
+#include "system/physmem.h"
 #include "elf.h"
 #include "cpu.h"
 
@@ -76,6 +78,16 @@
 #define Q6_TIMER_IRQ            3
 #define Q6_TIMER_HZ             32768       /* sleep clock */
 #define Q6_IPC_BASE             0xAB005000
+#define VDC_BASE                0xA1100000
+#define VDC_SIZE                0x5000
+#define VDC_STATUS              0x0010      /* bits 0-1: AXI/CRIF errors */
+#define VDC_STATUS_CLR          0x0018
+#define VDC_CP_ENABLE           0x4088
+#define VDC_CP_BUSY             0x408C      /* bit n: slot n queued */
+#define VDC_CP_ADDR0            0x4090
+#define VDC_CP_ADDR1            0x4094
+#define VDC_CP_DONE             0x4098      /* bit n: slot n done */
+#define VDC_CP_DONE_CLR         0x409C
 
 #define TAP_BASE                0x40000000ULL
 #define TAP_SIZE                0xC0000000ULL
@@ -105,6 +117,14 @@ struct HtcleoQ6MachineState {
     int32_t apps_irq, modem_irq;
     uint32_t smt_slice;
     MemoryRegion ipc_io;
+
+    /* the video decoder core ("Janus" VDC) */
+    MemoryRegion vdc_io;
+    uint32_t vdc_regs[VDC_SIZE / 4];
+    QEMUTimer *vdc_timer;
+    int32_t vdc_irq;
+    char *vdc_dump;             /* directory: one file per command buffer */
+    unsigned vdc_frames;
 };
 
 /* ---------------------------------------------------------------- */
@@ -126,7 +146,7 @@ static void tap_log(HtcleoQ6MachineState *s, hwaddr a, bool wr, uint64_t v,
         return;
     }
     n = GPOINTER_TO_UINT(g_hash_table_lookup(s->seen, key));
-    if (n >= TRACE_REPEATS) {
+    if (n >= TRACE_REPEATS && (a & ~0xfffULL) != 0xABF00000ULL) {
         return;
     }
     g_hash_table_insert(s->seen, key, GUINT_TO_POINTER(n + 1));
@@ -266,7 +286,8 @@ static void q6_link_send(HtcleoQ6MachineState *s, int line)
     uint8_t b = line;
 
     if (s->trace) {
-        qemu_log("q6-link: -> line %d pc %08x\n", line, q6_pc());
+        qemu_log("q6-link: %.3f -> line %d pc %08x\n",
+                 g_get_real_time() / 1e6, line, q6_pc());
     }
     qemu_chr_fe_write_all(&s->link, &b, 1);
 }
@@ -324,6 +345,160 @@ static const MemoryRegionOps q6_ipc_ops = {
 };
 
 /* ---------------------------------------------------------------- */
+/* Video decoder core                                                */
+/* ---------------------------------------------------------------- */
+
+#define VDC_REG(s, off) ((s)->vdc_regs[(off) / 4])
+
+#define VDC_CMD_MAX     0x40000     /* words */
+
+/*
+ * Command buffers are packet streams, header byte = opcode:
+ *   04 rrrrrr v         write register r
+ *   03 rrr sss v w      write registers r, s
+ *   02 rr ss tt u v w   write registers r, s, t
+ *   08 rrrrrr a n       feed n words from address a to register r
+ *                       (n bit 22: flag, low bits: count)
+ *   0a                  end of a pipeline step (one macroblock)
+ *   00 xxxxxx           (seen with 0x50, after the MB header)
+ * The first word is a header, the stream ends at a zero word.
+ */
+static void vdc_dump_buffer(HtcleoQ6MachineState *s, uint32_t addr)
+{
+    g_autofree uint32_t *w = g_new0(uint32_t, VDC_CMD_MAX);
+    g_autofree char *path = g_strdup_printf("%s/vdc%04u.bin", s->vdc_dump,
+                                            s->vdc_frames);
+    FILE *f = fopen(path, "wb");
+    unsigned n;
+
+    if (!f) {
+        return;
+    }
+    physical_memory_read(addr, w, VDC_CMD_MAX * 4);
+    for (n = 1; n < VDC_CMD_MAX && w[n]; ) {
+        uint32_t h = le32_to_cpu(w[n]);
+
+        if (h >> 24 == 0x01) {
+            n++;
+            break;
+        }
+
+        switch (h >> 24) {
+        case 0x04: n += 2; break;
+        case 0x03: n += 3; break;
+        case 0x02: n += 4; break;
+        case 0x08: n += 3; break;
+        default: n += 1; break;
+        }
+    }
+    fwrite(&addr, 4, 1, f);
+    fwrite(&n, 4, 1, f);
+    fwrite(w, 4, n, f);
+    /* then every block an 08 packet feeds: addr, words, data */
+    for (unsigned i = 1; i + 2 < n; ) {
+        uint32_t h = le32_to_cpu(w[i]);
+
+        if (h >> 24 == 0x08) {
+            uint32_t a = le32_to_cpu(w[i + 1]);
+            uint32_t cnt = le32_to_cpu(w[i + 2]) & 0xffff;
+            g_autofree uint32_t *blk = g_new(uint32_t, cnt);
+
+            physical_memory_read(a, blk, cnt * 4);
+            fwrite(&a, 4, 1, f);
+            fwrite(&cnt, 4, 1, f);
+            fwrite(blk, 4, cnt, f);
+        }
+        switch (h >> 24) {
+        case 0x04: i += 2; break;
+        case 0x03: i += 3; break;
+        case 0x02: i += 4; break;
+        case 0x08: i += 3; break;
+        default: i += 1; break;
+        }
+    }
+    fclose(f);
+}
+
+static void vdc_run(HtcleoQ6MachineState *s, int slot)
+{
+    uint32_t addr = VDC_REG(s, slot ? VDC_CP_ADDR1 : VDC_CP_ADDR0);
+
+    if (s->vdc_dump) {
+        vdc_dump_buffer(s, addr);
+    }
+    if (s->vdc_dump) {
+        g_autofree char *yuv = g_strdup_printf("%s/out%04u.yuv", s->vdc_dump,
+                                               s->vdc_frames);
+        htcleo_vdc_decode(addr, s->trace, yuv);
+    } else {
+        htcleo_vdc_decode(addr, s->trace, NULL);
+    }
+    s->vdc_frames++;
+
+    if (s->trace) {
+        qemu_log("q6-vdc: %.3f slot %d command buffer %08x\n",
+                 g_get_real_time() / 1e6, slot, addr);
+    }
+    VDC_REG(s, VDC_CP_DONE) |= 1u << slot;
+}
+
+static void vdc_kick(void *opaque)
+{
+    HtcleoQ6MachineState *s = opaque;
+    uint32_t pending = VDC_REG(s, VDC_CP_BUSY) & ~VDC_REG(s, VDC_CP_DONE) & 3;
+
+    if (!(VDC_REG(s, VDC_CP_ENABLE) & 1) || !pending) {
+        return;
+    }
+    for (int slot = 0; slot < 2; slot++) {
+        if (pending & (1u << slot)) {
+            vdc_run(s, slot);
+        }
+    }
+    if (s->vdc_irq >= 0) {
+        qemu_irq_pulse(qdev_get_gpio_in(DEVICE(s->cpu[0]), s->vdc_irq));
+    }
+}
+
+static uint64_t vdc_read(void *opaque, hwaddr off, unsigned size)
+{
+    HtcleoQ6MachineState *s = opaque;
+    uint32_t v = VDC_REG(s, off & ~3);
+
+    tap_log(s, VDC_BASE + off, false, v, size);
+    return v;
+}
+
+static void vdc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    HtcleoQ6MachineState *s = opaque;
+
+    tap_log(s, VDC_BASE + off, true, val, size);
+    switch (off) {
+    case VDC_STATUS_CLR:
+        VDC_REG(s, VDC_STATUS) &= ~val;
+        return;
+    case VDC_CP_DONE_CLR:
+        VDC_REG(s, VDC_CP_DONE) &= ~val;
+        return;
+    case VDC_CP_BUSY:
+        VDC_REG(s, off) = val;
+        /* the hardware takes a while; let the driver finish queueing */
+        timer_mod(s->vdc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  3 * SCALE_MS);
+        return;
+    }
+    VDC_REG(s, off) = val;
+}
+
+static const MemoryRegionOps vdc_ops = {
+    .read = vdc_read,
+    .write = vdc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* ---------------------------------------------------------------- */
 /* Machine                                                           */
 /* ---------------------------------------------------------------- */
 
@@ -369,6 +544,10 @@ static void htcleo_q6_init(MachineState *machine)
     memory_region_init_io(&s->ipc_io, OBJECT(machine), &q6_ipc_ops, s,
                           "q6-ipc", 0x8);
     memory_region_add_subregion(sysmem, Q6_IPC_BASE, &s->ipc_io);
+    memory_region_init_io(&s->vdc_io, OBJECT(machine), &vdc_ops, s, "q6-vdc",
+                          VDC_SIZE);
+    memory_region_add_subregion(sysmem, VDC_BASE, &s->vdc_io);
+    s->vdc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vdc_kick, s);
 
     glob = qdev_new(TYPE_HEXAGON_GLOBALREG);
     object_property_add_child(OBJECT(machine), "global-regs", OBJECT(glob));
@@ -418,6 +597,19 @@ static void htcleo_q6_init(MachineState *machine)
     }
 }
 
+static char *htcleo_q6_get_vdc_dump(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_Q6_MACHINE(obj)->vdc_dump);
+}
+
+static void htcleo_q6_set_vdc_dump(Object *obj, const char *v, Error **errp)
+{
+    HtcleoQ6MachineState *s = HTCLEO_Q6_MACHINE(obj);
+
+    g_free(s->vdc_dump);
+    s->vdc_dump = g_strdup(v);
+}
+
 static char *htcleo_q6_get_link(Object *obj, Error **errp)
 {
     return g_strdup(HTCLEO_Q6_MACHINE(obj)->link_id);
@@ -463,6 +655,9 @@ static void htcleo_q6_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     s->apps_irq = -1;
     s->modem_irq = -1;
+    s->vdc_irq = 16;
+    object_property_add(obj, "vdc-irq", "int32", htcleo_q6_get_irq,
+                        htcleo_q6_set_irq, NULL, &s->vdc_irq);
     object_property_add(obj, "apps-irq", "int32", htcleo_q6_get_irq,
                         htcleo_q6_set_irq, NULL, &s->apps_irq);
     object_property_add(obj, "modem-irq", "int32", htcleo_q6_get_irq,
@@ -488,6 +683,8 @@ static void htcleo_q6_class_init(ObjectClass *oc, const void *data)
                                    htcleo_q6_set_trace);
     object_class_property_add_str(oc, "link", htcleo_q6_get_link,
                                   htcleo_q6_set_link);
+    object_class_property_add_str(oc, "vdc-dump", htcleo_q6_get_vdc_dump,
+                                  htcleo_q6_set_vdc_dump);
 }
 
 static const TypeInfo htcleo_q6_info = {
