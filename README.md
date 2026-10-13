@@ -143,6 +143,29 @@ Debugging:
 - `tools/amss_dis.py` disassembles by AMSS virtual address (ARM or Thumb). `tools/amss_xref.py` finds the code that loads a literal, and `tools/amss_fatal.py` finds ERR_FATAL sites.
 - `QMON_CPU=1 tools/qmon.py` runs monitor commands on the modem core. gdb (multiprocess stub, inferior 2) works, but it slows AMSS enough to trip its watchdog.
 
+### Real DSP firmware (QDSP6)
+
+With `baseband=lle`, `tools/start-q6.sh` also runs the radio ROM's DSP1 image on the QDSP6, in a second process: `qemu-system-hexagon -M htcleo-q6`.
+```bash
+python3 tools/hd2_radio.py images/RUU_signed.nbh --dsp images/dsp1.elf
+tools/start-q6.sh
+```
+- The two processes share the DRAM through `images/dram.bin` and pass interrupt edges over the unix socket `images/q6link.sock`. The DSP stays in reset until the emulated OSBL has set up SMEM.
+- The Hexagon V2 cores run with `-icount` and a per-thread round-robin slice (`smt-slice`, default 64 instructions). Load-locked/store-conditional pairs behave like a reservation monitor across hardware threads.
+- The DSP's multimedia blocks:
+
+| Address | Block | DSP interrupt |
+|---|---|---|
+| 0xA1100000 | Janus video decoder (H.264): bit-exact against the JM reference decoder, including deblocking (`htcleo_q6_vdc.c`) | 16 |
+| 0xA1000000 | Janus video encoder (MPEG-4/H.263): the macroblock fetch pipeline. The firmware does the transform, quantisation and VLC itself. The motion search is not modelled: P macroblocks get a zero vector (`htcleo_q6_venc.c`) | 15 |
+| 0xA0700000 | audio interface DMA: 48 kHz stereo PCM to the QEMU audio backend (`htcleo_q6_audif.c`) | 12 |
+| 0xAB005000 | interrupts to the modem (+0) and apps (+4) cores | |
+
+- Android's Stagefright, Gallery and `recordvideo` use the DSP codecs, and audio plays through the DSP's front end. `Q6_AUDIO=none` mutes it; `-global htcleo-q6-audif.dump=FILE` saves the raw PCM.
+- `Q6_MACH=vdc-dump=DIR` saves every decoder/encoder command buffer with the blocks it feeds, plus the decoded pictures. `Q6_MACH=venc-test-pattern=on` paints a moving test picture over the camera input. `tools/vdc/` has a Python reference model and parsers for the command buffers.
+- The DSP1 firmware uses V2 encodings that QEMU's Hexagon decoder lacked (the ALU64 forms of `packhl`, `add:sat` and `sub:sat`). An unknown encoding now logs "undecodable packet" in `images/q6.log` and raises the guest's invalid-packet exception.
+- `contrib/plugins/hexhook.c` prints registers and memory at chosen DSP addresses, and logs the loads and stores of a code range.
+
 ### WiFi
 
 Turn WiFi on in Settings and connect to the open network **HD2-QEMU**. The phone gets 10.0.2.15 by DHCP and real internet through QEMU's user-mode network.
@@ -186,7 +209,7 @@ Scrolling the Settings list, the GPU emulation costs about 0.4 ms of CPU and 0.9
 Rectangles and lines still have their vertices shaded on the CPU, and so do draws into memory instead of GMEM (the driver's texture copies and mipmap generation), which the `soft` renderer draws.
 
 Not modelled:
-- hardware video decode/encode (the QDSP6 video DAL), so video uses Android's software codecs;
+- hardware video decode/encode unless the real DSP firmware runs (`tools/start-q6.sh`); otherwise video uses Android's software codecs;
 - occlusion queries and the Z180 2D core.
 
 Test programs (NDK r23, non-PIE; see the headers for build lines):
@@ -212,7 +235,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 |---|---|---|
 | Scorpion (ARMv7, Qualcomm's own core) | Apps processor: cLK, Linux, Android | **Low level.** The instructions run on a Cortex-A8 model with Qualcomm's MIDR and the Scorpion CP15 registers (PLL, L2). |
 | ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1) and Android boots on it. The secure boot stages are skipped and their hand-off is reproduced. The SIM works; the radio stack runs but finds no network, see below. |
-| QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, Android's "aDSP" | **High level.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. No Hexagon instructions run, so the DSP1 firmware image is never executed. With `baseband=lle` it acts as its own processor: it creates its SMD channels in AMSS's shared memory like the DSP firmware would. |
+| QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, video codecs, Android's "aDSP" | **High level by default.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. **Low level with `tools/start-q6.sh`** (`qdsp6=lle`): the real DSP1 firmware runs in `qemu-system-hexagon -M htcleo-q6`, with the video decoder/encoder cores and the audio DMA modelled under it. |
 | QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated** in HLE mode, where registration, calls and data are modelled above it. **High level in LLE mode** (`msm_mdsp.c`): AMSS downloads the mDSP image and its overlays into modelled memories; the model answers the boot handshake, master controller commands, WCDMA synchronous and search commands, and reports a receiver with no signal. No DSP instructions run. |
 
 ## Hardware status

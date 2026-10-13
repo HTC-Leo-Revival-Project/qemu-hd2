@@ -1,5 +1,13 @@
 # HD2 QEMU — session handoff (2026-10-12)
 
+## Real DSP firmware (qdsp6=lle), 2026-10-13
+`tools/start-q6.sh` runs AMSS on the modem core and the radio ROM's DSP1 on `qemu-system-hexagon -M htcleo-q6`, sharing `images/dram.bin`. README section "Real DSP firmware (QDSP6)" has the device map and tools.
+- H.264 decode (Janus VDC, `htcleo_q6_vdc.c`): bit-exact against JM; Stagefright/Gallery play.
+- Audio: the AFE's DMA (`htcleo_q6_audif.c`) reaches the host audio backend.
+- MPEG-4 encode (`htcleo_q6_venc.c`): `recordvideo` output decodes at 31-37 dB against the test pattern (`Q6_MACH=venc-test-pattern=on`, `tools/vdc/venc_psnr.py`). The core models the MB fetch pipeline; no motion search yet (zero vectors).
+- Hexagon fixes that the firmware needed: V2 ALU64 encodings of packhl/add:sat/sub:sat; undecodable packets were silently skipped (cause 0x15 raised as the INT5 event); `Rd = cmpy(Rd, Rt)`-style instructions read their own half-written destination.
+- Open: re-check the intermittent decoder crashes (`build-tmp/stress.sh`) after those fixes; motion search; then GSM/3G/GPS in LLE mode.
+
 ## Real baseband (baseband=lle), 2026-10-12, latest
 `tools/start-lle.sh` boots cLK, Linux and Android to the lock screen on the real AMSS 2.15.50.14 running on the ARM926 modem core. adb works and `sys.boot_completed` is 1. The README section "Real baseband firmware" has the device map, the reproduced OSBL hand-off and the debugging tools (`AMSSLOG=1` = the amsslog TCG plugin). Fixes along the way:
 - ADM SD0 page at 0xA9400000;
