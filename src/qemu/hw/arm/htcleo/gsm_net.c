@@ -1,7 +1,8 @@
 /*
  * A GSM cell and the network behind it, for the mDSP model (msm_mdsp.c)
  *
- * The cell (MCC 310, MNC 260, LAC 1, cell 1) broadcasts SI1-4 on its BCCH
+ * The cell (MCC 310, MNC 260, LAC 1, cell 1, RAC 1) broadcasts SI1-4 and
+ * SI13 (GPRS) on its BCCH
  * and pages, or assigns a channel to a RACH, on its CCCH (one CCCH
  * timeslot, not combined).  The channel it assigns is SDCCH/8 subchannel
  * 0 on timeslot 1, with SI5/SI6 on its SACCH.  On it the network runs
@@ -23,6 +24,7 @@
 #include "qemu/log.h"
 #include "qemu/bswap.h"
 #include "gsm_net.h"
+#include "gsm_gprs.h"
 
 #define L3_MAX          251             /* an L3 message, at most */
 #define L2_INFO         20              /* octets of L3 in an SDCCH frame */
@@ -67,6 +69,7 @@ struct GsmNet {
     bool trace;
     /* CCCH */
     uint8_t rach_ra;
+    bool rach_pkt;                      /* a packet access */
     uint32_t rach_fn;
     uint32_t ia_bfn;
     uint32_t page_bfn;
@@ -90,6 +93,7 @@ struct GsmNet {
     char *mt_call;                      /* calling number, to page for */
     bool hangup;
     GQueue events;
+    Gprs *gprs;
 };
 
 /*
@@ -104,7 +108,7 @@ static const uint8_t si3[GSM_BLOCK] = {
     0x2f,                               /* cell options: RLT 64 */
     0x45, 0x40,                         /* reselect hysteresis, NECI */
     0x70, 0x00, 0x00,                   /* RACH: max retrans, tx-integer */
-    0x2b, 0x2b, 0x2b, 0x2b,             /* rest octets */
+    0x2c, 0x2b, 0x2b, 0x2b,             /* rest octets: GPRS, SI13 on BCCH */
 };
 /* SI1: cell allocation (variable bit map, ARFCN 133), RACH control */
 static const uint8_t si1[GSM_BLOCK] = {
@@ -133,6 +137,77 @@ static const uint8_t page_none[GSM_BLOCK] = {
     0x15, 0x06, 0x21, 0x00, 0x01, 0xf0, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
     0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
 };
+/*
+ * CSN.1 rest octets: bits MSB first; L and H are the padding's bit at
+ * that position (0x2B repeated) and its inverse
+ */
+typedef struct BitWriter {
+    uint8_t *b;
+    unsigned n, max;
+} BitWriter;
+
+static void bw_bit(BitWriter *w, int v)
+{
+    if (w->n < 8 * w->max) {
+        uint8_t m = 0x80 >> (w->n % 8);
+
+        w->b[w->n / 8] = v ? w->b[w->n / 8] | m : w->b[w->n / 8] & ~m;
+        w->n++;
+    }
+}
+
+static void bw_bits(BitWriter *w, unsigned v, int len)
+{
+    while (len--) {
+        bw_bit(w, v >> len & 1);
+    }
+}
+
+static void bw_lh(BitWriter *w, bool h)
+{
+    bw_bit(w, (0x2b >> (7 - w->n % 8) & 1) ^ h);
+}
+
+/* SI13: GPRS on the BCCH's channel, RAC 1, network mode II */
+static void si13_build(uint8_t b[GSM_BLOCK])
+{
+    BitWriter w = { b + 3, 0, GSM_BLOCK - 3 };
+
+    memset(b, 0x2b, GSM_BLOCK);
+    b[0] = 0x01;                        /* L2 pseudo length 0 */
+    b[1] = 0x06;
+    b[2] = 0x00;                        /* SI13 */
+    bw_lh(&w, true);
+    bw_bits(&w, 1, 3);                  /* BCCH_CHANGE_MARK */
+    bw_bits(&w, 0, 4);                  /* SI_CHANGE_FIELD */
+    bw_bit(&w, 0);                      /* no SI13 change mark, GPRS MA */
+    bw_bit(&w, 0);                      /* no PBCCH: */
+    bw_bits(&w, GSM_RAC, 8);
+    bw_bit(&w, 0);                      /* SPGC_CCCH_SUP */
+    bw_bits(&w, 6, 3);                  /* PRIORITY_ACCESS_THR: all */
+    bw_bits(&w, 0, 2);                  /* NETWORK_CONTROL_ORDER NC0 */
+    /* GPRS cell options */
+    bw_bits(&w, 1, 2);                  /* NMO II */
+    bw_bits(&w, 3, 3);                  /* T3168 2 s */
+    bw_bits(&w, 2, 3);                  /* T3192 1.5 s */
+    bw_bits(&w, 3, 3);                  /* DRX_TIMER_MAX */
+    bw_bit(&w, 0);                      /* ACCESS_BURST_TYPE 8 bit */
+    bw_bit(&w, 1);                      /* CONTROL_ACK_TYPE: RLC/MAC block */
+    bw_bits(&w, 15, 4);                 /* BS_CV_MAX */
+    bw_bit(&w, 0);                      /* no PAN */
+    bw_bit(&w, 0);                      /* no extension */
+    /* GPRS power control parameters */
+    bw_bits(&w, 0, 4);                  /* ALPHA */
+    bw_bits(&w, 16, 5);                 /* T_AVG_W */
+    bw_bits(&w, 16, 5);                 /* T_AVG_T */
+    bw_bit(&w, 0);                      /* PC_MEAS_CHAN: BCCH */
+    bw_bits(&w, 15, 4);                 /* N_AVG_I */
+    bw_lh(&w, false);                   /* no release 99 additions */
+    while (w.n % 8) {
+        bw_lh(&w, false);
+    }
+}
+
 /* the SACCH: L1 header (power, timing advance), UI, then SI5 or SI6 */
 static const uint8_t si5[GSM_BLOCK] = {
     0x00, 0x00, 0x03, 0x03,
@@ -946,8 +1021,54 @@ static void imm_ass(GsmNet *n, uint8_t b[GSM_BLOCK])
     memcpy(b, m, sizeof(m));
 }
 
+/*
+ * IMMEDIATE ASSIGNMENT of an uplink TBF (one phase packet access): a PDCH
+ * on timeslot 3, dynamic allocation with USF GSM_USF, TFI 0, CS-1
+ */
+static void imm_ass_pkt(GsmNet *n, uint8_t b[GSM_BLOCK])
+{
+    uint32_t fn = n->rach_fn;
+    unsigned t1p = fn / 1326 % 32, t2 = fn % 26, t3 = fn % 51;
+    const uint8_t m[] = {
+        0x2d, 0x06, 0x3f,                   /* L2 pseudo length 11, RR, IA */
+        0x10,                               /* TBF, uplink; normal paging */
+        0x01 << 3 | GSM_PDCH_TN,            /* packet channel description */
+        GSM_TSC << 5 | (GSM_ARFCN >> 8 & 3), GSM_ARFCN & 0xff,
+        n->rach_ra, t1p << 3 | t3 >> 3, (t3 & 7) << 5 | t2,
+        0x00,                               /* timing advance */
+        0x00,                               /* mobile allocation: none */
+    };
+    BitWriter w = { b + sizeof(m), 0, GSM_BLOCK - sizeof(m) };
+
+    memset(b, 0x2b, GSM_BLOCK);
+    memcpy(b, m, sizeof(m));
+    /* IA rest octets: HH, Packet Uplink Assignment */
+    bw_lh(&w, true);
+    bw_lh(&w, true);
+    bw_bits(&w, 0, 2);
+    bw_bit(&w, 1);                      /* dynamic or fixed allocation */
+    bw_bits(&w, GSM_UL_TFI, 5);
+    bw_bit(&w, 0);                      /* POLLING */
+    bw_bit(&w, 0);                      /* dynamic allocation */
+    bw_bits(&w, GSM_USF, 3);
+    bw_bit(&w, 0);                      /* USF_GRANULARITY: one block */
+    bw_bit(&w, 0);                      /* no P0 */
+    bw_bits(&w, 0, 2);                  /* CHANNEL_CODING_COMMAND: CS-1 */
+    bw_bit(&w, 0);                      /* TLLI_BLOCK_CHANNEL_CODING: CS-1 */
+    bw_bit(&w, 0);                      /* no ALPHA */
+    bw_bits(&w, 0, 5);                  /* GAMMA */
+    bw_bit(&w, 0);                      /* no TIMING_ADVANCE_INDEX */
+    bw_bit(&w, 0);                      /* no TBF_STARTING_TIME */
+    bw_lh(&w, false);                   /* no release 99 additions */
+    while (w.n % 8) {
+        bw_lh(&w, false);
+    }
+}
+
 void gsm_net_rach(GsmNet *n, uint8_t ra, uint32_t l1_fn, uint32_t fn)
 {
+    /* 0111 1xxx one phase packet access, 0111 0xxx single block */
+    n->rach_pkt = (ra & 0xf0) == 0x70;
     n->rach_ra = ra;
     n->rach_fn = l1_fn;
     n->ia_bfn = ccch_after(fn + 2);
@@ -964,15 +1085,24 @@ void gsm_net_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK])
 {
     unsigned t3 = bfn % 51, tc = (bfn / 51) % 8;
     static const uint8_t *const bcch[8] = {
-        si1, si2, si3, si4, si3, si4, si3, si4,
+        si1, si2, si3, si4, NULL, si4, si3, si4,     /* TC 4: SI13 */
     };
 
-    if (t3 == 2) {
+    if (t3 == 2 && !bcch[tc]) {
+        si13_build(b);
+    } else if (t3 == 2) {
         memcpy(b, bcch[tc], GSM_BLOCK);
     } else if (n->ia_bfn && bfn == n->ia_bfn) {
-        imm_ass(n, b);
+        if (n->rach_pkt) {
+            imm_ass_pkt(n, b);
+            gprs_ul_assigned(n->gprs);
+        } else {
+            imm_ass(n, b);
+        }
         qemu_log_mask(LOG_UNIMP, "gsm-net: IMMEDIATE ASSIGNMENT in block"
                       " %u\n", bfn);
+    } else if (gprs_ccch_assignment(n->gprs, bfn, b)) {
+        /* a downlink TBF */
     } else if (n->page_left && n->mi[0]) {
         /* PAGING REQUEST TYPE 1 for the MS's IMSI, in every CCCH block */
         unsigned l = 3 + 1 + n->mi[0];
@@ -1045,6 +1175,10 @@ void gsm_net_ul(GsmNet *n, uint32_t fn, int chan, const uint8_t f[GSM_BLOCK])
         n->idle = 0;
     }
     if (chan == GSM_UL_SPEECH) {
+        return;
+    }
+    if (chan == GSM_UL_PDTCH) {
+        gprs_pdch_ul(n->gprs, fn, f);
         return;
     }
     if (chan == GSM_UL_SDCCH && t3 >= 47) {
@@ -1120,21 +1254,40 @@ char *gsm_net_events(GsmNet *n)
     return g_string_free(g, false);
 }
 
+void gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK])
+{
+    gprs_pdch_dl(n->gprs, bfn, b);
+}
+
+void gsm_net_from_host(GsmNet *n, const uint8_t *ip, size_t len)
+{
+    gprs_from_host(n->gprs, ip, len);
+}
+
+uint32_t gsm_net_ms_ip(GsmNet *n)
+{
+    return gprs_ms_ip(n->gprs);
+}
+
 void gsm_net_set_trace(GsmNet *n, bool on)
 {
     n->trace = on;
+    gprs_set_trace(n->gprs, on);
 }
 
 void gsm_net_reset(GsmNet *n)
 {
     net_free_channel(n);
+    gprs_reset(n->gprs);
     n->ia_bfn = n->page_left = 0;
 }
 
-GsmNet *gsm_net_new(void)
+GsmNet *gsm_net_new(void (*to_host)(void *opaque, const uint8_t *ip,
+                                    size_t len), void *opaque)
 {
     GsmNet *n = g_new0(GsmNet, 1);
 
+    n->gprs = gprs_new(to_host, opaque);
     n->l2[0].sapi = 0;
     n->l2[1].sapi = 3;
     g_queue_init(&n->mt_sms);

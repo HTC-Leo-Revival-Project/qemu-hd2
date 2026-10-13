@@ -36,6 +36,7 @@
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
+#include "net/net.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
@@ -523,6 +524,8 @@ static void lle_realize(DeviceState *dev, Error **errp)
 
     s->mdsp = qdev_new(TYPE_MSM_MDSP);
     object_property_add_child(OBJECT(dev), "mdsp", OBJECT(s->mdsp));
+    /* GPRS data goes to -nic ...,model=msm-modem (the HLE modem's) */
+    qemu_configure_nic_device(s->mdsp, false, "msm-modem");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mdsp), &error_fatal);
     memory_region_add_subregion(&s->mem, MODEM_MDSP_PHYS,
                     sysbus_mmio_get_region(SYS_BUS_DEVICE(s->mdsp), 0));

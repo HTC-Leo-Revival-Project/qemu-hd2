@@ -87,6 +87,9 @@
 #include "target/arm/cpu.h"
 #include "htcleo.h"
 #include "gsm_net.h"
+#include "net/net.h"
+#include "net/eth.h"
+#include "hw/core/qdev-properties.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 
@@ -156,6 +159,8 @@ struct MsmMdspState {
     int gsm_acq;                /* 0 idle, 1 searching, 2 tone posted */
     uint16_t gsm_acq_id;
     uint32_t gsm_acq_l1fn;      /* L1's frame number when it started */
+    NICConf nic_conf;           /* GPRS: the MS's IP packets */
+    NICState *nic;
     GsmNet *net;                /* the cell and network (gsm_net.c) */
     GHashTable *seen;
 };
@@ -194,6 +199,27 @@ static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     stw_le_p(s->mem + res, 0x8000 | (3 + 2 * n));
 }
 
+/*
+ * A PDCH burst's decode results besides the data (AMSS's 0xC85C66), at the
+ * word addresses in the command, each [ready, the command's sequence
+ * number, then per timeslot of the assignment a word]:
+ *   byte 12  the bursts scheduled: 0x8000 when a block was decoded (AMSS
+ *            reads it two frames on, for every burst)
+ *   byte 14  the decoded USFs: bit 15 valid, bits 2-0 the USF
+ */
+static void gsm_pdch_result(MsmMdspState *s, const uint8_t *cmd, int at,
+                            uint16_t seq, uint16_t val)
+{
+    uint32_t r = MEM_B + 2 * lduw_le_p(cmd + at);
+
+    if (r + 20 <= MEM_C) {
+        memset(s->mem + r, 0, 20);
+        stw_le_p(s->mem + r + 2, seq);
+        stw_le_p(s->mem + r + 4, val);
+        stw_le_p(s->mem + r, 1);
+    }
+}
+
 /* receive a block: its metrics and, on its last burst, its 23 octets */
 static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
 {
@@ -203,19 +229,29 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
     uint8_t b[GSM_BLOCK];
 
-    /* (14 halfwords on signalling channels, 18 on traffic channels) */
-    if (met + 36 > MEM_C || dat + 12 + 24 > MEM_C) {
+    /*
+     * The metrics: 14 halfwords set here (traffic channels have 18; AMSS
+     * keeps values of its own in the rest, which L1 tracking relies on)
+     */
+    if (met + 28 > MEM_C || dat + 12 + 24 > MEM_C) {
         return;
     }
-    memset(s->mem + met, 0, 36);
+    memset(s->mem + met, 0, 28);
     stw_le_p(s->mem + met + 2, seq);
     stw_le_p(s->mem + met + 6, 0x100);
     stw_le_p(s->mem + met + 8, 0x100);
     stw_le_p(s->mem + met, 1);
+    if ((lduw_le_p(cmd + 2) >> 8) == 0x0a) {
+        gsm_pdch_result(s, cmd, 12, seq, has_dat ? 0x8000 : 0);
+    }
     if (!has_dat) {
         return;
     }
-    if (gsm_net_dedicated(s->net)) {
+    if ((lduw_le_p(cmd + 2) >> 8) == 0x0a) {
+        /* a PDCH (byte 2: 0x0A40; 0x0C40 on other channels) */
+        gsm_net_pdch_dl(s->net, s->gsm_fn - 3, b);
+        gsm_pdch_result(s, cmd, 14, seq, 0x8000 | (b[0] & 7));
+    } else if (gsm_net_dedicated(s->net)) {
         /*
          * byte 22: bit 0 decode, bit 4 a traffic channel's SACCH, bit 12
          * first burst; the block's four reads end at this frame
@@ -267,8 +303,13 @@ static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
         gsm_net_rach(s->net, s->mem[e + 4], s->l1_fn, s->gsm_fn);
     } else {
         /* byte 14: 0x100 an entry, low byte the channel (GSM_UL_*) */
-        gsm_net_ul(s->net, s->gsm_fn, lduw_le_p(cmd + 14) & 0xff,
-                   s->mem + e + 4);
+        unsigned chan = lduw_le_p(cmd + 14) & 0xff;
+
+        gsm_net_ul(s->net, s->gsm_fn, chan, s->mem + e + 4);
+        if (chan == GSM_UL_PDTCH) {
+            /* sent (its USF came): the entry is free for the next block */
+            stw_le_p(s->mem + e, 0);
+        }
     }
 }
 
@@ -599,6 +640,77 @@ static char *mdsp_get_events(Object *obj, Error **errp)
     return gsm_net_events(MSM_MDSP(obj)->net);
 }
 
+/* ---- GPRS: the MS's IP packets, Ethernet to the host (-nic model=msm-modem) */
+
+static const uint8_t gw_mac[6] = { 0x52, 0x55, 0x0a, 0, 3, 2 };
+
+static void mdsp_to_host(void *opaque, const uint8_t *ip, size_t len)
+{
+    MsmMdspState *s = opaque;
+    g_autofree uint8_t *eth = g_malloc(14 + len);
+
+    if (!s->nic) {
+        return;
+    }
+    memcpy(eth, gw_mac, 6);
+    memcpy(eth + 6, s->nic_conf.macaddr.a, 6);
+    stw_be_p(eth + 12, ETH_P_IP);
+    memcpy(eth + 14, ip, len);
+    qemu_send_packet(qemu_get_queue(s->nic), eth, 14 + len);
+}
+
+static ssize_t mdsp_nic_receive(NetClientState *nc, const uint8_t *buf,
+                                size_t len)
+{
+    MsmMdspState *s = qemu_get_nic_opaque(nc);
+    uint32_t ip = gsm_net_ms_ip(s->net);
+
+    if (len < 14 || !ip) {
+        return len;
+    }
+    if (lduw_be_p(buf + 12) == ETH_P_ARP && len >= 42 &&
+        lduw_be_p(buf + 20) == 1 && ldl_be_p(buf + 38) == ip) {
+        /* who has the MS's address: we do */
+        uint8_t f[42];
+
+        memcpy(f, buf + 22, 6);
+        memcpy(f + 6, s->nic_conf.macaddr.a, 6);
+        stw_be_p(f + 12, ETH_P_ARP);
+        stw_be_p(f + 14, 1);
+        stw_be_p(f + 16, ETH_P_IP);
+        f[18] = 6;
+        f[19] = 4;
+        stw_be_p(f + 20, 2);
+        memcpy(f + 22, s->nic_conf.macaddr.a, 6);
+        stl_be_p(f + 28, ip);
+        memcpy(f + 32, buf + 22, 6);
+        memcpy(f + 38, buf + 28, 4);
+        qemu_send_packet(qemu_get_queue(s->nic), f, sizeof(f));
+    } else if (lduw_be_p(buf + 12) == ETH_P_IP) {
+        gsm_net_from_host(s->net, buf + 14, len - 14);
+    }
+    return len;
+}
+
+static NetClientInfo mdsp_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = mdsp_nic_receive,
+};
+
+static void mdsp_realize(DeviceState *dev, Error **errp)
+{
+    MsmMdspState *s = MSM_MDSP(dev);
+
+    qemu_macaddr_default_if_unset(&s->nic_conf.macaddr);
+    s->nic = qemu_new_nic(&mdsp_net_info, &s->nic_conf, TYPE_MSM_MDSP, NULL,
+                          &dev->mem_reentrancy_guard, s);
+}
+
+static const Property mdsp_props[] = {
+    DEFINE_NIC_PROPERTIES(MsmMdspState, nic_conf),
+};
+
 static void mdsp_init(Object *obj)
 {
     MsmMdspState *s = MSM_MDSP(obj);
@@ -611,7 +723,7 @@ static void mdsp_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), mdsp_gsm_frame, "frame", 2);
     s->search = timer_new_ns(QEMU_CLOCK_VIRTUAL, mdsp_search_done, s);
     s->seen = g_hash_table_new(g_direct_hash, g_direct_equal);
-    s->net = gsm_net_new();
+    s->net = gsm_net_new(mdsp_to_host, s);
     object_property_add_bool(obj, "trace", mdsp_get_trace, mdsp_set_trace);
     object_property_add_str(obj, "sms", mdsp_get_sms, mdsp_set_sms);
     object_property_add_str(obj, "call", mdsp_get_call, mdsp_set_call);
@@ -621,7 +733,11 @@ static void mdsp_init(Object *obj)
 
 static void mdsp_class_init(ObjectClass *oc, const void *data)
 {
-    device_class_set_legacy_reset(DEVICE_CLASS(oc), mdsp_reset);
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    device_class_set_legacy_reset(dc, mdsp_reset);
+    dc->realize = mdsp_realize;
+    device_class_set_props(dc, mdsp_props);
 }
 
 static const TypeInfo msm_mdsp_info = {
