@@ -342,7 +342,7 @@ const EmulatorShell = () => {
         ]}
       >
         <p className="px-4 py-5 text-[15px] leading-6 text-holo-text-2">
-          The emulator is running with the previous settings. Restarting QEMU applies the new ones; Android boots again from the start.
+          The emulator is running with the previous settings. Restarting QEMU applies the new ones; the phone boots again from the start.
         </p>
       </Dialog>
       <Toast text={toast} />

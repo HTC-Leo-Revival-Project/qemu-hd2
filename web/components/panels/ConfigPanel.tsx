@@ -17,6 +17,14 @@ type Props = {
 export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
   const nands = images.filter((i) => i.kind === "nand");
   const sds = images.filter((i) => i.kind === "sdcard");
+  /* a stock Windows Mobile ROM: it runs on the real baseband and boots without the cLK menu */
+  const winmo = nands.some((i) => i.name === config.nand && i.os === "winmo");
+
+  const setNand = (nand: string) => {
+    const patch: Partial<EmulatorConfig> = { nand };
+    if (nands.some((i) => i.name === nand && i.os === "winmo")) Object.assign(patch, { baseband: "lle", dsp: "hle" });
+    onChange(patch);
+  };
 
   const setBaseband = (baseband: EmulatorConfig["baseband"]) => {
     const patch: Partial<EmulatorConfig> = { baseband };
@@ -30,11 +38,16 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
   };
 
   const basebandChoices: Choice<EmulatorConfig["baseband"]>[] = [
-    { value: "hle", label: "Modelled (HLE)", summary: "Fast. Network registration, data, SMS and GPS fixes work." },
+    {
+      value: "hle",
+      label: "Modelled (HLE)",
+      summary: winmo ? "Not for Windows Mobile" : "Fast. Network registration, data, SMS and GPS fixes work.",
+      disabled: winmo,
+    },
     {
       value: "lle",
       label: "Real AMSS firmware (LLE)",
-      summary: firmware.amss ? "The radio ROM's own ARM9 code. No network signal." : "Needs images/amss.elf",
+      summary: firmware.amss ? "The radio ROM's own ARM9 code on a modelled GSM network: calls, texts, GPRS data" : "Needs images/amss.elf",
       disabled: !firmware.amss,
     },
   ];
@@ -58,10 +71,11 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
         icon={<Cpu {...I} />}
         value={config.dsp}
         choices={dspChoices}
-        disabled={config.baseband !== "lle"}
+        disabled={config.baseband !== "lle" || winmo}
         onChange={(dsp) => onChange({ dsp })}
       />
       {config.baseband !== "lle" && <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">The DSP firmware runs on top of the real baseband.</p>}
+      {winmo && <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">Windows Mobile runs without the DSP firmware.</p>}
       {config.dsp === "lle" && (
         <>
           <Divider />
@@ -87,8 +101,8 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
         title="NAND flash"
         icon={<MemoryStick {...I} />}
         value={config.nand}
-        choices={nands.map((n) => ({ value: n.name, label: n.name, summary: gb(n.size) }))}
-        onChange={(nand) => onChange({ nand })}
+        choices={nands.map((n) => ({ value: n.name, label: n.name, summary: n.os === "winmo" ? `Windows Mobile 6.5, ${gb(n.size)}` : gb(n.size) }))}
+        onChange={setNand}
       />
       <Divider />
       <ListPref
@@ -102,6 +116,7 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
       <ListPref
         title="Boot"
         icon={<Layers {...I} />}
+        disabled={winmo}
         value={config.boot}
         choices={[
           { value: "nand", label: "Boot from NAND", summary: "Picks BOOT FROM NAND in the cLK menu" },
@@ -110,6 +125,7 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
         ]}
         onChange={(boot) => onChange({ boot })}
       />
+      {winmo && <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">Windows Mobile boots straight from NAND, as after the HTC bootloader.</p>}
 
       <Category>Graphics and sound</Category>
       <ListPref

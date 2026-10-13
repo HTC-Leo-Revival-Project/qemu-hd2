@@ -38,6 +38,7 @@ qemu-system-hexagon ──VNC (audio only, qdsp6=lle)─────────
 - **QMP**: the UI uses its own sockets (`images/webqmp.sock`, `q6webqmp.sock`), so `tools/keys.py`, `touch.py` and `qmon.py` keep working on `qmp.sock`.
 - QEMU runs in its own process group: restarting the web server leaves it running, and the next server attaches to it again. An emulator started with `tools/start*.sh` is attached too, but without a picture, since it has no VNC socket.
 - Settings are saved in `web/.emulator.json`.
+- NAND images are listed from `images/`. A stock Windows Mobile 6.5 ROM (its WinCE MBR lists ULDR first) shows as "Windows Mobile 6.5": it always runs on the real baseband (LLE) without the DSP firmware, and boots straight from NAND (the machine loads the ROM's XIP partition, as the HTC SPL does), so the cLK boot choices do not apply.
 - With the real DSP, the UI runs qemu-system-hexagon with `-icount shift=auto` by default, so the DSP's virtual clock follows real time. With a fixed shift, the DSP's audio DMA runs at about half speed while the DSP is busy. `Q6_ARGS=… npm run dev` adds arguments to the Hexagon process, as in `tools/start-q6.sh`.
 
 ## Keyboard (screen focused)
