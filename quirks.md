@@ -10,32 +10,23 @@ and fails within seconds when a QEMU dies, or when a proc_comm command stays
 unanswered (below), printing the apps and modem cores' state, the pending
 command, the modem VIC and every DSP thread's interrupt state.
 
-### Rare boot hang: a proc_comm command AMSS never answers
+### Boot/run hang: a proc_comm command AMSS never answered (fixed)
 
-- Symptom: the kernel console stops (often during a YAFFS mount); Linux
-  spins in its proc_comm wait loop (apps PC in `__delay`, return address
-  0xc0079500) with `APP_COMMAND` at SMEM 0x100000 stuck at 0x32/0x33
-  (`CLK_REGIME_SEC_ENABLE`/`DISABLE`, clock 0x13, the clock Linux's NAND
-  driver votes for around every NAND command). AMSS sits in its idle loop
-  with nothing pending at its VIC; the DSP is idle with nothing pending
-  either. Recover by rebooting.
-- Frequency: about 1 boot in 10 in testing. It needs heavy proc_comm
-  traffic, which a YAFFS mount without a checkpoint makes (thousands of
-  calls); since `boot-q6.sh` remounts the YAFFS partitions read-only before
-  killing the emulator (writing the checkpoints), it is rarer: the last 11
-  boots of testing were clean. `NO_CHECKPOINT=1` skips the remount to
-  provoke it.
-- What is known: the apps doorbell (A2M 6, modem VIC line 62, edge
-  triggered) arrives; normally AMSS takes it as: L4 kernel reads the vector
-  twice (PC 0xf0012cbc), AMSS's interrupt code disables the line (0x9d18cc),
-  clears it twice (0x9d1924) and re-enables it (0x9d1852). In a hang the
-  doorbell came 2 us after the previous one's last clear, while AMSS was
-  still finishing it; the vector was read once and the line cleared, and
-  the command was never processed. Probably a race that the real ARM9's
-  timing hides (Linux on its own host thread answers within microseconds).
-- Tools: `-global msm-vic.watch=62` keeps the last 256 events of that line
-  (edges, vector reads, clears, enables, with the accessing PC); read them
-  with `qom-get /machine/unattached/device[0] watch-log` (tools/qmon.py).
+- Symptom: Linux spun in its proc_comm wait loop (apps PC in `__delay`,
+  return address 0xc0079500) with `APP_COMMAND` at SMEM 0x100000 stuck,
+  usually 0x32/0x33 (clock regime enable/disable); AMSS and the DSP idle.
+  Without the radio up, GSM never started either.
+- Cause: AMSS's interrupt glue (tramp_l4.c) masks a line while its
+  handler runs and unmasks it just before marking the handler done; a
+  doorbell dispatched in between is taken for a nested interrupt and
+  dropped. On the phone the next proc_comm cannot ring that early; here
+  the apps core runs on its own host thread and sometimes did.
+- Fix: the modem VIC holds apps doorbells (lines 56-63) that ring while
+  the line is masked and latches them 100 us after it is unmasked
+  (msm_vic.c "redeliver"). No hang in the boots tested since.
+- If it ever comes back, `tools/boot-q6.sh` reports it within seconds;
+  `-global msm-vic.watch=62` plus `qom-get /machine/unattached/device[0]
+  watch-log` shows line 62's last 256 events with the accessing PCs.
 
 ### Slow boots after an unclean stop
 
