@@ -62,6 +62,16 @@
  *              RF words]; the results at that address: [0x8000 (ready)
  *              | 3 + 2n, the buffer's sequence number, 0, then each
  *              measurement's energy, high half first]
+ *   4          receive; with type 3 (word 8) it starts an acquisition: the
+ *              DSP looks for the cell's tone (FCCH, frames 0/10/20/30/40 of
+ *              the 51-multiframe) and posts it to a ring of three 8-halfword
+ *              entries at B+0x7B4 (write index B+0xADC, AMSS's read index
+ *              B+0xADA): [id, timing (32 bits), ?, frequency error, ?, ?,
+ *              SNR >= 8]; the SCH of the next frame goes to a ring of three
+ *              11-halfword entries at B+0xA7C (write B+0xAE0, read B+0xADE):
+ *              [id (the tone's), status (bit 1 CRC OK), ?, ?, payload
+ *              length 2, the 25 SCH bits as 4 bytes (BSIC, T1, T2, T3'),
+ *              timing (32 bits), ?, ?]
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -108,7 +118,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define B_GSM_CMDBUF1   (MEM_B + 0x6024)
 #define GSM_CMDBUF_SIZE 0xF8
 #define GSM_CMD_PWR     20
+#define GSM_CMD_RX      4               /* receive; type 3: acquisition */
+#define GSM_RX_ACQ      3
+#define GSM_CMD_STOP    8               /* (seen ending searches) */
+/* the acquisition results: rings of 3, the DSP's write index, AMSS's read */
+#define B_FCCH_RING     (MEM_B + 0x7B4)     /* 8 halfwords each */
+#define B_FCCH_WR       (MEM_B + 0xADC)
+#define B_SCH_RING      (MEM_B + 0xA7C)     /* 11 halfwords each */
+#define B_SCH_WR        (MEM_B + 0xAE0)
+#define GSM_BSIC        0x0A                /* NCC 1, BCC 2 */
+#define GSM_FCCH_SNR    0x400
 #define GSM_NOISE       0x40            /* energy of an empty channel */
+#define GSM_CELL        0x186a0         /* energy of the cell */
 #define DB_MC           (1u << 19)
 #define DB_SYNC         (1u << 15)
 #define CTL_DOORBELL    0x08
@@ -122,6 +143,9 @@ struct MsmMdspState {
     uint32_t ctl;
     uint32_t ctl_regs[0x400];
     bool trace;                 /* log doorbells and first writes (+PC) */
+    uint32_t gsm_fn;            /* the cell's frame number */
+    int gsm_acq;                /* 0 idle, 1 searching, 2 tone posted */
+    uint16_t gsm_acq_id;
     GHashTable *seen;
 };
 
@@ -144,7 +168,7 @@ static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     stw_le_p(s->mem + res + 4, 0);
     for (unsigned i = 0; i < n; i++) {
         uint16_t arfcn = lduw_le_p(cmd + 10 + 8 * i);
-        uint32_t e = GSM_NOISE;
+        uint32_t e = GSM_CELL;   /* XXX every ARFCN, until the RF tuning is decoded */
 
         if (s->trace) {
             qemu_log("msm-mdsp: gsm power seq %04x res %04x n %u #%u pos %04x"
@@ -159,13 +183,66 @@ static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     stw_le_p(s->mem + res, 0x8000 | (3 + 2 * n));
 }
 
+/* the SCH's 25 bits for frame fn: BSIC, T1, T2, T3' (AMSS's 0xF9F41A) */
+static void gsm_sch_bits(uint32_t fn, uint8_t b[4])
+{
+    unsigned t1 = fn / 1326, t2 = fn % 26, t3p = (fn % 51 - 1) / 10;
+
+    b[0] = GSM_BSIC << 2 | (t1 >> 9 & 3);
+    b[1] = t1 >> 1;
+    b[2] = (t1 & 1) << 7 | t2 << 2 | (t3p >> 1 & 3);
+    b[3] = t3p & 1;
+}
+
+/* acquisition: the tone (FCCH) of the cell, then its SCH a frame later */
+static void gsm_acq_frame(MsmMdspState *s)
+{
+    unsigned t3 = s->gsm_fn % 51;
+
+    if (s->gsm_acq == 1 && t3 % 10 == 0 && t3 != 50) {
+        uint16_t wr = lduw_le_p(s->mem + B_FCCH_WR);
+        uint8_t *e = s->mem + B_FCCH_RING + 16 * (wr % 3);
+
+        memset(e, 0, 16);
+        stw_le_p(e + 0, ++s->gsm_acq_id);
+        stw_le_p(e + 14, GSM_FCCH_SNR);     /* >= 8 or it is rejected */
+        stw_le_p(s->mem + B_FCCH_WR, wr + 1);
+        s->gsm_acq = 2;
+        if (s->trace) {
+            qemu_log("msm-mdsp: gsm tone id %u fn %u\n", s->gsm_acq_id,
+                     s->gsm_fn);
+        }
+    } else if (s->gsm_acq == 2 && t3 % 10 == 1) {
+        uint16_t wr = lduw_le_p(s->mem + B_SCH_WR);
+        uint8_t *e = s->mem + B_SCH_RING + 22 * (wr % 3);
+        uint8_t b[4];
+
+        gsm_sch_bits(s->gsm_fn, b);
+        memset(e, 0, 22);
+        stw_le_p(e + 0, s->gsm_acq_id);
+        stw_le_p(e + 2, 2);             /* bit 1: CRC OK */
+        stw_le_p(e + 8, 2);             /* payload halfwords */
+        memcpy(e + 10, b, 4);
+        stw_le_p(s->mem + B_SCH_WR, wr + 1);
+        s->gsm_acq = 0;
+        if (s->trace) {
+            qemu_log("msm-mdsp: gsm sch id %u fn %u %02x%02x%02x%02x\n",
+                     s->gsm_acq_id, s->gsm_fn, b[0], b[1], b[2], b[3]);
+        }
+    }
+}
+
 /* a GSM frame starts: run the commands queued for it */
 static void mdsp_gsm_frame(void *opaque, int n, int level)
 {
     MsmMdspState *s = opaque;
     static const uint32_t bufs[2] = { B_GSM_CMDBUF0, B_GSM_CMDBUF1 };
 
-    if (!level || s->ctl != CTL_RUN || lduw_le_p(s->mem + MEM_A) != IMG_1406 ||
+    if (!level) {
+        return;
+    }
+    s->gsm_fn = (s->gsm_fn + 1) % 2715648;
+    if (s->ctl != CTL_RUN || lduw_le_p(s->mem + MEM_A) != IMG_1406 ||
         !lduw_le_p(s->mem + B_GSM_READY)) {
         return;
     }
@@ -189,13 +266,25 @@ static void mdsp_gsm_frame(void *opaque, int n, int level)
             }
             if (id == GSM_CMD_PWR) {
                 gsm_power(s, seq, buf + off);
-            } else if (s->trace) {
-                qemu_log("msm-mdsp: gsm cmd %u seq %04x\n", id, seq);
+            } else if (id == GSM_CMD_RX &&
+                       lduw_le_p(buf + off + 16) == GSM_RX_ACQ) {
+                s->gsm_acq = 1;
+            }
+            if (id != GSM_CMD_PWR && s->trace) {
+                GString *g = g_string_new(NULL);
+
+                for (unsigned k = 2; k < len; k += 2) {
+                    g_string_append_printf(g, " %04x",
+                                           lduw_le_p(buf + off + k));
+                }
+                qemu_log("msm-mdsp: gsm cmd %u seq %04x:%s\n", id, seq, g->str);
+                g_string_free(g, true);
             }
             off += len;
         }
         stw_le_p(buf, 0);
     }
+    gsm_acq_frame(s);
 }
 
 static void mdsp_boot(MsmMdspState *s)
