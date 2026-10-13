@@ -1060,7 +1060,7 @@ static void imm_ass_pkt(GsmNet *n, uint8_t b[GSM_BLOCK])
     bw_bits(&w, GSM_USF, 3);
     bw_bit(&w, 0);                      /* USF_GRANULARITY: one block */
     bw_bit(&w, 0);                      /* no P0 */
-    bw_bits(&w, 0, 2);                  /* CHANNEL_CODING_COMMAND: CS-1 */
+    bw_bits(&w, gprs_cs(n->gprs), 2);   /* CHANNEL_CODING_COMMAND */
     bw_bit(&w, 0);                      /* TLLI_BLOCK_CHANNEL_CODING: CS-1 */
     bw_bit(&w, 0);                      /* no ALPHA */
     bw_bits(&w, 0, 5);                  /* GAMMA */
@@ -1185,7 +1185,7 @@ void gsm_net_ul(GsmNet *n, uint32_t fn, int chan, const uint8_t f[GSM_BLOCK])
         return;
     }
     if (chan == GSM_UL_PDTCH) {
-        gprs_pdch_ul(n->gprs, fn, f);
+        gprs_pdch_ul(n->gprs, fn, f, 0);
         return;
     }
     if (chan == GSM_UL_SDCCH && t3 >= 47) {
@@ -1261,9 +1261,19 @@ char *gsm_net_events(GsmNet *n)
     return g_string_free(g, false);
 }
 
-void gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK])
+int gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_PDCH_BLOCK])
 {
-    gprs_pdch_dl(n->gprs, bfn, b);
+    return gprs_pdch_dl(n->gprs, bfn, b);
+}
+
+void gsm_net_pdch_ul(GsmNet *n, uint32_t fn, const uint8_t *b, int cs)
+{
+    gprs_pdch_ul(n->gprs, fn, b, cs);
+}
+
+void gsm_net_set_gprs_cs(GsmNet *n, int cs)
+{
+    gprs_set_cs(n->gprs, cs);
 }
 
 void gsm_net_from_host(GsmNet *n, const uint8_t *ip, size_t len)

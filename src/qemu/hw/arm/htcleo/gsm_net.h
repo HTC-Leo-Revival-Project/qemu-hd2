@@ -7,6 +7,7 @@
 #define HW_ARM_HTCLEO_GSM_NET_H
 
 #define GSM_BLOCK       23              /* octets of a signalling block */
+#define GSM_PDCH_BLOCK  53              /* of a packet data block (CS-4) */
 #define GSM_ARFCN       133             /* the cell's, in its allocation */
 #define GSM_BSIC        0x0A            /* NCC 1, BCC 2 */
 #define GSM_TSC         2               /* = BCC */
@@ -41,8 +42,14 @@ int gsm_net_ded_dl(GsmNet *n, uint32_t bfn, bool sacch, uint8_t b[GSM_BLOCK]);
 /* an uplink block sent at cell frame fn on the dedicated channel */
 enum { GSM_UL_SPEECH = 0, GSM_UL_SDCCH = 4, GSM_UL_FACCH = 5, GSM_UL_PDTCH = 8 };
 void gsm_net_ul(GsmNet *n, uint32_t fn, int chan, const uint8_t f[GSM_BLOCK]);
-/* the PDCH's downlink block that starts at frame bfn */
-void gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK]);
+/*
+ * the PDCH's downlink block that starts at frame bfn, and its coding
+ * scheme (0-3: CS-1 to CS-4); an uplink one, sent at frame fn
+ */
+int gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_PDCH_BLOCK]);
+void gsm_net_pdch_ul(GsmNet *n, uint32_t fn, const uint8_t *b, int cs);
+/* the coding scheme the network uses for packet data (0-3) */
+void gsm_net_set_gprs_cs(GsmNet *n, int cs);
 /* an IP packet from the host for the MS; the MS's address (0: none) */
 void gsm_net_from_host(GsmNet *n, const uint8_t *ip, size_t len);
 uint32_t gsm_net_ms_ip(GsmNet *n);

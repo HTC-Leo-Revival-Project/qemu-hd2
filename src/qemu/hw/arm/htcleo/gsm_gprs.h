@@ -20,9 +20,15 @@ void gprs_set_trace(Gprs *g, bool on);
 void gprs_ul_assigned(Gprs *g);
 /* an IMMEDIATE ASSIGNMENT of a downlink TBF to send on the CCCH */
 bool gprs_ccch_assignment(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK]);
-/* the PDCH's downlink block that starts at frame fn; and an uplink one */
-void gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK]);
-void gprs_pdch_ul(Gprs *g, uint32_t fn, const uint8_t b[GSM_BLOCK]);
+/*
+ * the PDCH's downlink block that starts at frame fn, returning its coding
+ * scheme (0-3: CS-1 to CS-4); an uplink one, in coding scheme cs
+ */
+int gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_PDCH_BLOCK]);
+void gprs_pdch_ul(Gprs *g, uint32_t fn, const uint8_t *b, int cs);
+/* the coding scheme for data blocks, both ways */
+void gprs_set_cs(Gprs *g, int cs);
+int gprs_cs(Gprs *g);
 /* an IP packet from the host for the MS */
 void gprs_from_host(Gprs *g, const uint8_t *ip, size_t len);
 /* the MS's address, 0 while no PDP context is active */

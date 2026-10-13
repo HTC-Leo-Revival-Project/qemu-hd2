@@ -81,6 +81,7 @@
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/cpu.h"
@@ -167,6 +168,9 @@ struct MsmMdspState {
 };
 
 /* the commands' lengths in bytes, by id (AMSS's table at 0x1E1EAC4) */
+/* a packet data block's halfwords in the mDSP, CS-1 to CS-4 */
+static const uint8_t gsm_pdch_hw[4] = { 12, 17, 20, 27 };
+
 static const uint8_t gsm_cmd_len[31] = {
     [2] = 22, [4] = 22, [5] = 8, [6] = 24, [7] = 2, [8] = 4, [11] = 8,
     [12] = 14, [13] = 8, [14] = 8, [16] = 4, [17] = 10, [20] = 64,
@@ -228,13 +232,14 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     bool has_dat = lduw_le_p(cmd + 24) != 0xffff;
     int kind = GSM_DL_SIGNAL;
     uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
-    uint8_t b[GSM_BLOCK];
+    uint8_t b[GSM_PDCH_BLOCK + 1] = {};
+    int cs = -1;
 
     /*
      * The metrics: 14 halfwords set here (traffic channels have 18; AMSS
      * keeps values of its own in the rest, which L1 tracking relies on)
      */
-    if (met + 28 > MEM_C || dat + 12 + 24 > MEM_C) {
+    if (met + 28 > MEM_C || dat + 12 + 2 * gsm_pdch_hw[3] > MEM_C) {
         return;
     }
     memset(s->mem + met, 0, 28);
@@ -250,7 +255,7 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     }
     if ((lduw_le_p(cmd + 2) >> 8) == 0x0a) {
         /* a PDCH (byte 2: 0x0A40; 0x0C40 on other channels) */
-        gsm_net_pdch_dl(s->net, s->gsm_fn - 3, b);
+        cs = gsm_net_pdch_dl(s->net, s->gsm_fn - 3, b);
         gsm_pdch_result(s, cmd, 14, seq, 0x8000 | (b[0] & 7));
     } else if (gsm_net_dedicated(s->net)) {
         /*
@@ -263,11 +268,22 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
         gsm_net_dl(s->net, gsm_net_block_fn(s->gsm_fn), b);
     }
     /*
-     * [length in halfwords with this header, seq, frame type, status (bit
-     * 1: CRC OK; bits 15-13 PDCH), ?, ?].  The frame type on a traffic
-     * channel (AMSS's 0xC8C7E4): bit 0 a FACCH frame, else speech (bits
-     * 2-5 other kinds: SID, ...); on signalling channels bit 0 is not set.
+     * [length in halfwords with this header, seq, frame type, status, ?,
+     * ?].  The status: bit 1 CRC OK, bits 6-3 a packet data block's coding
+     * scheme (L1 takes its length from it, AMSS's 0x1071A9C: CS-1 to 4,
+     * then MCS-1 to 9), bits 15-13 the buffer's tag.  The frame type on a
+     * traffic channel (AMSS's 0xC8C7E4): bit 0 a FACCH frame, else speech
+     * (bits 2-5 other kinds: SID, ...); on signalling channels bit 0 is
+     * not set.
      */
+    if (cs >= 0) {
+        memset(s->mem + dat, 0, 12 + 2 * gsm_pdch_hw[3]);
+        memcpy(s->mem + dat + 12, b, 2 * gsm_pdch_hw[cs]);
+        stw_le_p(s->mem + dat + 2, seq);
+        stw_le_p(s->mem + dat + 6, 2 | cs << 3);
+        stw_le_p(s->mem + dat, 6 + gsm_pdch_hw[cs]);
+        return;
+    }
     memset(s->mem + dat, 0, 12 + 24);
     if (kind != GSM_DL_SPEECH) {
         memcpy(s->mem + dat + 12, b, GSM_BLOCK);
@@ -281,7 +297,8 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
 /*
  * a burst goes out (command 30): byte 12 the number of entries (up to 2),
  * then for each [flags, word address of the entry].  The flags: bit 8 an
- * entry, the low byte the channel (GSM_UL_*), bits 14-12 the uplink slot
+ * entry, the low byte the channel (GSM_UL_*; packet data GSM_UL_PDTCH plus
+ * the coding scheme), bits 14-12 the uplink slot
  * of a multislot allocation, bit 15 a poll's answer (it goes before a
  * block the slot's USF asked for).  The entry is [length, type, data]: a
  * RACH's [4, 6, RA], a signalling block's [15, 1, 23 octets], a speech
@@ -290,16 +307,23 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
  */
 static void gsm_tx_entry(MsmMdspState *s, unsigned flags, uint32_t e)
 {
-    unsigned chan = flags & 0xff;
+    unsigned chan = flags & 0xff, len = lduw_le_p(s->mem + e);
 
-    if (lduw_le_p(s->mem + e) == 4) {
+    if (len == 4) {
         gsm_net_rach(s->net, s->mem[e + 4], s->l1_fn, s->gsm_fn);
         return;
     }
-    gsm_net_ul(s->net, s->gsm_fn, chan, s->mem + e + 4);
-    if (chan == GSM_UL_PDTCH) {
+    if (chan >= GSM_UL_PDTCH && chan < GSM_UL_PDTCH + 4) {
+        /*
+         * a packet data block, the channel GSM_UL_PDTCH plus its coding
+         * scheme (CS-1 to CS-4): [3 + its halfwords, ...]
+         */
+        gsm_net_pdch_ul(s->net, s->gsm_fn, s->mem + e + 4,
+                        chan - GSM_UL_PDTCH);
         stw_le_p(s->mem + e, 0);                /* sent */
+        return;
     }
+    gsm_net_ul(s->net, s->gsm_fn, chan, s->mem + e + 4);
 }
 
 static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
@@ -337,7 +361,8 @@ static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
             uint32_t e = MEM_B + 2 * lduw_le_p(cmd + 16 + 4 * i);
 
             if (!(flags >> 15) != !poll || slots & 1 << slot ||
-                e + 4 + GSM_BLOCK > MEM_C || !lduw_le_p(s->mem + e)) {
+                e + 4 + GSM_PDCH_BLOCK + 1 > MEM_C ||
+                !lduw_le_p(s->mem + e)) {
                 continue;
             }
             slots |= 1 << slot;
@@ -610,6 +635,21 @@ static void mdsp_reset(DeviceState *dev)
     gsm_net_reset(s->net);
 }
 
+static void mdsp_set_gprs_cs(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint8_t cs;
+
+    if (!visit_type_uint8(v, name, &cs, errp)) {
+        return;
+    }
+    if (cs < 1 || cs > 4) {
+        error_setg(errp, "gprs-cs: 1 to 4 (CS-1 to CS-4)");
+        return;
+    }
+    gsm_net_set_gprs_cs(MSM_MDSP(obj)->net, cs - 1);
+}
+
 static void mdsp_set_gprs_trace(Object *obj, bool value, Error **errp)
 {
     MSM_MDSP(obj)->gprs_trace = value;
@@ -765,6 +805,8 @@ static void mdsp_init(Object *obj)
     s->net = gsm_net_new(mdsp_to_host, s);
     object_property_add_bool(obj, "trace", mdsp_get_trace, mdsp_set_trace);
     object_property_add_bool(obj, "gprs-trace", NULL, mdsp_set_gprs_trace);
+    object_property_add(obj, "gprs-cs", "uint8", NULL, mdsp_set_gprs_cs,
+                        NULL, NULL);
     object_property_add_str(obj, "sms", mdsp_get_sms, mdsp_set_sms);
     object_property_add_str(obj, "call", mdsp_get_call, mdsp_set_call);
     object_property_add_bool(obj, "hangup", mdsp_get_hangup, mdsp_set_hangup);
