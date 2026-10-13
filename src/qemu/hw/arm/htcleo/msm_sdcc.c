@@ -15,6 +15,11 @@
  * FIFO that is always ready.  Both IRQ lines are levels:
  * STATUS & MASK0 and STATUS & MASK1.
  *
+ * An SDIO card's interrupt (DAT1, in-band) shows in STATUS bit 22 (SDIOINTR)
+ * and bit 25 (SDIOINTOPER, the one Linux's msm_sdcc unmasks) for as long as
+ * the card holds it; Windows Mobile's SDIO stack takes the WLAN chip's
+ * interrupts this way (Android's driver uses the chip's separate pin).
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
@@ -73,7 +78,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmSdccState, MSM_SDCC)
 #define ST_RXFIFOEMPTY      (1u << 19)
 #define ST_TXDATAAVLBL      (1u << 20)
 #define ST_RXDATAAVLBL      (1u << 21)
+#define ST_SDIOINTR         (1u << 22)
 #define ST_PROGDONE         (1u << 23)
+#define ST_SDIOINTOPER      (1u << 25)
 /* bits the CLEAR register acknowledges; the rest describe live state */
 #define ST_LATCHED          0x07C007FFu
 
@@ -96,6 +103,7 @@ struct MsmSdccState {
     uint32_t remain;            /* bytes left in the data phase */
     DeviceState *adm;           /* data mover serving the FIFO */
     bool data_active;
+    bool sdio_irq;              /* the SDIO card's interrupt */
 
     const MsmSdioCardOps *sdio;
     void *sdio_opaque;
@@ -111,6 +119,9 @@ static uint32_t sdcc_status(MsmSdccState *s)
 {
     uint32_t st = s->latched;
 
+    if (s->sdio_irq) {
+        st |= ST_SDIOINTR | ST_SDIOINTOPER;
+    }
     if (s->data_active && s->remain) {
         if (s->datactrl & DC_READ) {
             st |= ST_RXACTIVE;
@@ -365,6 +376,16 @@ static void sdcc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     }
     sdcc_update(s);
+}
+
+void msm_sdcc_sdio_irq(DeviceState *dev, bool level)
+{
+    MsmSdccState *s = MSM_SDCC(dev);
+
+    if (s->sdio_irq != level) {
+        s->sdio_irq = level;
+        sdcc_update(s);
+    }
 }
 
 void msm_sdcc_attach_sdio(DeviceState *dev, const MsmSdioCardOps *ops,

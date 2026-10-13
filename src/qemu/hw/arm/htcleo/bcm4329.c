@@ -96,6 +96,7 @@ static const struct { uint16_t id; uint8_t rev; } core_info[NCORES] = {
 #define CCCR_IOEN           0x02
 #define CCCR_IORDY          0x03
 #define CCCR_INTEN          0x04
+#define CCCR_INTPEND        0x05
 #define CCCR_BUSIF          0x07
 #define CCCR_SPEED          0x13
 #define CCCR_BRCM_SEPINT    0xF2
@@ -167,6 +168,7 @@ static const uint8_t ap_rates[] = {
 struct Bcm4329State {
     DeviceState parent_obj;
     qemu_irq oob;
+    DeviceState *sdcc;          /* the host controller (in-band interrupt) */
     NICState *nic;
     NICConf conf;
     QEMUTimer *timer;
@@ -210,12 +212,28 @@ struct Bcm4329State {
 
 /* ---- interrupts ------------------------------------------------------------ */
 
+static bool bcm_irq_pending(Bcm4329State *s)
+{
+    return s->powered && (s->intstatus & s->hostintmask);
+}
+
+/*
+ * The SDIO device core's interrupt goes out on the separate pin (the OOB
+ * GPIO Android's driver uses) and, unless that pin is enabled in CCCR
+ * 0xF2, in-band as function 1's interrupt when the host has enabled it
+ * (CCCR 0x04: master and function 1 or 2): Windows Mobile's driver takes
+ * it through the SDIO stack.
+ */
 static void bcm_update_irq(Bcm4329State *s)
 {
-    bool pending = s->powered && (s->intstatus & s->hostintmask);
+    bool pending = bcm_irq_pending(s);
     bool hi = !(s->sepint & 1) || (s->sepint & SEPINT_ACT_HI);
 
     qemu_set_irq(s->oob, hi ? pending : !pending);
+    if (s->sdcc) {
+        msm_sdcc_sdio_irq(s->sdcc, pending && !(s->sepint & 1) &&
+                          (s->ien & 1) && (s->ien & 0x06));
+    }
 }
 
 /* ---- frames to the host -------------------------------------------------- */
@@ -591,6 +609,7 @@ static void bcm_control(Bcm4329State *s, const uint8_t *p, size_t len)
     rsp = g_malloc0(16 + dlen);
     memcpy(rsp + 16, p + 16, MIN(dlen, len - 16));
     ret = bcm_ioctl(s, cmd, flags & CDCF_IOC_SET, rsp + 16, dlen);
+    DPRINTF("cdc cmd %u flags %08x len %zu -> %d\n", cmd, flags, dlen, ret);
     if (ret) {
         flags |= CDCF_IOC_ERROR;
     }
@@ -983,6 +1002,8 @@ static uint8_t f0_read8(Bcm4329State *s, uint32_t addr)
         return (s->ioen & 0x02) | (s->fw_running ? (s->ioen & 0x04) : 0);
     case CCCR_INTEN:
         return s->ien;
+    case CCCR_INTPEND:
+        return bcm_irq_pending(s) ? 0x02 : 0;   /* function 1's */
     case CCCR_BUSIF:
         return s->busif;
     case 0x08:
@@ -1023,6 +1044,7 @@ static void f0_write8(Bcm4329State *s, uint32_t addr, uint8_t v)
         break;
     case CCCR_INTEN:
         s->ien = v;
+        bcm_update_irq(s);
         break;
     case CCCR_BUSIF:
         s->busif = v;
@@ -1259,6 +1281,7 @@ void bcm4329_set_power(DeviceState *dev, bool on)
 
 void bcm4329_attach(DeviceState *dev, DeviceState *sdcc)
 {
+    BCM4329(dev)->sdcc = sdcc;
     msm_sdcc_attach_sdio(sdcc, &bcm_sdio_ops, BCM4329(dev));
 }
 

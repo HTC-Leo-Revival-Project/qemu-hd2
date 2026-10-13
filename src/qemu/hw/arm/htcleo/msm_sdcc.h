@@ -26,6 +26,8 @@ typedef struct MsmSdioCardOps {
 
 void msm_sdcc_attach_sdio(DeviceState *sdcc, const MsmSdioCardOps *ops,
                           void *opaque);
+/* the SDIO card's in-band interrupt (DAT1) */
+void msm_sdcc_sdio_irq(DeviceState *sdcc, bool level);
 
 /*
  * The data mover moving the controller's FIFO (mapped at base): it then
