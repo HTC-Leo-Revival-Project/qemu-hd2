@@ -95,6 +95,7 @@ export class Emulator extends EventEmitter {
     return {
       state: this.state,
       since: this.since,
+      now: Date.now(),
       message: this.message,
       external: this.external,
       running: this.running,

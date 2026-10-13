@@ -54,6 +54,8 @@ export type Firmware = { amss: boolean; dsp1: boolean; arm: boolean; hexagon: bo
 export type EmulatorStatus = {
   state: PowerState;
   since: number;
+  /* the server's clock when it sent this (since is on that clock) */
+  now: number;
   message: string;
   external: boolean;
   running: EmulatorConfig | null;

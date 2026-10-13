@@ -61,7 +61,8 @@ export const useControl = () => {
   const { ref, open } = useSocket("/ws/control", (ev) => {
     const m = JSON.parse(ev.data as string) as { t: string; status: EmulatorStatus; config: EmulatorConfig };
     if (m.t === "status") {
-      setStatus(m.status);
+      /* since on this device's clock (frames are timed on it): devices disagree */
+      setStatus({ ...m.status, since: m.status.since - (m.status.now - Date.now()) });
       setConfig(m.config);
     }
   });
