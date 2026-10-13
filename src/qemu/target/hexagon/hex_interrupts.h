@@ -12,4 +12,6 @@ void hex_clear_interrupts(CPUHexagonState *env, uint32_t mask, uint32_t type);
 void hex_raise_interrupts(CPUHexagonState *env, uint32_t mask, uint32_t type);
 void hex_interrupt_update(CPUHexagonState *env);
 
+void hex_dump_int_state(CPUHexagonState *env, FILE *f);
+
 #endif

@@ -275,6 +275,7 @@ static void hexagon_dump(CPUHexagonState *env, FILE *f, int flags)
     print_t_sreg(f, env, HEX_SREG_BADVA);
     print_reg(f, env, HEX_REG_CS0);
     print_reg(f, env, HEX_REG_CS1);
+    hex_dump_int_state(env, f);
 #endif
     qemu_fprintf(f, "}\n");
 
