@@ -14,6 +14,9 @@ T=$(cd "$(dirname "$0")" && pwd)
 cd "$T/../images" || exit 1
 rm -f dram.bin q6link.sock q6.log q6qmp.sock
 truncate -s 1G dram.bin
+# the host audio: PipeWire's socket is under XDG_RUNTIME_DIR
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+[ -S "$XDG_RUNTIME_DIR/pipewire-0" ] || : "${Q6_AUDIO:=none}"
 MEM="-object memory-backend-file,id=htcleo.ram,size=1G,mem-path=dram.bin,share=on"
 "$T/start-lle.sh" $MEM -machine memory-backend=htcleo.ram,qdsp6=lle,qdsp6-link=q6link \
   -chardev socket,id=q6link,path=q6link.sock,server=on,wait=off "$@"
