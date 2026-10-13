@@ -7,6 +7,8 @@
 # usage: start-q6.sh [extra qemu-system-arm args]
 #   images/dsp1.elf: tools/hd2_radio.py RUU_signed.nbh --dsp dsp1.elf
 #   Q6TRACE=off stops logging the DSP's peripheral accesses to q6.log;
+#   Q6_AUDIO= the DSP's audio output backend (default pipewire, none to
+#   mute; -global htcleo-q6-audif.dump=FILE saves the raw PCM)
 #   Q6_D= sets its -d flags (default guest_errors,unimp), Q6_ARGS= adds more
 T=$(cd "$(dirname "$0")" && pwd)
 cd "$T/../images" || exit 1
@@ -17,9 +19,10 @@ MEM="-object memory-backend-file,id=htcleo.ram,size=1G,mem-path=dram.bin,share=o
   -chardev socket,id=q6link,path=q6link.sock,server=on,wait=off "$@"
 for i in $(seq 20); do [ -S q6link.sock ] && break; sleep 0.3; done
 ../src/qemu/build/qemu-system-hexagon \
-  -M htcleo-q6,link=q6link,apps-irq=${Q6_APPS_IRQ:-11},modem-irq=${Q6_MODEM_IRQ:-2},trace=${Q6TRACE:-on} -kernel dsp1.elf \
+  -M htcleo-q6,link=q6link,${Q6_MACH:+$Q6_MACH,}apps-irq=${Q6_APPS_IRQ:-11},modem-irq=${Q6_MODEM_IRQ:-2},trace=${Q6TRACE:-on} -kernel dsp1.elf \
   -icount shift=${Q6_SHIFT:-1} \
   $MEM -machine memory-backend=htcleo.ram \
   -chardev socket,id=q6link,path=q6link.sock \
+  -audiodev ${Q6_AUDIO:-pipewire},id=q6snd -global htcleo-q6-audif.audiodev=q6snd \
   -display none -qmp unix:q6qmp.sock,server,nowait \
   -d ${Q6_D:-guest_errors,unimp} -D q6.log $Q6_ARGS > q6.out 2>&1 &
