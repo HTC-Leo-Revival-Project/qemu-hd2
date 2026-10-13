@@ -16,8 +16,13 @@
  *   reg 14        the output DMA table: six-word entries, bits 8-11 of
  *                 word 0 the stream (0 source MBs, 2 prediction MBs, 7
  *                 MB information), word 3 its buffer
- *   reg 1096      the MB: column in bits 0-8, row in 16-24, bit 28 the
- *                 first of the picture
+ *   reg 1096      fetch an MB: column in bits 0-8, row in 16-24, bit 28
+ *                 the first of a row, bit 27 motion search (the positions
+ *                 then come from reg 96)
+ *   reg 96        fetch an MB for the motion search, row << 16 | column (P
+ *                 pictures interleave two MB rows)
+ *   the fetches are pipelined: each step's outputs (114b-114d) belong to
+ *   the oldest MB fetched and not yet written out, one or two steps back
  *   reg 114b      offset of the MB's source luma (16x16, stride 16) in
  *                 the source stream
  *   reg 114c      offset of its prediction luma in the prediction stream
@@ -99,8 +104,10 @@ int htcleo_venc_encode(uint32_t addr, bool trace)
 {
     g_autofree uint32_t *w = g_new0(uint32_t, CMD_MAX);
     uint32_t src, recon, ref, buf_src = 0, buf_pred = 0, buf_info = 0;
-    uint32_t mb = 0, off_src = 0, off_pred = 0, off_info = 0;
-    bool got_src = false, got_pred = false, got_info = false;
+    uint32_t off_src = 0, off_pred = 0, off_info = 0;
+    bool got_src = false, got_pred = false, got_info = false, search = false;
+    uint32_t fifo[8];               /* fetched MBs, row << 16 | column */
+    unsigned fifo_rd = 0, fifo_wr = 0;
     int mbw, mbh, stride, nmb = 0;
 
     physical_memory_read(addr, w, CMD_MAX * 4);
@@ -147,7 +154,8 @@ int htcleo_venc_encode(uint32_t addr, bool trace)
             break;
         case 0x0a:
             /* end of an MB step: produce what was asked for */
-            if (got_src || got_pred || got_info) {
+            if ((got_src || got_pred || got_info) && fifo_rd != fifo_wr) {
+                uint32_t mb = fifo[fifo_rd++ % ARRAY_SIZE(fifo)];
                 int mbx = mb & 0x1ff, mby = (mb >> 16) & 0x1ff;
 
                 if (mbx < mbw && mby < mbh) {
@@ -196,7 +204,14 @@ int htcleo_venc_encode(uint32_t addr, bool trace)
                 break;
             }
             case 0x1096:
-                mb = v[k];
+                search |= v[k] & (1u << 27);
+                if (search) {
+                    break;          /* the search names its MBs in 96 */
+                }
+                fifo[fifo_wr++ % ARRAY_SIZE(fifo)] = v[k] & 0x1ff01ff;
+                break;
+            case 0x96:
+                fifo[fifo_wr++ % ARRAY_SIZE(fifo)] = v[k] & 0x1ff01ff;
                 break;
             case 0x114b:
                 off_src = v[k];
