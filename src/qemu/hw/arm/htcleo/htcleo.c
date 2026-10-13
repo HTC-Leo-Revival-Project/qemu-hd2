@@ -527,6 +527,15 @@ static bool htcleo_load_os_from_nand(BlockBackend *blk, uint32_t *entry)
     return true;
 }
 
+static void htcleo_sd_detect(void *opaque, int n, int level)
+{
+    HtcleoMachineState *s = opaque;
+
+    if (s->gpio) {
+        msm_gpio_set_input(s->gpio, HTCLEO_GPIO_SD_STATUS, level);
+    }
+}
+
 static void htcleo_reset(MachineState *machine, ResetType type)
 {
     HtcleoMachineState *s = HTCLEO_MACHINE(machine);
@@ -593,8 +602,6 @@ static void htcleo_reset(MachineState *machine, ResetType type)
     /* what the SPL leaves configured */
     msm_mdp_setup_scanout(s->mdp, HTCLEO_SPL_FB_BASE, 480, 800, 480 * 2,
                           true);
-    msm_gpio_set_input(s->gpio, HTCLEO_GPIO_SD_STATUS,
-                       drive_get(IF_SD, 0, 0) ? 0 : 1);
     htcleo_update_keys(s);
 
     /* SVC mode, IRQ/FIQ masked, MMU off: jump to the OS image */
@@ -958,6 +965,12 @@ static void htcleo_init(MachineState *machine)
         sysbus_connect_irq(sbd, 0, vic_in[irq[i][0]]);
         sysbus_connect_irq(sbd, 1, vic_in[irq[i][1]]);
         msm_sdcc_connect_adm(dev, s->adm, base[i]);
+        if (i == 1) {
+            /* the microSD slot's card switch, GPIO 153, low with a card */
+            qdev_connect_gpio_out_named(dev, "card-detect", 0,
+                                        qemu_allocate_irq(htcleo_sd_detect,
+                                                          s, 0));
+        }
         dinfo = i == 1 ? drive_get(IF_SD, 0, 0) : NULL;
         if (dinfo) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);

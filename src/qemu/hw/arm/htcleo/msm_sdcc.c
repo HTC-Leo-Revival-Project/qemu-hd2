@@ -79,11 +79,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmSdccState, MSM_SDCC)
 
 #define FIFO_BYTES          64
 
+#define TYPE_MSM_SDCC_BUS "msm-sdcc-bus"
+
 struct MsmSdccState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     SDBus sdbus;
     qemu_irq irq[2];            /* cmd_irq, pio_irq */
+    qemu_irq card_detect;       /* the slot's switch: low with a card in */
 
     uint32_t power, clock, arg, cmd, respcmd;
     uint32_t resp[4];
@@ -401,6 +404,13 @@ static void msm_sdcc_reset(DeviceState *dev)
     s->remain = 0;
     s->data_active = false;
     sdcc_update(s);
+    qemu_set_irq(s->card_detect, !sdbus_get_inserted(&s->sdbus));
+}
+
+/* a card inserted or removed (or a drive given media): the slot's switch */
+static void msm_sdcc_set_inserted(DeviceState *dev, bool inserted)
+{
+    qemu_set_irq(MSM_SDCC(dev)->card_detect, !inserted);
 }
 
 static void msm_sdcc_init(Object *obj)
@@ -417,7 +427,8 @@ static void msm_sdcc_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq[0]);
     sysbus_init_irq(sbd, &s->irq[1]);
-    qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_SD_BUS, DEVICE(obj),
+    qdev_init_gpio_out_named(DEVICE(obj), &s->card_detect, "card-detect", 1);
+    qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_MSM_SDCC_BUS, DEVICE(obj),
               "sd-bus");
 }
 
@@ -427,6 +438,18 @@ static void msm_sdcc_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_legacy_reset(dc, msm_sdcc_reset);
 }
+
+static void msm_sdcc_bus_class_init(ObjectClass *oc, const void *data)
+{
+    SD_BUS_CLASS(oc)->set_inserted = msm_sdcc_set_inserted;
+}
+
+static const TypeInfo msm_sdcc_bus_info = {
+    .name = TYPE_MSM_SDCC_BUS,
+    .parent = TYPE_SD_BUS,
+    .instance_size = sizeof(SDBus),
+    .class_init = msm_sdcc_bus_class_init,
+};
 
 static const TypeInfo msm_sdcc_info = {
     .name = TYPE_MSM_SDCC,
@@ -438,6 +461,7 @@ static const TypeInfo msm_sdcc_info = {
 
 static void msm_sdcc_register(void)
 {
+    type_register_static(&msm_sdcc_bus_info);
     type_register_static(&msm_sdcc_info);
 }
 type_init(msm_sdcc_register)
