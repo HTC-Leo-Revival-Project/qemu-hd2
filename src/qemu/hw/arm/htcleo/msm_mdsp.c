@@ -119,7 +119,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define GSM_CMDBUF_SIZE 0xF8
 #define GSM_CMD_PWR     20
 #define GSM_CMD_RX      4               /* receive; type 3: acquisition */
-#define GSM_RX_ACQ      3
+#define GSM_RX_ACQ      3               /* (the BCCH list's) */
+#define GSM_RX_ACQ_CAMP 1               /* (cell selection's, to camp) */
 #define GSM_CMD_STOP    8               /* (seen ending searches) */
 /* the acquisition results: rings of 3, the DSP's write index, AMSS's read */
 #define B_FCCH_RING     (MEM_B + 0x7B4)     /* 8 halfwords each */
@@ -127,6 +128,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define B_SCH_RING      (MEM_B + 0xA7C)     /* 11 halfwords each */
 #define B_SCH_WR        (MEM_B + 0xAE0)
 #define GSM_BSIC        0x0A                /* NCC 1, BCC 2 */
+#define GSM_CMD_ACCCH   29              /* receive a CCCH/BCCH block */
 #define GSM_FCCH_SNR    0x400
 #define GSM_NOISE       0x40            /* energy of an empty channel */
 #define GSM_CELL        0x186a0         /* energy of the cell */
@@ -144,8 +146,10 @@ struct MsmMdspState {
     uint32_t ctl_regs[0x400];
     bool trace;                 /* log doorbells and first writes (+PC) */
     uint32_t gsm_fn;            /* the cell's frame number */
+    uint32_t l1_fn;             /* L1's frame number (its frame timer's) */
     int gsm_acq;                /* 0 idle, 1 searching, 2 tone posted */
     uint16_t gsm_acq_id;
+    uint32_t gsm_acq_l1fn;      /* L1's frame number when it started */
     GHashTable *seen;
 };
 
@@ -181,6 +185,109 @@ static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     }
     /* the length last, bit 15 "ready": AMSS polls it */
     stw_le_p(s->mem + res, 0x8000 | (3 + 2 * n));
+}
+
+/*
+ * The modelled cell's broadcast (3GPP 44.018): system information for MCC
+ * 310, MNC 260 (the SIM's network), LAC 1, cell 1, in the BCCH block by
+ * TC (SI1, SI2, SI3, SI4, then SI3/SI4 in the optional slots); the other
+ * CCCH blocks are L2 fill frames for now.
+ */
+static const uint8_t gsm_si3[23] = {
+    0x49, 0x06, 0x1b,                   /* L2 pseudo length 18, RR, SI3 */
+    0x00, 0x01,                         /* cell identity */
+    0x13, 0x00, 0x62, 0x00, 0x01,       /* LAI: 310 260, LAC 1 */
+    0x48, 0x00, 0x0a,                   /* ATT, BS_AG_BLKS_RES 1, T3212 1 h */
+    0x2f,                               /* cell options: RLT 64 */
+    0x45, 0x40,                         /* reselect hysteresis, NECI */
+    0x70, 0x00, 0x00,                   /* RACH: max retrans, tx-integer */
+    0x2b, 0x2b, 0x2b, 0x2b,             /* rest octets */
+};
+/* SI1: cell allocation (variable bit map, ARFCN 133), RACH control */
+static const uint8_t gsm_si1[23] = {
+    0x55, 0x06, 0x19,
+    0x8e, 0x42, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x70, 0x00, 0x00,
+    0x2b,
+};
+/* SI2: BA list (variable bit map, ARFCN 133), NCC permitted, RACH */
+static const uint8_t gsm_si2[23] = {
+    0x59, 0x06, 0x1a,
+    0x8e, 0x42, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0xff,
+    0x70, 0x00, 0x00,
+};
+/* SI4: LAI, cell selection parameters, RACH control */
+static const uint8_t gsm_si4[23] = {
+    0x31, 0x06, 0x1c,
+    0x13, 0x00, 0x62, 0x00, 0x01,
+    0x45, 0x40,
+    0x70, 0x00, 0x00,
+    0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+};
+static const uint8_t gsm_fill[23] = {
+    0x01, 0x03, 0x01, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+    0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+};
+
+/*
+ * The block a receive command for frame fn is for: the block whose four
+ * frames include fn (idle reads come burst by burst), else the next one
+ * (the BCCH list queues its reads a couple of frames ahead).  Blocks start
+ * on frames 2 (BCCH), 6, 12, 16, 22, 26, 32, 36, 42, 46 of the multiframe.
+ */
+static uint32_t gsm_block_fn(uint32_t fn)
+{
+    static const uint8_t starts[] = { 2, 6, 12, 16, 22, 26, 32, 36, 42, 46 };
+    unsigned t3 = fn % 51;
+
+    for (unsigned i = 0; i < ARRAY_SIZE(starts); i++) {
+        if (t3 < starts[i] + 4) {
+            return fn - t3 + starts[i];
+        }
+    }
+    return fn - t3 + 51 + 2;
+}
+
+static const uint8_t *gsm_block(uint32_t bfn)
+{
+    unsigned t3 = bfn % 51, tc = (bfn / 51) % 8;
+
+    static const uint8_t *const bcch[8] = {
+        gsm_si1, gsm_si2, gsm_si3, gsm_si4, gsm_si3, gsm_si4, gsm_si3, gsm_si4,
+    };
+
+    return t3 == 2 ? bcch[tc] : gsm_fill;
+}
+
+/* receive a CCCH/BCCH block: its metrics and its decoded 23 octets */
+static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
+{
+    uint32_t met = MEM_B + 2 * lduw_le_p(cmd + 4);
+    uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
+    uint32_t bfn = gsm_block_fn(s->gsm_fn);
+    const uint8_t *blk = gsm_block(bfn);
+
+    if (met + 28 > MEM_C || dat + 12 + 24 > MEM_C) {
+        return;
+    }
+    memset(s->mem + met, 0, 28);
+    stw_le_p(s->mem + met + 2, seq);
+    stw_le_p(s->mem + met + 6, 0x100);
+    stw_le_p(s->mem + met + 8, 0x100);
+    stw_le_p(s->mem + met, 1);
+    memset(s->mem + dat, 0, 12 + 24);
+    memcpy(s->mem + dat + 12, blk, 23);
+    stw_le_p(s->mem + dat + 2, seq);
+    stw_le_p(s->mem + dat + 6, 2);              /* bit 1: CRC OK */
+    stw_le_p(s->mem + dat, 23);
+    if (s->trace) {
+        qemu_log("msm-mdsp: gsm accch seq %04x fn %u block %u (t3 %u tc %u)"
+                 " met %04x dat %04x %s\n", seq, s->gsm_fn, bfn, bfn % 51,
+                 (bfn / 51) % 8, lduw_le_p(cmd + 4), lduw_le_p(cmd + 24),
+                 blk == gsm_si1 ? "SI1" : blk == gsm_si2 ? "SI2" :
+                 blk == gsm_si3 ? "SI3" : blk == gsm_si4 ? "SI4" : "fill");
+    }
 }
 
 /* the SCH's 25 bits for frame fn: BSIC, T1, T2, T3' (AMSS's 0xF9F41A) */
@@ -223,11 +330,24 @@ static void gsm_acq_frame(MsmMdspState *s)
         stw_le_p(e + 2, 2);             /* bit 1: CRC OK */
         stw_le_p(e + 8, 2);             /* payload halfwords */
         memcpy(e + 10, b, 4);
+        /*
+         * The burst's time from the acquisition start, in quarter symbols
+         * (5000 a frame): L1 takes the cell's frame offset from it
+         * (0xF9F91A: FN_diff = start + 1 + timing / 5000 - SCH FN)
+         */
+        {
+            uint32_t qs = 5000 * ((s->l1_fn - s->gsm_acq_l1fn) % 2715648);
+
+            stw_le_p(e + 14, qs >> 16);
+            stw_le_p(e + 16, qs & 0xffff);
+        }
         stw_le_p(s->mem + B_SCH_WR, wr + 1);
         s->gsm_acq = 0;
         if (s->trace) {
-            qemu_log("msm-mdsp: gsm sch id %u fn %u %02x%02x%02x%02x\n",
-                     s->gsm_acq_id, s->gsm_fn, b[0], b[1], b[2], b[3]);
+            qemu_log("msm-mdsp: gsm sch id %u fn %u %02x%02x%02x%02x l1 %u"
+                     " start %u true diff %d\n", s->gsm_acq_id, s->gsm_fn,
+                     b[0], b[1], b[2], b[3], s->l1_fn, s->gsm_acq_l1fn,
+                     (int)(s->l1_fn - s->gsm_fn));
         }
     }
 }
@@ -242,6 +362,7 @@ static void mdsp_gsm_frame(void *opaque, int n, int level)
         return;
     }
     s->gsm_fn = (s->gsm_fn + 1) % 2715648;
+    s->l1_fn = level - 1;
     if (s->ctl != CTL_RUN || lduw_le_p(s->mem + MEM_A) != IMG_1406 ||
         !lduw_le_p(s->mem + B_GSM_READY)) {
         return;
@@ -266,9 +387,13 @@ static void mdsp_gsm_frame(void *opaque, int n, int level)
             }
             if (id == GSM_CMD_PWR) {
                 gsm_power(s, seq, buf + off);
+            } else if (id == GSM_CMD_ACCCH) {
+                gsm_accch(s, seq, buf + off);
             } else if (id == GSM_CMD_RX &&
-                       lduw_le_p(buf + off + 16) == GSM_RX_ACQ) {
+                       (lduw_le_p(buf + off + 16) == GSM_RX_ACQ ||
+                        lduw_le_p(buf + off + 16) == GSM_RX_ACQ_CAMP)) {
                 s->gsm_acq = 1;
+                s->gsm_acq_l1fn = s->l1_fn;
             }
             if (id != GSM_CMD_PWR && s->trace) {
                 GString *g = g_string_new(NULL);

@@ -98,8 +98,13 @@ static void gstmr_schedule(MsmGstmrState *s)
 static void gstmr_tick(void *opaque)
 {
     MsmGstmrState *s = opaque;
-    /* the DSP runs the frame's commands as the frame starts */
-    qemu_irq_pulse(s->frame[s->next & 1]);
+    /*
+     * The DSP runs the frame's commands as the frame starts; the level
+     * carries L1's frame number for that frame, plus one
+     */
+    qemu_set_irq(s->frame[s->next & 1],
+                 1 + (s->fn_base + s->next - s->fn_frame) % HYPERFRAME);
+    qemu_set_irq(s->frame[s->next & 1], 0);
     qemu_irq_pulse(s->irq);
     /* the next frame, skipping ticks the guest slept through */
     s->next = MAX(s->next + 1, gstmr_frame(s) + 1);
