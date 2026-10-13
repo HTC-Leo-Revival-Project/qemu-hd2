@@ -212,75 +212,45 @@ static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
  *            reads it two frames on, for every burst)
  *   byte 14  the decoded USFs: bit 15 valid, bits 2-0 the USF
  */
+/* the PDCH's slots a receive command reads (byte 20), up to 4 */
+#define GSM_PDCH_SLOTS  4
+
+/*
+ * a packet data receive result record (its word address at byte at):
+ * [ready, seq, a word for each slot]
+ */
 static void gsm_pdch_result(MsmMdspState *s, const uint8_t *cmd, int at,
-                            uint16_t seq, uint16_t val)
+                            uint16_t seq, const uint16_t *val, unsigned n)
 {
     uint32_t r = MEM_B + 2 * lduw_le_p(cmd + at);
 
     if (r + 20 <= MEM_C) {
         memset(s->mem + r, 0, 20);
         stw_le_p(s->mem + r + 2, seq);
-        stw_le_p(s->mem + r + 4, val);
+        for (unsigned i = 0; i < n; i++) {
+            stw_le_p(s->mem + r + 4 + 2 * i, val[i]);
+        }
         stw_le_p(s->mem + r, 1);
     }
 }
 
-/* receive a block: its metrics and, on its last burst, its 23 octets */
-static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
+/*
+ * a decoded block for L1: [length in halfwords with this header, seq,
+ * frame type, status, ?, ?] then the block.  The status: bit 1 CRC OK,
+ * bits 6-3 a packet data block's coding scheme (L1 takes its length from
+ * it, AMSS's 0x1071A9C: CS-1 to 4, then MCS-1 to 9), bits 15-13 its slot
+ * of a multislot allocation (slot).  The frame type on a traffic channel
+ * (AMSS's 0xC8C7E4): bit 0 a FACCH frame, else speech (bits 2-5 other
+ * kinds: SID, ...); on signalling channels bit 0 is not set.
+ */
+static void gsm_rx_data(MsmMdspState *s, uint32_t dat, uint16_t seq,
+                        int kind, int cs, unsigned slot, const uint8_t *b)
 {
-    uint32_t met = MEM_B + 2 * lduw_le_p(cmd + 4);
-    bool has_dat = lduw_le_p(cmd + 24) != 0xffff;
-    int kind = GSM_DL_SIGNAL;
-    uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
-    uint8_t b[GSM_PDCH_BLOCK + 1] = {};
-    int cs = -1;
-
-    /*
-     * The metrics: 14 halfwords set here (traffic channels have 18; AMSS
-     * keeps values of its own in the rest, which L1 tracking relies on)
-     */
-    if (met + 28 > MEM_C || dat + 12 + 2 * gsm_pdch_hw[3] > MEM_C) {
-        return;
-    }
-    memset(s->mem + met, 0, 28);
-    stw_le_p(s->mem + met + 2, seq);
-    stw_le_p(s->mem + met + 6, 0x100);
-    stw_le_p(s->mem + met + 8, 0x100);
-    stw_le_p(s->mem + met, 1);
-    if ((lduw_le_p(cmd + 2) >> 8) == 0x0a) {
-        gsm_pdch_result(s, cmd, 12, seq, has_dat ? 0x8000 : 0);
-    }
-    if (!has_dat) {
-        return;
-    }
-    if ((lduw_le_p(cmd + 2) >> 8) == 0x0a) {
-        /* a PDCH (byte 2: 0x0A40; 0x0C40 on other channels) */
-        cs = gsm_net_pdch_dl(s->net, s->gsm_fn - 3, b);
-        gsm_pdch_result(s, cmd, 14, seq, 0x8000 | (b[0] & 7));
-    } else if (gsm_net_dedicated(s->net)) {
-        /*
-         * byte 22: bit 0 decode, bit 4 a traffic channel's SACCH, bit 12
-         * first burst; the block's four reads end at this frame
-         */
-        kind = gsm_net_ded_dl(s->net, s->gsm_fn - 3,
-                              lduw_le_p(cmd + 22) & 0x10, b);
-    } else {
-        gsm_net_dl(s->net, gsm_net_block_fn(s->gsm_fn), b);
-    }
-    /*
-     * [length in halfwords with this header, seq, frame type, status, ?,
-     * ?].  The status: bit 1 CRC OK, bits 6-3 a packet data block's coding
-     * scheme (L1 takes its length from it, AMSS's 0x1071A9C: CS-1 to 4,
-     * then MCS-1 to 9), bits 15-13 the buffer's tag.  The frame type on a
-     * traffic channel (AMSS's 0xC8C7E4): bit 0 a FACCH frame, else speech
-     * (bits 2-5 other kinds: SID, ...); on signalling channels bit 0 is
-     * not set.
-     */
     if (cs >= 0) {
         memset(s->mem + dat, 0, 12 + 2 * gsm_pdch_hw[3]);
         memcpy(s->mem + dat + 12, b, 2 * gsm_pdch_hw[cs]);
         stw_le_p(s->mem + dat + 2, seq);
-        stw_le_p(s->mem + dat + 6, 2 | cs << 3);
+        stw_le_p(s->mem + dat + 6, 2 | cs << 3 | slot << 13);
         stw_le_p(s->mem + dat, 6 + gsm_pdch_hw[cs]);
         return;
     }
@@ -292,6 +262,94 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     stw_le_p(s->mem + dat + 4, kind == GSM_DL_FACCH);
     stw_le_p(s->mem + dat + 6, 2);
     stw_le_p(s->mem + dat, GSM_BLOCK);
+}
+
+/*
+ * a slot's metrics (byte 4: the first's word address, the others' 0x28
+ * words apart): 14 halfwords set here (traffic channels have 18; AMSS
+ * keeps values of its own in the rest, which L1 tracking relies on)
+ */
+static void gsm_metrics(MsmMdspState *s, uint16_t seq, const uint8_t *cmd,
+                        unsigned slot)
+{
+    uint32_t met = MEM_B + 2 * (lduw_le_p(cmd + 4) + 0x28 * slot);
+
+    if (met + 28 > MEM_C) {
+        return;
+    }
+    memset(s->mem + met, 0, 28);
+    stw_le_p(s->mem + met + 2, seq);
+    stw_le_p(s->mem + met + 6, 0x100);
+    stw_le_p(s->mem + met + 8, 0x100);
+    stw_le_p(s->mem + met, 1);
+}
+
+/*
+ * a PDCH read (byte 2: 0x0A40; 0x0C40 on other channels): byte 20 the
+ * number of slots (a multislot allocation's, from its lowest), then an
+ * entry of 14 octets for each: [flags as on other channels, data word
+ * address (0xFFFF but on a block's last burst), 0x0C00 | the slot's
+ * index, its timing (625 quarter symbols a slot), ...].  The results:
+ * byte 12's record a word for each slot, 0x8000 if a block was decoded
+ * (L1 reads it two frames later), byte 14's the USFs.
+ */
+static void gsm_pdch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
+{
+    unsigned n = MAX(MIN(lduw_le_p(cmd + 20), GSM_PDCH_SLOTS), 1);
+    uint16_t sched[GSM_PDCH_SLOTS] = {}, usf[GSM_PDCH_SLOTS] = {};
+    bool any = false;
+
+    for (unsigned i = 0; i < n; i++) {
+        const uint8_t *e = cmd + 22 + 14 * i;
+        uint32_t dat = MEM_B + 2 * lduw_le_p(e + 2);
+        uint8_t b[GSM_PDCH_BLOCK + 1] = {};
+        int cs;
+
+        if (i) {
+            gsm_metrics(s, seq, cmd, i);
+        }
+        if (lduw_le_p(e + 2) == 0xffff ||
+            dat + 12 + 2 * gsm_pdch_hw[3] > MEM_C) {
+            continue;
+        }
+        cs = gsm_net_pdch_dl(s->net, s->gsm_fn - 3, lduw_le_p(e + 4) & 7, n,
+                             b);
+        gsm_rx_data(s, dat, seq, GSM_DL_SIGNAL, cs, i, b);
+        sched[i] = 0x8000;
+        usf[i] = 0x8000 | (b[0] & 7);
+        any = true;
+    }
+    gsm_pdch_result(s, cmd, 12, seq, sched, n);
+    if (any) {
+        gsm_pdch_result(s, cmd, 14, seq, usf, n);
+    }
+}
+
+static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
+{
+    uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
+    int kind = GSM_DL_SIGNAL;
+    uint8_t b[GSM_BLOCK];
+
+    gsm_metrics(s, seq, cmd, 0);
+    if ((lduw_le_p(cmd + 2) >> 8) == 0x0a) {
+        gsm_pdch(s, seq, cmd);
+        return;
+    }
+    if (lduw_le_p(cmd + 24) == 0xffff || dat + 12 + 24 > MEM_C) {
+        return;
+    }
+    if (gsm_net_dedicated(s->net)) {
+        /*
+         * byte 22: bit 0 decode, bit 4 a traffic channel's SACCH, bit 12
+         * first burst; the block's four reads end at this frame
+         */
+        kind = gsm_net_ded_dl(s->net, s->gsm_fn - 3,
+                              lduw_le_p(cmd + 22) & 0x10, b);
+    } else {
+        gsm_net_dl(s->net, gsm_net_block_fn(s->gsm_fn), b);
+    }
+    gsm_rx_data(s, dat, seq, kind, -1, 0, b);
 }
 
 /*
@@ -650,6 +708,21 @@ static void mdsp_set_gprs_cs(Object *obj, Visitor *v, const char *name,
     gsm_net_set_gprs_cs(MSM_MDSP(obj)->net, cs - 1);
 }
 
+static void mdsp_set_gprs_slots(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    uint8_t n;
+
+    if (!visit_type_uint8(v, name, &n, errp)) {
+        return;
+    }
+    if (n < 1 || n > 4) {
+        error_setg(errp, "gprs-slots: 1 to 4");
+        return;
+    }
+    gsm_net_set_gprs_slots(MSM_MDSP(obj)->net, n);
+}
+
 static void mdsp_set_gprs_trace(Object *obj, bool value, Error **errp)
 {
     MSM_MDSP(obj)->gprs_trace = value;
@@ -807,6 +880,8 @@ static void mdsp_init(Object *obj)
     object_property_add_bool(obj, "gprs-trace", NULL, mdsp_set_gprs_trace);
     object_property_add(obj, "gprs-cs", "uint8", NULL, mdsp_set_gprs_cs,
                         NULL, NULL);
+    object_property_add(obj, "gprs-slots", "uint8", NULL,
+                        mdsp_set_gprs_slots, NULL, NULL);
     object_property_add_str(obj, "sms", mdsp_get_sms, mdsp_set_sms);
     object_property_add_str(obj, "call", mdsp_get_call, mdsp_set_call);
     object_property_add_bool(obj, "hangup", mdsp_get_hangup, mdsp_set_hangup);

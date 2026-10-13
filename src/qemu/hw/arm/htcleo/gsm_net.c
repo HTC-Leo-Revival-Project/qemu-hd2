@@ -1261,9 +1261,15 @@ char *gsm_net_events(GsmNet *n)
     return g_string_free(g, false);
 }
 
-int gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_PDCH_BLOCK])
+int gsm_net_pdch_dl(GsmNet *n, uint32_t bfn, unsigned slot, unsigned slots,
+                    uint8_t b[GSM_PDCH_BLOCK])
 {
-    return gprs_pdch_dl(n->gprs, bfn, b);
+    return gprs_pdch_dl(n->gprs, bfn, gprs_slot_tn(n->gprs, slot, slots), b);
+}
+
+void gsm_net_set_gprs_slots(GsmNet *n, unsigned slots)
+{
+    gprs_set_slots(n->gprs, slots);
 }
 
 void gsm_net_pdch_ul(GsmNet *n, uint32_t fn, const uint8_t *b, int cs)

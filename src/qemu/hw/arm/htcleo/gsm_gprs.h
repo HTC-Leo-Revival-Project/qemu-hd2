@@ -21,14 +21,19 @@ void gprs_ul_assigned(Gprs *g);
 /* an IMMEDIATE ASSIGNMENT of a downlink TBF to send on the CCCH */
 bool gprs_ccch_assignment(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK]);
 /*
- * the PDCH's downlink block that starts at frame fn, returning its coding
+ * the downlink block on timeslot tn that starts at frame fn (the PDCH,
+ * GSM_PDCH_TN, or another of a multislot downlink), returning its coding
  * scheme (0-3: CS-1 to CS-4); an uplink one, in coding scheme cs
  */
-int gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_PDCH_BLOCK]);
+int gprs_pdch_dl(Gprs *g, uint32_t fn, unsigned tn, uint8_t b[GSM_PDCH_BLOCK]);
 void gprs_pdch_ul(Gprs *g, uint32_t fn, const uint8_t *b, int cs);
 /* the coding scheme for data blocks, both ways */
 void gprs_set_cs(Gprs *g, int cs);
 int gprs_cs(Gprs *g);
+/* the timeslots of downlink TBFs (1-4) */
+void gprs_set_slots(Gprs *g, unsigned n);
+/* the timeslot of a slot of the MS's downlink allocation (of slots) */
+unsigned gprs_slot_tn(Gprs *g, unsigned slot, unsigned slots);
 /* an IP packet from the host for the MS */
 void gprs_from_host(Gprs *g, const uint8_t *ip, size_t len);
 /* the MS's address, 0 while no PDP context is active */

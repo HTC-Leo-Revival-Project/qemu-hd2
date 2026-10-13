@@ -52,6 +52,7 @@ enum { DL_IDLE, DL_ASSIGNING, DL_PACCH, DL_ACTIVE, DL_FINAL };
 struct Gprs {
     bool trace;
     int cs;                             /* data blocks' coding scheme */
+    unsigned slots;                     /* downlink TBFs' timeslots (1-4) */
     uint32_t fn;                        /* the PDCH's last block */
     GprsToHost *to_host;
     void *opaque;
@@ -79,6 +80,15 @@ struct Gprs {
     uint8_t dl_bsn;
     unsigned dl_wait, dl_idle, dl_since_poll;
     bool dl_ia_sent;
+    /*
+     * the timeslots the MS listens to (TIMESLOT_ALLOCATION bits, TN 0 the
+     * MSB): those of its assignment on the CCCH (one) until a PACKET
+     * DOWNLINK ASSIGNMENT gives it more (dl_widen: one is to be sent),
+     * which they are dl_ts_wait blocks later
+     */
+    uint8_t dl_ts, dl_ts_next;
+    unsigned dl_ts_wait;
+    bool dl_widen;
     unsigned dl_polls;                  /* polls not answered */
     bool ul_wanted;                     /* the MS asked for an uplink TBF */
     /* LLC: V(U) to send, by SAPI */
@@ -634,8 +644,22 @@ static void pua(Gprs *g, uint8_t b[GSM_BLOCK], unsigned usf, bool ul)
     pad(&w);
 }
 
-/* PACKET DOWNLINK ASSIGNMENT to the MS of the uplink TBF, on the PACCH */
-static void pda(Gprs *g, uint8_t b[GSM_BLOCK], unsigned usf)
+/*
+ * the downlink timeslots of an assignment (TIMESLOT_ALLOCATION bits, TN 0
+ * the MSB): g->slots of TN 3-6, the PDCH's among them
+ */
+static uint8_t dl_ts_all(Gprs *g)
+{
+    unsigned lo = g->slots == 4 ? 3 : GSM_PDCH_TN + 1 - g->slots;
+
+    return (uint8_t)(0xff00 >> g->slots) >> lo;
+}
+
+/*
+ * PACKET DOWNLINK ASSIGNMENT on the PACCH, to the MS of the uplink TBF (a
+ * new downlink TBF) or (dl) of the downlink one (more timeslots)
+ */
+static void pda(Gprs *g, uint8_t b[GSM_BLOCK], unsigned usf, bool dl)
 {
     Bits w = { b + 1, 0, GSM_BLOCK - 1 };
 
@@ -644,13 +668,15 @@ static void pda(Gprs *g, uint8_t b[GSM_BLOCK], unsigned usf)
     put(&w, 0, 2);
     put(&w, 0, 1);
     put(&w, 0, 1);                              /* Global TFI: */
-    put(&w, 0, 1);
-    put(&w, GSM_UL_TFI, 5);                     /* its uplink TFI */
+    put(&w, dl, 1);
+    put(&w, dl ? GPRS_DL_TFI : GSM_UL_TFI, 5);
     put(&w, 0, 1);                              /* GPRS */
     put(&w, 0, 2);                              /* MAC mode: dynamic */
     put(&w, 1, 1);                              /* RLC unacknowledged */
     put(&w, 0, 1);                              /* CONTROL_ACK */
-    put(&w, 0x80 >> GSM_PDCH_TN, 8);            /* TIMESLOT_ALLOCATION */
+    put(&w, dl_ts_all(g), 8);                   /* TIMESLOT_ALLOCATION */
+    g->dl_ts_next = dl_ts_all(g);
+    g->dl_ts_wait = 3;
     put_ta(&w);
     put(&w, 0, 1);                              /* no P0 */
     put(&w, 0, 1);                              /* no frequency parameters */
@@ -666,21 +692,51 @@ static void pda(Gprs *g, uint8_t b[GSM_BLOCK], unsigned usf)
 static void dl_start(Gprs *g)
 {
     g->dl = DL_ACTIVE;
+    g->dl_ts = g->dl_ts_next = 0x80 >> GSM_PDCH_TN;
+    g->dl_ts_wait = 0;
+    g->dl_widen = false;
     g->dl_bsn = 0;
     g->dl_off = 0;
     g->dl_idle = g->dl_since_poll = g->dl_polls = 0;
 }
 
-int gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_PDCH_BLOCK])
+/* the other timeslots of a multislot downlink: data, else dummies */
+static int pdch_dl_other(Gprs *g, unsigned tn, uint8_t b[GSM_PDCH_BLOCK])
+{
+    Bits w = { b + 1, 0, GSM_BLOCK - 1 };
+
+    memset(b, 0x2b, GSM_PDCH_BLOCK);
+    if (g->dl == DL_ACTIVE && g->dl_ts & 0x80 >> tn &&
+        !g_queue_is_empty(&g->dl_q)) {
+        dl_data(g, b, 7, false, false, false);  /* (USF 7: nobody's) */
+        return g->cs;
+    }
+    b[0] = 1 << 6 | 7;
+    put(&w, 0x25, 6);
+    put(&w, 0, 2);
+    put(&w, 0, 1);
+    pad(&w);
+    return 0;
+}
+
+int gprs_pdch_dl(Gprs *g, uint32_t fn, unsigned tn, uint8_t b[GSM_PDCH_BLOCK])
 {
     unsigned usf = g->ul_active ? GSM_USF : 0;
     Bits w = { b + 1, 0, GSM_BLOCK - 1 };
 
+    if (tn != GSM_PDCH_TN) {
+        return pdch_dl_other(g, tn, b);
+    }
     memset(b, 0x2b, GSM_PDCH_BLOCK);
     g->fn = fn;
+    if (g->dl_ts_wait && !--g->dl_ts_wait) {
+        g->dl_ts = g->dl_ts_next;
+        gtrace(g, fn, "DL on timeslots %02x", g->dl_ts);
+    }
     /* the MS reads the PDCH after a CCCH assignment: the downlink TBF is on */
     if (g->dl == DL_ASSIGNING && g->dl_ia_sent && !g->ul_active) {
         dl_start(g);
+        g->dl_widen = g->slots > 1;
         gtrace(g, fn, "DL TBF on (CCCH)");
     }
     /* an uplink TBF came first: assign the downlink one on the PACCH */
@@ -698,8 +754,8 @@ int gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_PDCH_BLOCK])
     }
     /* a downlink TBF for the MS of an uplink one, before that one ends */
     if (g->dl == DL_PACCH && g->ul_active && !g->ul_poll_sent) {
-        pda(g, b, usf);
         dl_start(g);
+        pda(g, b, usf, false);
         gtrace(g, fn, "PDA");
         return 0;
     }
@@ -738,6 +794,12 @@ int gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_PDCH_BLOCK])
         g->dl = g_queue_is_empty(&g->dl_q) ? DL_IDLE : DL_ASSIGNING;
         g->dl_wait = 0;
         g->dl_ia_sent = false;
+    }
+    if (g->dl == DL_ACTIVE && g->dl_widen) {
+        pda(g, b, usf, true);
+        g->dl_widen = false;
+        gtrace(g, fn, "PDA (timeslots %02x)", g->dl_ts_next);
+        return 0;
     }
     if (g->dl == DL_ACTIVE) {
         bool more = !g_queue_is_empty(&g->dl_q);
@@ -1013,6 +1075,21 @@ int gprs_cs(Gprs *g)
     return g->cs;
 }
 
+void gprs_set_slots(Gprs *g, unsigned n)
+{
+    g->slots = MAX(1, MIN(n, 4));
+}
+
+unsigned gprs_slot_tn(Gprs *g, unsigned slot, unsigned slots)
+{
+    uint8_t ts = g->dl_ts_next;
+
+    if (slots <= 1 || !ts) {
+        return GSM_PDCH_TN;
+    }
+    return clz32(ts) - 24 + slot;               /* from the lowest */
+}
+
 uint32_t gprs_ms_ip(Gprs *g)
 {
     return g->pdp ? GPRS_MS_IP : 0;
@@ -1042,6 +1119,7 @@ Gprs *gprs_new(GprsToHost *to_host, void *opaque)
     g->to_host = to_host;
     g->opaque = opaque;
     g->cs = 1;                                  /* CS-2 */
+    g->slots = 4;
     g_queue_init(&g->dl_q);
     return g;
 }
