@@ -56,6 +56,7 @@ struct MsmGstmrState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     qemu_irq irq;
+    qemu_irq frame[2];          /* to the modem DSP, by frame parity */
     QEMUTimer *timer;
 
     uint32_t regs[0x10];
@@ -97,6 +98,8 @@ static void gstmr_schedule(MsmGstmrState *s)
 static void gstmr_tick(void *opaque)
 {
     MsmGstmrState *s = opaque;
+    /* the DSP runs the frame's commands as the frame starts */
+    qemu_irq_pulse(s->frame[s->next & 1]);
     qemu_irq_pulse(s->irq);
     /* the next frame, skipping ticks the guest slept through */
     s->next = MAX(s->next + 1, gstmr_frame(s) + 1);
@@ -182,6 +185,7 @@ static void gstmr_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &gstmr_ops, s, "msm-gstmr", 0x40);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(obj), s->frame, "frame", 2);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gstmr_tick, s);
 }
 

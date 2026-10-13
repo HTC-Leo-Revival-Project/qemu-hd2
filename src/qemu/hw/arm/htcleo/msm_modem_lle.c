@@ -530,6 +530,11 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->gstmr = lle_private_device(s, TYPE_MSM_GSTMR, MODEM_GSTMR_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->gstmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_GSTMR));
+    for (int i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(s->gstmr, "frame", i,
+                                    qdev_get_gpio_in_named(s->mdsp, "frame",
+                                                           i));
+    }
 
     s->wstmr = lle_private_device(s, TYPE_MSM_WSTMR, MODEM_WSTMR_PHYS);
     for (int i = 0; i < 3; i++) {

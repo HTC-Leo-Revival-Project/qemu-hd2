@@ -48,7 +48,20 @@
  *           it leaves (no peaks: there is no signal) send acquisition on to
  *           the next frequency.  Handlers ignore a done event for a queue
  *           with no search pending.
- *   bit 26  GSM L1 frame commands (not modelled)
+ *   bit 26  GSM sleep/wake handshake (not modelled)
+ *
+ * GSM L1 (mdsp_intf.c, mdsp_gprs.c) talks to the DSP through the GSM
+ * overlay's variables, found through AMSS's overlay symbol table (slot k
+ * at [[0x1350B0C] + 4k]): slots 44 and 45 are two per-frame command
+ * buffers at B+0x5F2C and B+0x6024 ([count, buffer sequence number, then
+ * the commands, each its id and fixed-length fields]), slot 47 (B+0xD18)
+ * the base of the interface's other buffers.  The DSP runs a buffer's
+ * commands at the frame tick and zeroes its count.  Commands handled:
+ *   20 (0x14)  power measurements: [id, flags, result address (B word),
+ *              n <= 7, then per measurement a gain byte, the ARFCN and two
+ *              RF words]; the results at that address: [0x8000 (ready)
+ *              | 3 + 2n, the buffer's sequence number, 0, then each
+ *              measurement's energy, high half first]
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -91,6 +104,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define B_EVT_LPQ_DONE  (MEM_B + 0x4E54)
 #define B_EVT_HPQ_DONE  (MEM_B + 0x4E56)
 #define SEARCH_NS       2000000         /* a search takes a couple of ms */
+#define B_GSM_CMDBUF0   (MEM_B + 0x5F2C)
+#define B_GSM_CMDBUF1   (MEM_B + 0x6024)
+#define GSM_CMDBUF_SIZE 0xF8
+#define GSM_CMD_PWR     20
+#define GSM_NOISE       0x40            /* energy of an empty channel */
 #define DB_MC           (1u << 19)
 #define DB_SYNC         (1u << 15)
 #define CTL_DOORBELL    0x08
@@ -106,6 +124,79 @@ struct MsmMdspState {
     bool trace;                 /* log doorbells and first writes (+PC) */
     GHashTable *seen;
 };
+
+/* the commands' lengths in bytes, by id (AMSS's table at 0x1E1EAC4) */
+static const uint8_t gsm_cmd_len[31] = {
+    [2] = 22, [4] = 22, [5] = 8, [6] = 24, [7] = 2, [8] = 4, [11] = 8,
+    [12] = 14, [13] = 8, [14] = 8, [16] = 4, [17] = 10, [20] = 64,
+    [24] = 8, [25] = 14, [26] = 12, [28] = 8, [29] = 78, [30] = 48,
+};
+
+static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
+{
+    uint32_t res = MEM_B + 2 * lduw_le_p(cmd + 4);
+    unsigned n = MIN(lduw_le_p(cmd + 6), 7);
+
+    if (res + 2 * (3 + 2 * n) > MEM_C) {
+        return;
+    }
+    stw_le_p(s->mem + res + 2, seq);
+    stw_le_p(s->mem + res + 4, 0);
+    for (unsigned i = 0; i < n; i++) {
+        uint16_t arfcn = lduw_le_p(cmd + 10 + 8 * i);
+        uint32_t e = GSM_NOISE;
+
+        if (s->trace) {
+            qemu_log("msm-mdsp: gsm power seq %04x res %04x n %u #%u pos %04x"
+                     " gain %02x rf %04x %04x\n", seq, lduw_le_p(cmd + 4), n,
+                     i, arfcn, cmd[8 + 8 * i], lduw_le_p(cmd + 12 + 8 * i),
+                     lduw_le_p(cmd + 14 + 8 * i));
+        }
+        stw_le_p(s->mem + res + 6 + 4 * i, e >> 16);
+        stw_le_p(s->mem + res + 8 + 4 * i, e & 0xffff);
+    }
+    /* the length last, bit 15 "ready": AMSS polls it */
+    stw_le_p(s->mem + res, 0x8000 | (3 + 2 * n));
+}
+
+/* a GSM frame starts: run the commands queued for it */
+static void mdsp_gsm_frame(void *opaque, int n, int level)
+{
+    MsmMdspState *s = opaque;
+    static const uint32_t bufs[2] = { B_GSM_CMDBUF0, B_GSM_CMDBUF1 };
+
+    if (!level || s->ctl != CTL_RUN || lduw_le_p(s->mem + MEM_A) != IMG_1406 ||
+        !lduw_le_p(s->mem + B_GSM_READY)) {
+        return;
+    }
+    if (s->trace) {
+        qemu_log("msm-mdsp: gsm frame parity %d: buf0 %u/%04x buf1 %u/%04x\n",
+                 n, lduw_le_p(s->mem + bufs[0]), lduw_le_p(s->mem + bufs[0] + 2),
+                 lduw_le_p(s->mem + bufs[1]), lduw_le_p(s->mem + bufs[1] + 2));
+    }
+    for (int b = 0; b < 2; b++) {
+        uint8_t *buf = s->mem + bufs[b];
+        unsigned count = lduw_le_p(buf), off = 4;
+        uint16_t seq = lduw_le_p(buf + 2);
+
+        for (unsigned c = 0; c < count && off + 2 <= GSM_CMDBUF_SIZE; c++) {
+            uint16_t id = lduw_le_p(buf + off);
+            unsigned len = id < ARRAY_SIZE(gsm_cmd_len) ? gsm_cmd_len[id] : 0;
+
+            if (!len || off + len > GSM_CMDBUF_SIZE) {
+                qemu_log_mask(LOG_UNIMP, "msm-mdsp: gsm command %u?\n", id);
+                break;
+            }
+            if (id == GSM_CMD_PWR) {
+                gsm_power(s, seq, buf + off);
+            } else if (s->trace) {
+                qemu_log("msm-mdsp: gsm cmd %u seq %04x\n", id, seq);
+            }
+            off += len;
+        }
+        stw_le_p(buf, 0);
+    }
+}
 
 static void mdsp_boot(MsmMdspState *s)
 {
@@ -258,6 +349,7 @@ static void mdsp_init(Object *obj)
                           MDSP_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    qdev_init_gpio_in_named(DEVICE(obj), mdsp_gsm_frame, "frame", 2);
     s->search = timer_new_ns(QEMU_CLOCK_VIRTUAL, mdsp_search_done, s);
     s->seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     object_property_add_bool(obj, "trace", mdsp_get_trace, mdsp_set_trace);
