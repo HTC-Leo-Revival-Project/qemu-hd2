@@ -364,10 +364,8 @@ static void gsm_net_l3(MsmMdspState *s, const uint8_t *m, unsigned n)
 {
     unsigned pd = m[0] & 0xf, mt = n > 1 ? m[1] & 0x3f : 0;
 
-    if (s->trace) {
-        qemu_log("msm-mdsp: gsm net: L3 pd %u type %02x (%u bytes)\n", pd, mt,
-                 n);
-    }
+    qemu_log_mask(LOG_UNIMP, "msm-mdsp: gsm net: L3 pd %u type %02x"
+                  " (%u bytes)\n", pd, mt, n);
     if (pd == 5 && mt == 0x08) {
         /* LOCATION UPDATING REQUEST: ACCEPT (the LAI), then release */
         static const uint8_t acc[] = { 0x05, 0x02, 0x13, 0x00, 0x62, 0x00, 0x01 };
@@ -592,10 +590,9 @@ static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
     s->rach_fn = s->l1_fn;
     s->rach_ra = s->mem[e + 4];
     s->ia_bfn = gsm_ccch_after(s->gsm_fn + 2);
-    if (s->trace) {
-        qemu_log("msm-mdsp: gsm RACH ra %02x fn %u (cell %u), answer in"
-                 " block %u\n", s->rach_ra, s->rach_fn, s->gsm_fn, s->ia_bfn);
-    }
+    qemu_log_mask(LOG_UNIMP, "msm-mdsp: gsm RACH ra %02x fn %u (cell %u),"
+                  " answer in block %u\n", s->rach_ra, s->rach_fn, s->gsm_fn,
+                  s->ia_bfn);
 }
 
 /* the SCH's 25 bits for frame fn: BSIC, T1, T2, T3' (AMSS's 0xF9F41A) */
@@ -651,12 +648,10 @@ static void gsm_acq_frame(MsmMdspState *s)
         }
         stw_le_p(s->mem + B_SCH_WR, wr + 1);
         s->gsm_acq = 0;
-        if (s->trace) {
-            qemu_log("msm-mdsp: gsm sch id %u fn %u %02x%02x%02x%02x l1 %u"
-                     " start %u true diff %d\n", s->gsm_acq_id, s->gsm_fn,
-                     b[0], b[1], b[2], b[3], s->l1_fn, s->gsm_acq_l1fn,
-                     (int)(s->l1_fn - s->gsm_fn));
-        }
+        qemu_log_mask(LOG_UNIMP, "msm-mdsp: gsm sch id %u fn %u"
+                      " %02x%02x%02x%02x l1 %u start %u\n", s->gsm_acq_id,
+                      s->gsm_fn, b[0], b[1], b[2], b[3], s->l1_fn,
+                      s->gsm_acq_l1fn);
     }
 }
 
@@ -703,6 +698,8 @@ static void mdsp_gsm_frame(void *opaque, int n, int level)
                        (lduw_le_p(buf + off + 16) == GSM_RX_ACQ ||
                         lduw_le_p(buf + off + 16) == GSM_RX_ACQ_CAMP)) {
                 s->gsm_acq = 1;
+                qemu_log_mask(LOG_UNIMP, "msm-mdsp: gsm acquisition (%u) l1 fn"
+                              " %u\n", lduw_le_p(buf + off + 16), s->l1_fn);
                 s->gsm_acq_l1fn = s->l1_fn;
             }
             if (id != GSM_CMD_PWR && s->trace) {
