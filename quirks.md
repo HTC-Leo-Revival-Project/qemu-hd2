@@ -92,7 +92,23 @@ at the mDSP's command interface (AMSS's GSM L1 drives it as on the phone):
   authentication or ciphering (no TMSI), CM service, paging by IMSI,
   calls on a TCH/F (timeslot 2, early assignment), SMS both ways.
   Answered calls carry silence: speech frames are not routed anywhere.
-- Not yet: speech, GPRS (data), supplementary services, handovers.
+- Not yet: speech, supplementary services, handovers.
+- GPRS (hw/arm/htcleo/gsm_gprs.c): network mode II, attach, one PDP
+  context (IPCP DNS in the PCO), LLC UI and SNDCP unit data, no ciphering
+  or compression. The PDCH is on timeslot 5: single-slot TBFs, the
+  uplink (USF 1, acknowledged mode, extended uplink TBFs), PACCH and
+  polls; downlink TBFs (unacknowledged mode) are widened by a PACKET
+  DOWNLINK ASSIGNMENT to timeslots 3-6, a layout the HD2 (multislot
+  class 12, type 1) can receive while transmitting on 5. Coding scheme
+  `gprs-cs` (default CS-2) both ways; `gprs-slots` downlink slots
+  (default 4). The mDSP side: receive commands carry an entry per slot
+  (slot index in the result's status bits 15-13, metrics 0x28 words
+  apart), transmit commands up to two entries (one per uplink slot, a
+  poll's answer first), the coding scheme in the channel numbers.
+  `-global msm-mdsp.gprs-trace=on` (or `qom-set`) logs the PDCH's blocks.
+- GPRS throughput with slirp as the far end is TCP-bound at small sizes
+  (its TCP starts slowly over the ~1 s round trips of a busy downlink);
+  measure with transfers of 100 KB or more.
 - The cell keeps L1's frame numbers instead of its own time: AMSS restarts
   the GSM frame timer after sleep by a register write, which lands a
   variable time late here, and L1 would drift from an independent cell.
