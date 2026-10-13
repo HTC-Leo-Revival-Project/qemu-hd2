@@ -1,11 +1,32 @@
-# HTC HD2 (htcleo) on QEMU
+<h1 align="center">HTC HD2 on QEMU</h1>
+
+<p align="center">
+  <img alt="SoC: QSD8250" src="https://img.shields.io/badge/SoC-QSD8250-33B5E5?style=flat-square&labelColor=222222&logo=qualcomm&logoColor=white">
+  <img alt="QEMU: 11.1" src="https://img.shields.io/badge/QEMU-11.1-0099CC?style=flat-square&labelColor=222222&logo=qemu&logoColor=white">
+  <img alt="status: experimental" src="https://img.shields.io/badge/status-experimental-FFBB33?style=flat-square&labelColor=222222">
+  <img alt="vibecoded: 100%" src="https://img.shields.io/badge/vibecoded-100%25-FF4444?style=flat-square&labelColor=222222">
+</p>
+
+<p align="center">
+  <img src="docs/hd2.png" width="720" alt="The emulated HD2: setup wizard, Settings and a 3D test on the emulated GPU">
+</p>
+
+<p align="center">
+  <a href="#build"><img src="docs/holo/n-build.png" width="59" height="30" alt="Build"></a>
+  <a href="#run"><img src="docs/holo/n-run.png" width="52" height="30" alt="Run"></a>
+  <a href="#what-works"><img src="docs/holo/n-what-works.png" width="101" height="30" alt="What works"></a>
+  <a href="#real-baseband-firmware"><img src="docs/holo/n-real-baseband-firmware.png" width="90" height="30" alt="Baseband"></a>
+  <a href="#gpu-adreno-200"><img src="docs/holo/n-gpu-adreno-200.png" width="55" height="30" alt="GPU"></a>
+  <a href="#tools"><img src="docs/holo/n-tools.png" width="62" height="30" alt="Tools"></a>
+</p>
 
 > [!WARNING]
 > **Vibecoded.** This project was written FULLY by an AI coding agent (Claude), with little (actually 0) human review. Expect bullshit, don't ask me about this (i really don't know how it works either).
 
-A QEMU machine (`-M htcleo`) that boots the HTC HD2
+A QEMU machine (`-M htcleo`) that emulates the HTC HD2 (Qualcomm QSD8250) hardware. It boots whatever is in its NAND, unmodified, the way the phone would.
 
-## Build
+<a name="build"></a>
+<h2><img src="docs/holo/h-build.png" width="86" height="40" alt="Build"></h2>
 
 ```bash
 mkdir -p src/qemu/build && cd src/qemu/build
@@ -15,293 +36,116 @@ mkdir -p src/qemu/build && cd src/qemu/build
 ninja qemu-system-arm qemu-system-hexagon
 ```
 
-The machine lives in `src/qemu/hw/arm/htcleo/`.
+The machine is in `src/qemu/hw/arm/htcleo/`.
 
-## Create the images
+<a name="images"></a>
+<h2><img src="docs/holo/h-images.png" width="106" height="40" alt="Images"></h2>
 
-```bash
-cd images
-python3 ../tools/hd2_mknand.py --lk ../firmware/lk-user.bin --rom ../firmware/dl/NexusHD2-ICS-CM9-HWA_V2.8.zip -o nand.img
-../tools/mksdcard.sh sdcard.img 1024             # optional microSD (FAT32)
-```
+`images/nand.img` is the phone's raw NAND: a dump of your own, or one built with `tools/hd2_mknand.py` (see `--help`). `tools/mksdcard.sh images/sdcard.img 1024` makes an optional FAT32 microSD.
 
-`hd2_mknand.py` lays out the NAND the way cLK expects:
-- the ROM area at block 0x212 and the partition table
-- boot.img
-- yaffs2 /system and /data
-- the factory WiFi/BT MAC addresses in block 505
-
-## Run
+<a name="run"></a>
+<h2><img src="docs/holo/h-run.png" width="76" height="40" alt="Run"></h2>
 
 ```bash
-tools/start.sh
+tools/start.sh                              # start
+python3 tools/qmon.py images/qmp.sock quit  # stop
 ```
 
-- `start.sh` attaches `images/sdcard.img` when it exists.
-- It opens the adb bridge on 127.0.0.1:5555 (`ADB_PORT` changes it).
-- Audio goes nowhere by default. Set `AUDIODEV` to hear it or record it:
-  ```bash
-  AUDIODEV="-audiodev pa,id=snd0" tools/start.sh
-  AUDIODEV="-audiodev wav,id=snd0,path=out.wav" tools/start.sh
-  ```
-- To get a window, drop `-display none` from the script or pass `-display gtk`.
-- Stop QEMU with `python3 tools/qmon.py images/qmp.sock quit`.
-
-Boot to the Android UI takes about 30 s.
-
-### Web UI
-
-`web/` is a browser front end: the live screen inside a photo of a real HD2, the hardware keys, touch, typing, and the boot configuration (HLE/LLE baseband, the QDSP6 firmware, NAND and SD images, GPU renderer, audio route) in an Android 4 Holo interface. The screen streams as H.264 to WebCodecs, about 50 ms from a tap to the picture, and the sound streams as PCM. It needs QEMU built with VNC (`meson configure src/qemu/build -Dvnc=enabled`).
-```bash
-cd web && npm install && npm run dev     # http://127.0.0.1:3000
-```
-See `web/README.md`.
-
-```bash
-adb connect 127.0.0.1:5555 && adb shell    # root shell
-```
-
-### Controls
+- `images/sdcard.img` is attached if present. USB device traffic (e.g. adb) is bridged to 127.0.0.1:5555 (`ADB_PORT`).
+- Sound is off by default: `AUDIODEV="-audiodev pa,id=snd0" tools/start.sh` (or `wav,id=snd0,path=out.wav`).
+- For a window, drop `-display none` from the script or pass `-display gtk`.
+- `web/` is a browser front end (screen, keys, touch, sound, boot options). It needs QEMU built with `-Dvnc=enabled`; run `cd web && npm install && npm run dev` and see `web/README.md`.
 
 | Key | HD2 button |
 |---|---|
 | PgUp / PgDn | Volume up / down |
-| Home | Home |
-| Esc | Back |
+| Home / Esc | Home / Back |
 | F1 | Windows (Menu) |
 | F2 / F3 | Call / End |
 | F12 or End | Power |
 
-The mouse acts as the touchscreen.
+The mouse is the touchscreen. Headless: `tools/keys.py` and `tools/touch.py` send keys, taps and swipes over QMP.
 
-Headless helpers:
-- `tools/keys.py SOCK key[:ms]...` sends key presses (QEMU qcode names).
-- `tools/touch.py SOCK x,y | swipe:x0,y0,x1,y1` sends taps and swipes in screen pixels.
-- `tools/logcat.sh` dumps logcat from guest RAM, for use when adb isn't up yet.
+<a name="what-works"></a>
+<h2><img src="docs/holo/h-what-works.png" width="143" height="40" alt="What works"></h2>
 
-### Battery and USB cable
+| Block | Emulation |
+|---|---|
+| CPU | Scorpion as a Cortex-A8 with Qualcomm's MIDR and CP15 registers |
+| Core SoC | VIC/SIRC/GPIO interrupts, timers, clocks, NAND + ADM DMA, SDCC microSD |
+| Display | MDP 3.1 scanout and PPP blitter |
+| GPU | Adreno 200 on the host GPU or the CPU ([below](#gpu-adreno-200)) |
+| Modem | Modelled AMSS services (SMEM, proc_comm, SMD, RPC) by default; or the real AMSS firmware ([below](#real-baseband-firmware)) |
+| Cellular | T-Mobile US SIM, UMTS registration, data through QEMU's network |
+| WiFi | BCM4329; connect to the open network **HD2-QEMU** for internet |
+| Bluetooth / FM | BCM4329 HCI (adapter works, no radio links); FM tuner with test tones or `-global bcm4329-bt.fm-stations="MHZ=SOURCE;…"` |
+| GPS | 1 Hz fixes; `qom-set /machine/modem gps-fix LAT,LON,ALT` moves the phone |
+| Audio | QDSP6 playback to the QEMU audio backend |
+| Battery / USB | 1230 mAh gauge that charges and drains; `qom-set /machine cable usb\|ac\|none`, `qom-set /machine battery-capacity N` |
+| Input | Touchscreen, key matrix, power key, G-sensor, light sensor, compass |
+| USB | HSUSB device controller; adb is bridged to TCP |
 
-The DS2746 gauge models a 1230 mAh battery. It charges while a cable is plugged in and Linux enables the charger (GPIO 22, fast rate on GPIO 16), and it drains otherwise. The machine starts with the adb cable plugged in. To unplug it, plug in a wall charger or set the charge level, like the AOSP emulator's `power` commands:
-```bash
-python3 tools/qmon.py images/qmp.sock "qom-set /machine cable none"   # usb | ac | none
-python3 tools/qmon.py images/qmp.sock "qom-set /machine battery-capacity 15"
-```
-With `baseband=lle` the cable state goes to the PM7540, and the real AMSS updates HTC's VBUS word and notifies Linux. With the modelled baseband, the modem model does the same.
+Not emulated: camera, audio capture, Bluetooth pairing/connections.
 
-### GPS
+The `qom-set` commands go through `python3 tools/qmon.py images/qmp.sock "..."`.
 
-Location requests get a 1 Hz fix with eight satellites in view. The default position is 37.4220 N, 122.0841 W at 10 m; `-global msm-modem.gps-latitude=…` (and `gps-longitude`, `gps-altitude`) set a different one at startup. To move the phone while it runs (like the AOSP emulator's `geo fix`):
-```bash
-python3 tools/qmon.py images/qmp.sock "qom-set /machine/modem gps-fix -23.5505,-46.6333,760"
-```
+<a name="real-baseband-firmware"></a>
+<h2><img src="docs/holo/h-real-baseband-firmware.png" width="247" height="40" alt="Real baseband firmware"></h2>
 
-### Bluetooth and FM radio
+`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it, the SIM works, and the radio finds no network (the modem DSP runs no code, so there is no RF):
 
-Turn Bluetooth on in Settings. The ROM's `brcm_patchram_plus` loads `bcm4329.hcd` into the emulated chip, then bluetoothd brings the adapter up with the factory address from NAND. Scans complete without finding devices, and connections fail with a page timeout, since there is no radio.
-
-The FM receiver sits behind Broadcom's HCI vendor command `0xFC15` (register access), with Bluetooth on. For example, as root:
-```bash
-hcitool cmd 0x3f 0x15 0x00 0x00 0x01            # FM on
-hcitool cmd 0x3f 0x15 0x0a 0x00 0x7c 0x92       # FREQ = 101500 - 64000 kHz
-hcitool cmd 0x3f 0x15 0x09 0x00 0x01            # tune (0x02 = seek, see 0x07)
-hcitool cmd 0x3f 0x15 0x12 0x01                 # read FLAG0: 0x01 done, 0x20 stereo
-```
-`AUDIO_START_FM` on `/dev/msm_audio_ctl` turns on the codec's aux loopback, and the tuned station plays through the audio backend. Stations are set with `-global bcm4329-bt.fm-stations="MHZ=SOURCE;…"`, where SOURCE is `tone:HZ` or any file or stream URL that ffmpeg can decode. Without it, test tones play on 88.1, 94.7, 101.5 and 105.9 MHz, with static between stations. The ROM itself has no FM app.
-
-### Real baseband firmware
-
-`baseband=lle` runs the radio ROM's own AMSS on an emulated ARM926 modem core, next to the Scorpion, instead of the modelled baseband services. cLK, Linux and Android boot on top of it to the lock screen, and adb works:
 ```bash
 cd images
-python3 ../tools/hd2_radio.py RUU_signed.nbh -o amss.elf          # e.g. radio 2.15.50.14
+python3 ../tools/hd2_radio.py RUU_signed.nbh -o amss.elf
 cp nand.img nand-lle.img
-python3 ../tools/hd2_radio.py RUU_signed.nbh --write-nand nand-lle.img   # MIBIB, AMSS, DSP1 ...
-cd .. && tools/start-lle.sh          # start.sh with BASEBAND=lle and nand-lle.img
+python3 ../tools/hd2_radio.py RUU_signed.nbh --write-nand nand-lle.img
+cd .. && tools/start-lle.sh
 ```
-- `hd2_radio.py` unwraps the signed NBH, prints the radio's MIBIB partition table and extracts the AMSS ELF. `--write-nand` puts the radio partitions into a NAND image. AMSS then finds its MIBIB at block 2 and formats EFS2 on first boot.
-- The secure boot stages (DBL/FSBL/OSBL) are skipped. Their hand-off is reproduced instead:
-  - the SMEM heap, the fixed items and the boot segment info (item 98);
-  - HTC's configuration block at SMEM + 0xEF000 (board ID, radio version, CID, NAND ID, USB cable present);
-  - the apps core and the QDSP6, which OSBL starts before it jumps to AMSS, run from reset.
-- The modem core (cluster 1) sees the shared DRAM and peripherals and has its own devices:
 
-| Address | Device |
-|---|---|
-| 0xB8000000 | timers, watchdog; writing 1 to 0x594 + 4n interrupts the apps core (INT_A9_M2A_n) |
-| 0xB8001000 | modem VIC: the L4 tick on line 32, the ADM on 52, the watchdog bark (FIQ) on 55, apps doorbells A2M 0-6 on 56-62 |
-| 0xB8000300, 0xB8000400, 0xA8100000, 0xB0007580 | SSBI controllers; the PM7540 PMIC behind the first (`msm_ssbi.c`) |
-| 0xA8E00000, 0xA8F00400 | the modem's own shadow of the GPIO registers; its group interrupts are lines 44 and 45 |
-| 0xB1000000 | modem DSP (QDSP4) memories and control, high level: image download, the boot handshake, master controller commands, the GSM/WCDMA ready flags, WCDMA synchronous and search commands, the receive AGC (`msm_mdsp.c`) |
-| 0xB0007B00 | GSM frame timer: quarter-symbol counter, frame number, the frame tick every 120/26 ms on line 18 (`msm_gstmr.c`) |
-| 0xB0005D00 | WCDMA system timer: chip counter, 10 ms frames, three event interrupts on lines 12-14 (`msm_wstmr.c`) |
-| 0xA9B00000 | UIM: UART2 in SIM mode with a GSM SIM card behind it, interrupt through the second-level controller 7 on line 37 (`msm_uim.c`, `sim_card.c`) |
-| 0xA9400000 | ADM security domain 0, shared with the apps data mover |
-| 0xFFFC0000, 0x9C000000 | internal SRAM, modem RAM |
+The secure boot stages are skipped and their hand-off to AMSS is reproduced. Debugging: `AMSSLOG=1` puts AMSS's debug log in `images/qemu.log`, `TRACE=on` logs the modem's device accesses, fatal errors go to `images/uart1.log`, and `tools/amss_*.py` help with disassembly.
 
-- The PM7540 PMIC is modelled with:
-  - its RTC (the clock comes from QEMU's);
-  - its interrupt controller, wired to MSM GPIO 24 and the modem's GPIO interrupt shadow;
-  - the power key, USB power and charger sources.
-- The SIM is the same T-Mobile US card as in the default mode (IMSI 310260000000000), here a real ISO 7816 card: AMSS's UIM driver powers it through the PMIC, gets its ATR, falls back from USIM to GSM commands and reads it over T=0. AMSS reports it present and ready, and Android's RIL reads it with AT+CRSM.
-- The modem DSP runs no code. The model answers what AMSS's GSM and WCDMA layers wait for: firmware ready, master controller and synchronous commands, and the searcher. With no RF signal the receiver sits at its noise floor (−106 dBm) and searches find no peaks.
-- So the radio stack behaves like a phone with no network around: WCDMA frequency scans and acquisition, then GSM power scans, then NO SERVICE and power save, retried periodically. Android shows the SIM READY and "out of service".
-- GPS requests reach AMSS's gpsOne engine. The receiver turns on, finds no satellites and times out every 2 s, like a phone indoors.
-- Out of reach in this mode: registering on a network and getting a GPS fix. Both need the DSP's signal processing and the RF front end, and the DSP firmware cannot be run. Use the default mode for those.
-- Known gaps: GSM power measurements read −70 dBm rather than the noise floor (the DSP's per-frame GSM interface is not modelled), so GSM tries to acquire a few channels before it gives up.
-- AMSS prints fatal errors on UART1 (`images/uart1.log`).
+<a name="qdsp6-firmware"></a>
+<h3><img src="docs/holo/h-qdsp6-firmware.png" width="182" height="40" alt="QDSP6 firmware"></h3>
 
-Debugging:
-- `AMSSLOG=1 tools/start-lle.sh` writes AMSS's own debug log ("F3" messages) to `images/qemu.log`. It uses the TCG plugin `contrib/plugins/amsslog.c`, which hooks the msg_send functions. `AMSSLOG="1 hook=0xVA"` also reports each call of a function.
-- `TRACE=on` logs the modem core's peripheral accesses; `qom-set /machine/modem-lle trace-now true` (tools/qmon.py) switches it on at runtime, and `/machine/modem-lle/mdsp trace` logs DSP memory accesses. `AMSSLOG="1 mem=0xLO-0xHI"` logs the device accesses made by a code range.
-- `tools/amss_dis.py` disassembles by AMSS virtual address (ARM or Thumb). `tools/amss_xref.py` finds the code that loads a literal, and `tools/amss_fatal.py` finds ERR_FATAL sites.
-- `QMON_CPU=1 tools/qmon.py` runs monitor commands on the modem core. gdb (multiprocess stub, inferior 2) works, but it slows AMSS enough to trip its watchdog.
+With `baseband=lle`, `tools/start-q6.sh` also runs the radio's DSP1 image on the Hexagon QDSP6 in a second process (`qemu-system-hexagon -M htcleo-q6`):
 
-### Real DSP firmware (QDSP6)
-
-With `baseband=lle`, `tools/start-q6.sh` also runs the radio ROM's DSP1 image on the QDSP6, in a second process: `qemu-system-hexagon -M htcleo-q6`.
 ```bash
 python3 tools/hd2_radio.py images/RUU_signed.nbh --dsp images/dsp1.elf
 tools/start-q6.sh
 ```
-- The two processes share the DRAM through `images/dram.bin` and pass interrupt edges over the unix socket `images/q6link.sock`. The DSP stays in reset until the emulated OSBL has set up SMEM.
-- The Hexagon V2 cores run with `-icount` and a per-thread round-robin slice (`smt-slice`, default 64 instructions). Load-locked/store-conditional pairs behave like a reservation monitor across hardware threads.
-- The DSP's multimedia blocks:
 
-| Address | Block | DSP interrupt |
-|---|---|---|
-| 0xA1100000 | Janus video decoder (H.264): bit-exact against the JM reference decoder, including deblocking (`htcleo_q6_vdc.c`) | 16 |
-| 0xA1000000 | Janus video encoder (MPEG-4/H.263): the macroblock fetch pipeline. The firmware does the transform, quantisation and VLC itself. The motion search is not modelled: P macroblocks get a zero vector (`htcleo_q6_venc.c`) | 15 |
-| 0xA0700000 | audio interface DMA: 48 kHz stereo PCM to the QEMU audio backend (`htcleo_q6_audif.c`) | 12 |
-| 0xAB005000 | interrupts to the modem (+0) and apps (+4) cores | |
+Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder's motion search is not modelled). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers.
 
-- Android's Stagefright, Gallery and `recordvideo` use the DSP codecs, and audio plays through the DSP's front end. `Q6_AUDIO=none` mutes it; `-global htcleo-q6-audif.dump=FILE` saves the raw PCM.
-- `Q6_MACH=vdc-dump=DIR` saves every decoder/encoder command buffer with the blocks it feeds, plus the decoded pictures. `Q6_MACH=venc-test-pattern=on` paints a moving test picture over the camera input. `tools/vdc/` has a Python reference model and parsers for the command buffers.
-- The DSP1 firmware uses V2 encodings that QEMU's Hexagon decoder lacked (the ALU64 forms of `packhl`, `add:sat` and `sub:sat`). An unknown encoding now logs "undecodable packet" in `images/q6.log` and raises the guest's invalid-packet exception.
-- `contrib/plugins/hexhook.c` prints registers and memory at chosen DSP addresses, and logs the loads and stores of a code range.
+<a name="gpu-adreno-200"></a>
+<h2><img src="docs/holo/h-gpu-adreno-200.png" width="196" height="40" alt="GPU (Adreno 200)"></h2>
 
-### WiFi
+The guest's own graphics driver runs on an emulated Adreno 200: command processor, GPU MMU, a2xx shaders, binning into GMEM, and textures including ETC1, ATC, DXT and mipmaps.
 
-Turn WiFi on in Settings and connect to the open network **HD2-QEMU**. The phone gets 10.0.2.15 by DHCP and real internet through QEMU's user-mode network.
+Two renderers (`-global msm-adreno.backend=gl|soft`):
+- **`gl`** (default) uses the host GPU through OpenGL 4.5, Xenia-style: shaders are translated to GLSL, and GMEM is a GPU buffer the shaders update under fragment shader interlock. Needs `GL_ARB_fragment_shader_interlock` (NVIDIA, recent Intel); otherwise QEMU falls back to `soft`.
+- **`soft`** interprets everything on the CPU (`-global msm-adreno.threads=N`).
 
-The connection comes from the default `-nic`. To pick your own backend:
-```bash
-tools/start.sh -nic user,model=bcm4329
-```
+On an RTX 3080, `gl` draws 8 full-screen blended layers in ~5 ms (`soft`: ~150 ms) and an 18K-triangle mesh in ~3 ms (`soft`: ~49 ms).
 
-### GPU (Adreno 200)
+`tools/gltri.c` and `tools/gltest.c` are GLES2 test programs. For debugging: `qom-set /machine/gpu trace FILE`, `ADRENO_STATS=SECONDS`, `ADRENO_GL_DEBUG=1`.
 
-The Adreno 200 is emulated (`src/qemu/hw/arm/htcleo/msm_adreno*`), so Android can render with the ROM's own Qualcomm libraries instead of the PixelFlinger software renderer. Build a NAND image without the emulator's GPU properties:
-```bash
-python3 ../tools/hd2_mknand.py --lk ../firmware/lk-user.bin --rom ../firmware/dl/NexusHD2-ICS-CM9-HWA_V2.8.zip --gpu -o nand-gpu.img
-```
-Then SurfaceFlinger, the boot animation and apps (hwui) all render on the emulated GPU. For an image built without `--gpu`, the GPU is idle and nothing changes.
-
-What is modelled:
-- the KGSL-facing hardware: interrupts, the GPU MMU, and the command processor running the ring buffer and indirect buffers (PM4 packets);
-- the a2xx shader core: the driver's compiled shader microcode, translated to GLSL for the host GPU, or interpreted on the CPU;
-- the 3D pipe: vertex fetch, triangles, strips, fans, rectangles, points and lines, clipping, scissors, perspective-correct interpolation, depth/stencil, alpha test and blending, rendered in bins into GMEM and resolved to memory;
-- textures: 8/16/32-bit and float formats, ETC1, ATC, DXT and 3DC, mipmaps with the Xenos layout (packed mip tails), bilinear/trilinear filtering, and tiled surfaces.
-
-There are two renderers (`-global msm-adreno.backend=gl|soft`):
-- **`gl`, the default: the host GPU**, through OpenGL 4.5 on a surfaceless EGL context, the way Xenia emulates the Xbox 360's Xenos (the Adreno 200's sibling). The guest's vertex and pixel shaders are translated from a2xx microcode to GLSL. GMEM, the 256 KiB of on-chip memory the driver renders bins into, is a host GPU buffer that the translated pixel shaders read and write themselves, in the guest's byte layout. Fragment shader interlock keeps those accesses in primitive order, as in Xenia's rasterizer-ordered-view render backend. So depth/stencil, blending, MSAA and the driver's fast clears (which reinterpret GMEM) behave exactly as in the software renderer. Textures are decoded to host textures and kept until QEMU's dirty-page tracking or the GPU's own writes show their memory changed. Resolves copy GMEM to memory when the commands are done, without waiting for the host GPU at every bin. It needs OpenGL 4.5 with `GL_ARB_fragment_shader_interlock` (NVIDIA, recent Intel); without it, QEMU says so and uses `soft`.
-- **`soft`: the CPU.** It interprets the shaders on 16 lanes, with 6 rasterizer threads (`-global msm-adreno.threads=N`).
-
-Measured with the test programs below on an RTX 3080 (with the buffer swap, frames wait for the display's 60 Hz):
-
-| Workload | `soft` | `gl` |
-|---|---|---|
-| Full-screen clear + one triangle | ~15 ms | ~4 ms |
-| Spinning depth-tested cube | ~16 ms | ~16 ms (display) |
-| 8 full-screen blended, trilinear-textured layers | ~150 ms | ~18 ms (display); ~5 ms without the swap |
-| 64 such layers, without the swap | | ~33 ms (~750 Mpixels/s, about 5x a real Adreno 200) |
-| Lit, textured sphere of 18 432 triangles, without the swap | ~49 ms | ~3 ms |
-| The same with 51 200 triangles | | ~6.5 ms |
-
-Scrolling the Settings list, the GPU emulation costs about 0.4 ms of CPU and 0.9 ms of host GPU time per frame. The guest's own CPU work under TCG is now what limits apps.
-
-Rectangles and lines still have their vertices shaded on the CPU, and so do draws into memory instead of GMEM (the driver's texture copies and mipmap generation), which the `soft` renderer draws.
-
-Not modelled:
-- hardware video decode/encode unless the real DSP firmware runs (`tools/start-q6.sh`); otherwise video uses Android's software codecs;
-- occlusion queries and the Z180 2D core.
-
-Test programs (NDK r23, non-PIE; see the headers for build lines):
-- `tools/gltri.c` draws an RGB triangle with EGL/GLES2 on the framebuffer, reads pixels back and times the frames;
-- `tools/gltest.c` checks mipmaps, compressed textures, points and lines, depth, and a fill-rate scene.
-
-Run them with SurfaceFlinger stopped (`adb shell stop`).
-
-Debugging:
-- `qom-set /machine/gpu trace FILE` logs every packet and draw, with screen-space vertices for the draws whose vertices the CPU shades, and the host GPU's programs and textures (`""` stops it);
-- `qom-set /machine/gpu dump GPUADDR,SIZE,FILE` saves GPU memory (`0xffffffff` saves GMEM; with `gl`, GMEM as of the last time the CPU needed it);
-- `ADRENO_STATS=SECONDS` prints where the GPU emulation's time goes, every few seconds;
-- `ADRENO_GL_DEBUG=1` reports OpenGL errors and saves every generated GLSL program in the working directory;
-- `ADRENO_GL_BARRIER=1` puts a memory barrier between all host draws, not only where the shader program changes.
-
-The driver points the render targets at GMEM offset 0 before the first frame's clear, so that clear misses the depth buffer. An app's first frame is therefore depth tested against whatever the previous app left in GMEM, with either renderer (and presumably on the phone).
-
-## Processors
-
-The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulated:
-
-| Processor | Role on the phone | Emulation |
-|---|---|---|
-| Scorpion (ARMv7, Qualcomm's own core) | Apps processor: cLK, Linux, Android | **Low level.** The instructions run on a Cortex-A8 model with Qualcomm's MIDR and the Scorpion CP15 registers (PLL, L2). |
-| ARM926EJ-S (ARMv5) | Boots first from the boot ROM (PBL, then DBL/FSBL/OSBL from NAND), sets up DRAM and clocks, releases the apps core, then runs AMSS: the radio stack, SMEM, proc_comm, RPC, PMIC and battery services. | **High level by default** (`baseband=hle`). `msm_modem.c` and its helpers implement the services AMSS gives the apps core: SMEM, proc_comm, SMSM/SMD, the RPC router, the AT modem with SIM and data, and GPS. **Low level with `baseband=lle`.** The real AMSS runs instruction by instruction on an ARM926 core (cluster 1) and Android boots on it. The secure boot stages are skipped and their hand-off is reproduced. The SIM works; the radio stack runs but finds no network, see below. |
-| QDSP6 (Hexagon, 4-issue VLIW with vector instructions) | Multimedia DSP: audio decoding and mixing, voice, video codecs, Android's "aDSP" | **High level by default.** `msm_qdsp6.c` answers the apps core's DAL audio calls and plays PCM to the QEMU audio backend. **Low level with `tools/start-q6.sh`** (`qdsp6=lle`): the real DSP1 firmware runs in `qemu-system-hexagon -M htcleo-q6`, with the video decoder/encoder cores and the audio DMA modelled under it. |
-| QDSP4 (modem DSP) | Baseband signal processing for GSM/WCDMA, driven by AMSS | **Not emulated** in HLE mode, where registration, calls and data are modelled above it. **High level in LLE mode** (`msm_mdsp.c`): AMSS downloads the mDSP image and its overlays into modelled memories; the model answers the boot handshake, master controller commands, WCDMA synchronous and search commands, and reports a receiver with no signal. No DSP instructions run. |
-
-## Hardware status
-
-| Block | Model |
-|---|---|
-| CPU | Scorpion as Cortex-A8 (Qualcomm MIDR, Scorpion CP15 registers) |
-| Interrupts | VIC, SIRC, GPIO interrupts (edge and level) |
-| Timers / clocks | CSR GPT/DGT timers, clock control, PLLs, Scorpion PLL |
-| NAND | Controller (16-bit ECC layout) + ADM data mover; yaffs2 read/write |
-| microSD | SDCC (SDC2) on QEMU's SD card model; mounted by vold |
-| WiFi | BCM4329 on SDC1: SDIO card, backplane, firmware download. The firmware is emulated at protocol level (SDPCM/CDC/BDC, scan, join, events) and bridged to a QEMU NIC. |
-| Modem | SMEM, proc_comm, DEX, SMSM, SMD, RPC router (RTC, PMIC, battery…); or the real AMSS on an ARM926 core (`baseband=lle`, boots Android with the SIM; no network) |
-| Cellular | AT modem on SMD with a T-Mobile US (310/260) SIM, UMTS registration, PPP data call to QEMU user networking |
-| GPS | gpsOne PDAPI over ONC RPC: position callbacks to the HAL's client endpoint, 1 Hz fixes, runtime `gps-fix` |
-| Bluetooth | UART1DM (msm_serial_hs) with paced ADM DMA, host-wake LPM; BCM4329 HCI controller (patchram, BT 2.1 + EDR) |
-| FM radio | BCM4329 FM core via HCI `0xFC15` (tune, seek, RSSI, flags/interrupts, volume); audio through the codec aux loopback (DEX `0x51`) |
-| Audio | QDSP6 DAL playback → QEMU audio backend (verified bit-exact) |
-| Display | MDP 3.1 DMA_P scanout + PPP blitter; backlight via microP |
-| GPU | Adreno 200: command processor, MMU, a2xx shaders translated to GLSL and rendered on the host GPU (OpenGL 4.5), or interpreted with a threaded CPU rasterizer; GMEM bins and resolves, textures incl. ETC1/ATC (images built with `--gpu`). Otherwise the ICS software fallback (PixelFlinger). |
-| I2C | Touchscreen, microP (backlight, G-sensor, light sensor), battery gauge (charging and draining), PMIC, compass |
-| Buttons | GPIO key matrix + power key |
-| USB | HSUSB (ChipIdea) device controller with a built-in host. It enumerates the gadget and bridges adb to TCP. |
-
-Not emulated:
-- camera;
-- Bluetooth radio links (pairing and connections);
-- audio capture.
-
-## Tools
+<a name="tools"></a>
+<h2><img src="docs/holo/h-tools.png" width="90" height="40" alt="Tools"></h2>
 
 | Tool | Purpose |
 |---|---|
-| `hd2_mknand.py` | NAND image builder |
-| `hd2_setmac.py` | Rewrite the factory MACs in an existing image |
-| `mksdcard.sh` | FAT32 SD card image |
-| `start.sh` / `boot.sh` / `run.sh` | Launch variants |
-| `qmon.py` | HMP commands over QMP |
-| `capture.py` / `waitscreen.py` | Screendumps |
-| `waitlog.sh` | Poll the kernel log |
-| `yaffs_check.py` | Read files back from a NAND image offline |
-| `logcat_dump.py` / `logcat.sh` | Recover logcat from a RAM dump |
-| `pcsample.py` | PC histogram by kernel symbol |
-| `hd2_radio.py` | Radio NBH unpacker: partition table and AMSS ELF |
-| `start-lle.sh` | Launch with the real baseband firmware |
-| `amss_dis.py` / `amss_xref.py` / `amss_fatal.py` | AMSS reverse-engineering helpers |
-| `gltri.c` / `gltest.c` | GLES2 test programs for the emulated GPU |
-| `hd2bench/` | HD2 Bench, an Android 4.0 app (`build.sh` makes `hd2bench.apk`): CPU, OpenGL ES 2.0 and internal/SD storage speeds, to compare a real HD2 with the emulator |
+| `hd2_mknand.py`, `hd2_setmac.py`, `mksdcard.sh` | NAND and SD images |
+| `start.sh`, `start-lle.sh`, `start-q6.sh` | Launch |
+| `qmon.py`, `keys.py`, `touch.py` | Monitor commands, input |
+| `capture.py`, `waitscreen.py`, `waitlog.sh` | Screendumps, logs |
+| `yaffs_check.py`, `logcat.sh` | Read a NAND image's files, guest logs from RAM |
+| `hd2_radio.py`, `amss_*.py` | Radio firmware |
+| `gltri.c`, `gltest.c` | GPU tests |
+| `hd2bench/` | Benchmark app to compare a real HD2 with the emulator |
 
-## Credits
+<a name="credits"></a>
+<h2><img src="docs/holo/h-credits.png" width="104" height="40" alt="Credits"></h2>
 
-The Adreno 200 model is written from scratch for QEMU, but it stands on the work of these projects:
-- **[freedreno](https://docs.mesa3d.org/drivers/freedreno.html)** (Mesa; Rob Clark and contributors): the a2xx register and PM4 packet definitions (`registers/adreno/a2xx.xml`, `adreno_pm4.xml`), the a2xx shader instruction formats and disassembler (`ir2/instr-a2xx.h`, `disasm-a2xx.c`), and the a2xx driver (`gallium/drivers/freedreno/a2xx`). The driver shows how binning, resolves, fast clears and surface layouts work.
-- **[Xenia](https://xenia.jp)** (the Xbox 360 emulator, whose Xenos GPU shares the Adreno 200's design): the shader microcode definitions and interpreter semantics (`src/xenia/gpu/ucode.h`, `shader_interpreter.cc`), the command processor's packet handling, the tiled texture addressing (`texture_address.h`) and the packed mip tail layout (`texture_util.cc`). The host GPU renderer follows Xenia's approach: microcode translated to host shaders (its DXBC and SPIR-V shader translators), and EDRAM emulated in a buffer that pixel shaders access in order through rasterizer-ordered views or fragment shader interlock (its ROV/FSI render backend).
-- **[texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder)**: the reference for decoding ATC (Adreno texture compression) blocks.
-- The kernel's KGSL driver (`drivers/gpu/msm` in the htcleo kernel) defines the register interface the model answers.
+The Adreno model builds on [freedreno](https://docs.mesa3d.org/drivers/freedreno.html) (a2xx registers, packets, shader formats), [Xenia](https://xenia.jp) (Xenos shader semantics, texture tiling, and the host-GPU rendering approach) and [texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder) (ATC).
+
+The phone in `docs/hd2.png` and the web UI is derived from ["HTC HD2 - Front.jpg"](https://commons.wikimedia.org/wiki/File:HTC_HD2_-_Front.jpg) by Beamish4, [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
