@@ -532,6 +532,9 @@ static void lle_realize(DeviceState *dev, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(s->mdsp), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_MDSP));
 
+    /* the HDLC accelerator, for PPP over packet data calls */
+    lle_private_device(s, TYPE_MSM_HDLC, 0xB8100000);
+
     s->gstmr = lle_private_device(s, TYPE_MSM_GSTMR, MODEM_GSTMR_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->gstmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_GSTMR));
