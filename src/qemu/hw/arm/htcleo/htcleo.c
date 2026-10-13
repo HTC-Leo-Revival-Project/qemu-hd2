@@ -552,6 +552,10 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * jumps to AMSS, so both run from here.
          */
         msm_modem_lle_reset(s->lle);
+        if (s->q6_link) {
+            /* OSBL starts the QDSP6 once the shared memory is set up */
+            msm_q6_link_boot(s->q6_link);
+        }
         if (!s->q6_lle) {
             msm_modem_qdsp6_boot(MSM_MODEM(s->modem));
         }

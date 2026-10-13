@@ -12,6 +12,8 @@
  *   from-q6 n  line n raised there, pulsed here:
  *              0  DSP -> apps (INT_ADSP_A11)
  *              1  DSP -> modem
+ * Byte 0x7f releases the QDSP6 from reset (msm_q6_link_boot): OSBL does
+ * that once the shared memory is set up, so the DSP cannot run before.
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -35,6 +37,7 @@ struct MsmQ6LinkState {
     CharFrontend chr;
     qemu_irq from_q6[Q6_LINK_LINES];
     bool trace;
+    bool released;              /* resend the release when the DSP connects */
 };
 
 static void q6_link_to_q6(void *opaque, int n, int level)
@@ -49,6 +52,31 @@ static void q6_link_to_q6(void *opaque, int n, int level)
         qemu_log("q6-link: -> line %d\n", n);
     }
     qemu_chr_fe_write_all(&s->chr, &b, 1);
+}
+
+void msm_q6_link_boot(DeviceState *dev)
+{
+    MsmQ6LinkState *s = MSM_Q6_LINK(dev);
+    uint8_t b = 0x7f;
+
+    if (s->trace) {
+        qemu_log("q6-link: -> release the QDSP6\n");
+    }
+    s->released = true;
+    if (qemu_chr_fe_backend_open(&s->chr)) {
+        qemu_chr_fe_write_all(&s->chr, &b, 1);
+    }
+}
+
+static void q6_link_event(void *opaque, QEMUChrEvent event)
+{
+    MsmQ6LinkState *s = opaque;
+    uint8_t b = 0x7f;
+
+    /* the DSP's QEMU connected after the reset that released it */
+    if (event == CHR_EVENT_OPENED && s->released) {
+        qemu_chr_fe_write_all(&s->chr, &b, 1);
+    }
 }
 
 static int q6_link_can_receive(void *opaque)
@@ -77,7 +105,7 @@ static void q6_link_realize(DeviceState *dev, Error **errp)
     MsmQ6LinkState *s = MSM_Q6_LINK(dev);
 
     qemu_chr_fe_set_handlers(&s->chr, q6_link_can_receive, q6_link_receive,
-                             NULL, NULL, s, NULL, true);
+                             q6_link_event, NULL, s, NULL, true);
 }
 
 static void q6_link_init(Object *obj)

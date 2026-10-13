@@ -7,6 +7,9 @@
  *   -plugin libhexhook.so,hook=0x108c0bb0,hook=...,dump=0x108c0bb0:2:8
  *     hook=VA        print r0-r5 and r31 (lr) of the vCPU when VA runs
  *     dump=VA:R:N    also print N words of memory at the address in rR
+ *     memr=LO-HI     print each instruction that reads data in [LO, HI)
+ *     memrp=LO-HI    the same for a physical range
+ *     pcr=LO-HI      only watch the instructions in that code range
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -28,6 +31,12 @@ typedef struct {
 } Hook;
 
 static GArray *hooks;
+static uint64_t memr_lo, memr_hi;       /* watched data range */
+static bool memr_phys;                  /* the range is physical */
+static uint64_t pcr_lo, pcr_hi = ~0ULL;  /* only instrument code here */
+static GHashTable *memr_seen;
+static long memr_all;                   /* log every read, this many */
+static bool mem_stores;                 /* log stores instead of loads */
 static struct qemu_plugin_register *regs[NREGS];
 
 static uint32_t reg(int n)
@@ -70,8 +79,63 @@ static void on_exec(unsigned int vcpu, void *udata)
     qemu_plugin_outs(s->str);
 }
 
+static void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
+                   uint64_t vaddr, void *udata)
+{
+    uint64_t pc = (uint64_t)(uintptr_t)udata;
+    gpointer key = (gpointer)(uintptr_t)pc;
+
+    uint64_t a = vaddr;
+
+    if (qemu_plugin_mem_is_store(info) != mem_stores) {
+        return;
+    }
+    if (memr_phys) {
+        struct qemu_plugin_hwaddr *hw = qemu_plugin_get_hwaddr(info, vaddr);
+
+        if (!hw || qemu_plugin_hwaddr_is_io(hw)) {
+            return;
+        }
+        a = qemu_plugin_hwaddr_phys_addr(hw);
+    }
+    if (a < memr_lo || a >= memr_hi) {
+        return;
+    }
+    if (memr_all > 0) {
+        memr_all--;
+    } else if (g_hash_table_contains(memr_seen, key)) {
+        return;
+    }
+    g_hash_table_add(memr_seen, key);
+    uint64_t pa = 0;
+    struct qemu_plugin_hwaddr *hwp = qemu_plugin_get_hwaddr(info, vaddr);
+
+    if (hwp && !qemu_plugin_hwaddr_is_io(hwp)) {
+        pa = qemu_plugin_hwaddr_phys_addr(hwp);
+    }
+    g_autofree char *s = g_strdup_printf("hexhook: %s %08" PRIx64
+                                         " (va %08" PRIx64 " pa %08" PRIx64
+                                         ") from pc %08" PRIx64 " cpu%u\n",
+                                         mem_stores ? "write" : "read", a,
+                                         vaddr, pa, pc, vcpu);
+    qemu_plugin_outs(s);
+}
+
 static void on_tb(struct qemu_plugin_tb *tb, void *userdata)
 {
+    if (memr_hi) {
+        for (size_t i = 0; i < qemu_plugin_tb_n_insns(tb); i++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+            uint64_t va = qemu_plugin_insn_vaddr(insn);
+
+            if (va < pcr_lo || va >= pcr_hi) {
+                continue;
+            }
+            qemu_plugin_register_vcpu_mem_cb(insn, on_mem,
+                    QEMU_PLUGIN_CB_NO_REGS, QEMU_PLUGIN_MEM_RW,
+                    (void *)(uintptr_t)qemu_plugin_insn_vaddr(insn));
+        }
+    }
     for (size_t i = 0; i < qemu_plugin_tb_n_insns(tb); i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t va = qemu_plugin_insn_vaddr(insn);
@@ -121,6 +185,22 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             Hook h = { .va = strtoull(kv[1], NULL, 0) };
 
             g_array_append_val(hooks, h);
+        } else if (!strcmp(kv[0], "memr") || !strcmp(kv[0], "memrp")) {
+            char *end;
+
+            memr_phys = !strcmp(kv[0], "memrp");
+            memr_lo = strtoull(kv[1], &end, 0);
+            memr_hi = *end == '-' ? strtoull(end + 1, NULL, 0) : memr_lo + 4;
+            memr_seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+        } else if (!strcmp(kv[0], "stores")) {
+            mem_stores = atoi(kv[1]);
+        } else if (!strcmp(kv[0], "memall")) {
+            memr_all = strtol(kv[1], NULL, 0);
+        } else if (!strcmp(kv[0], "pcr")) {
+            char *end;
+
+            pcr_lo = strtoull(kv[1], &end, 0);
+            pcr_hi = *end == '-' ? strtoull(end + 1, NULL, 0) : pcr_lo + 4;
         } else if (!strcmp(kv[0], "dump")) {
             g_auto(GStrv) f = g_strsplit(kv[1], ":", 3);
             Hook h;

@@ -23,6 +23,7 @@
  *               apps processor (the SMSM interrupt table's second byte
  *               picks the register)
  *   0xA0700000  audio interface DMA (htcleo_q6_audif.c), interrupt 12
+ *   0xA1000000  video encoder core (htcleo_q6_venc.c), interrupt 15
  *   0xA1100000  video decoder core (htcleo_q6_vdc.c), interrupt 16
  *   0xABF00000  "TCM IO": interrupt routing the kernel sets up at boot
  *
@@ -67,6 +68,7 @@
 #include "hw/hexagon/htcleo_q6_audif.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "exec/icount.h"
 #include "system/physmem.h"
@@ -84,6 +86,8 @@
 #define AUDIF_BASE              0xA0700000
 #define AUDIF_IRQ               12
 #define VDC_BASE                0xA1100000
+#define VENC_BASE               0xA1000000
+#define VENC_IRQ                15
 #define VDC_SIZE                0x5000
 #define VDC_STATUS              0x0010      /* bits 0-1: AXI/CRIF errors */
 #define VDC_STATUS_CLR          0x0018
@@ -97,6 +101,22 @@
 #define TAP_BASE                0x40000000ULL
 #define TAP_SIZE                0xC0000000ULL
 #define TRACE_REPEATS           4
+
+typedef struct HtcleoQ6MachineState HtcleoQ6MachineState;
+
+/* one command processor of the Janus core (decoder 0xA1100000, encoder
+ * 0xA1000000: the same register interface) */
+typedef struct JanusCore {
+    HtcleoQ6MachineState *s;
+    const char *name;
+    hwaddr base;
+    bool encoder;
+    MemoryRegion io;
+    uint32_t regs[VDC_SIZE / 4];
+    QEMUTimer *timer;
+    int irq;
+    unsigned frames;
+} JanusCore;
 
 #define TYPE_HTCLEO_Q6_MACHINE MACHINE_TYPE_NAME("htcleo-q6")
 OBJECT_DECLARE_SIMPLE_TYPE(HtcleoQ6MachineState, HTCLEO_Q6_MACHINE)
@@ -121,15 +141,14 @@ struct HtcleoQ6MachineState {
     CharFrontend link;
     int32_t apps_irq, modem_irq;
     uint32_t smt_slice;
+    bool released;              /* the apps side let the DSP out of reset */
+    bool release_on_reset;
     MemoryRegion ipc_io;
 
-    /* the video decoder core ("Janus" VDC) */
-    MemoryRegion vdc_io;
-    uint32_t vdc_regs[VDC_SIZE / 4];
-    QEMUTimer *vdc_timer;
+    /* the "Janus" video core: decoder and encoder command processors */
+    JanusCore vdc, venc;
     int32_t vdc_irq;
     char *vdc_dump;             /* directory: one file per command buffer */
-    unsigned vdc_frames;
 };
 
 /* ---------------------------------------------------------------- */
@@ -302,12 +321,36 @@ static int q6_link_can_receive(void *opaque)
     return 64;
 }
 
+static void q6_release(HtcleoQ6MachineState *s)
+{
+    CPUState *cs = CPU(s->cpu[0]);
+
+    if (s->trace) {
+        qemu_log("q6-link: <- out of reset%s\n",
+                 s->released ? " again: resetting the DSP" : "");
+    }
+    if (s->released) {
+        /* the apps processor and modem restarted: start over */
+        s->release_on_reset = true;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
+    s->released = true;
+    cs->halted = 0;
+    qemu_cpu_kick(cs);
+}
+
 static void q6_link_receive(void *opaque, const uint8_t *buf, int size)
 {
     HtcleoQ6MachineState *s = opaque;
 
     for (int i = 0; i < size; i++) {
         int line = buf[i] & 0x7F;
+
+        if (buf[i] == 0x7f) {
+            q6_release(s);
+            continue;
+        }
         int irq = line == 0 ? s->apps_irq : line == 1 ? s->modem_irq : -1;
 
         if (s->trace) {
@@ -353,7 +396,7 @@ static const MemoryRegionOps q6_ipc_ops = {
 /* Video decoder core                                                */
 /* ---------------------------------------------------------------- */
 
-#define VDC_REG(s, off) ((s)->vdc_regs[(off) / 4])
+#define VDC_REG(c, off) ((c)->regs[(off) / 4])
 
 #define VDC_CMD_MAX     0x40000     /* words */
 
@@ -368,11 +411,12 @@ static const MemoryRegionOps q6_ipc_ops = {
  *   00 xxxxxx           (seen with 0x50, after the MB header)
  * The first word is a header, the stream ends at a zero word.
  */
-static void vdc_dump_buffer(HtcleoQ6MachineState *s, uint32_t addr)
+static void vdc_dump_buffer(JanusCore *c, uint32_t addr)
 {
     g_autofree uint32_t *w = g_new0(uint32_t, VDC_CMD_MAX);
-    g_autofree char *path = g_strdup_printf("%s/vdc%04u.bin", s->vdc_dump,
-                                            s->vdc_frames);
+    g_autofree char *path = g_strdup_printf("%s/%s%04u.bin", c->s->vdc_dump,
+                                            c->encoder ? "venc" : "vdc",
+                                            c->frames);
     FILE *f = fopen(path, "wb");
     unsigned n;
 
@@ -424,77 +468,89 @@ static void vdc_dump_buffer(HtcleoQ6MachineState *s, uint32_t addr)
     fclose(f);
 }
 
-static void vdc_run(HtcleoQ6MachineState *s, int slot)
+static void vdc_run(JanusCore *c, int slot)
 {
-    uint32_t addr = VDC_REG(s, slot ? VDC_CP_ADDR1 : VDC_CP_ADDR0);
+    HtcleoQ6MachineState *s = c->s;
+    uint32_t addr = VDC_REG(c, slot ? VDC_CP_ADDR1 : VDC_CP_ADDR0);
 
     if (s->vdc_dump) {
-        vdc_dump_buffer(s, addr);
+        vdc_dump_buffer(c, addr);
     }
-    if (s->vdc_dump) {
+    if (c->encoder) {
+        htcleo_venc_encode(addr, s->trace);
+    } else if (s->vdc_dump) {
         g_autofree char *yuv = g_strdup_printf("%s/out%04u.yuv", s->vdc_dump,
-                                               s->vdc_frames);
+                                               c->frames);
         htcleo_vdc_decode(addr, s->trace, yuv);
     } else {
         htcleo_vdc_decode(addr, s->trace, NULL);
     }
-    s->vdc_frames++;
+    c->frames++;
 
     if (s->trace) {
-        qemu_log("q6-vdc: %.3f slot %d command buffer %08x\n",
+        qemu_log("q6-%s: %.3f slot %d command buffer %08x\n", c->name,
                  g_get_real_time() / 1e6, slot, addr);
     }
-    VDC_REG(s, VDC_CP_DONE) |= 1u << slot;
+    VDC_REG(c, VDC_CP_DONE) |= 1u << slot;
 }
 
 static void vdc_kick(void *opaque)
 {
-    HtcleoQ6MachineState *s = opaque;
-    uint32_t pending = VDC_REG(s, VDC_CP_BUSY) & ~VDC_REG(s, VDC_CP_DONE) & 3;
+    JanusCore *c = opaque;
+    uint32_t pending = VDC_REG(c, VDC_CP_BUSY) & ~VDC_REG(c, VDC_CP_DONE) & 3;
 
-    if (!(VDC_REG(s, VDC_CP_ENABLE) & 1) || !pending) {
+    if (!(VDC_REG(c, VDC_CP_ENABLE) & 1) || !pending) {
         return;
     }
     for (int slot = 0; slot < 2; slot++) {
         if (pending & (1u << slot)) {
-            vdc_run(s, slot);
+            vdc_run(c, slot);
         }
     }
-    if (s->vdc_irq >= 0) {
-        qemu_irq_pulse(qdev_get_gpio_in(DEVICE(s->cpu[0]), s->vdc_irq));
+    if (c->irq >= 0) {
+        qemu_irq_pulse(qdev_get_gpio_in(DEVICE(c->s->cpu[0]), c->irq));
     }
 }
 
 static uint64_t vdc_read(void *opaque, hwaddr off, unsigned size)
 {
-    HtcleoQ6MachineState *s = opaque;
-    uint32_t v = VDC_REG(s, off & ~3);
+    JanusCore *c = opaque;
+    uint32_t v = VDC_REG(c, off & ~3);
 
-    tap_log(s, VDC_BASE + off, false, v, size);
+    tap_log(c->s, c->base + off, false, v, size);
     return v;
 }
 
 static void vdc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
-    HtcleoQ6MachineState *s = opaque;
+    JanusCore *c = opaque;
 
-    tap_log(s, VDC_BASE + off, true, val, size);
+    tap_log(c->s, c->base + off, true, val, size);
     switch (off) {
     case VDC_STATUS_CLR:
-        VDC_REG(s, VDC_STATUS) &= ~val;
+        VDC_REG(c, VDC_STATUS) &= ~val;
         return;
     case VDC_CP_DONE_CLR:
-        VDC_REG(s, VDC_CP_DONE) &= ~val;
+        VDC_REG(c, VDC_CP_DONE) &= ~val;
         return;
     case VDC_CP_BUSY:
-        VDC_REG(s, off) = val;
-        /* the hardware takes a while; let the driver finish queueing */
-        timer_mod(s->vdc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  3 * SCALE_MS);
+        VDC_REG(c, off) = val;
+        /*
+         * The encoder's fetches lead the firmware, which starts on the
+         * macroblocks right after queueing: run it now, interrupt soon.
+         * The decoder takes a while; let the driver finish queueing.
+         */
+        if (c->encoder) {
+            vdc_kick(c);
+        } else {
+            timer_mod(c->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      3 * SCALE_MS);
+        }
         return;
     }
-    VDC_REG(s, off) = val;
+    VDC_REG(c, off) = val;
 }
+
 
 static const MemoryRegionOps vdc_ops = {
     .read = vdc_read,
@@ -503,13 +559,33 @@ static const MemoryRegionOps vdc_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+static void janus_init(HtcleoQ6MachineState *s, JanusCore *c, const char *name,
+                       hwaddr base, bool encoder, int irq)
+{
+    c->s = s;
+    c->name = name;
+    c->base = base;
+    c->encoder = encoder;
+    c->irq = irq;
+    memory_region_init_io(&c->io, OBJECT(s), &vdc_ops, c, name, VDC_SIZE);
+    memory_region_add_subregion(get_system_memory(), base, &c->io);
+    c->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vdc_kick, c);
+}
+
 /* ---------------------------------------------------------------- */
 /* Machine                                                           */
 /* ---------------------------------------------------------------- */
 
 static void htcleo_q6_cpu_reset(void *opaque)
 {
-    cpu_reset(CPU(opaque));
+    HexagonCPU *cpu = opaque;
+    HtcleoQ6MachineState *s = HTCLEO_Q6_MACHINE(qdev_get_machine());
+
+    cpu_reset(CPU(cpu));
+    if (cpu == s->cpu[0] && s->release_on_reset) {
+        s->release_on_reset = false;
+        CPU(cpu)->halted = 0;
+    }
 }
 
 static void htcleo_q6_init(MachineState *machine)
@@ -549,10 +625,8 @@ static void htcleo_q6_init(MachineState *machine)
     memory_region_init_io(&s->ipc_io, OBJECT(machine), &q6_ipc_ops, s,
                           "q6-ipc", 0x8);
     memory_region_add_subregion(sysmem, Q6_IPC_BASE, &s->ipc_io);
-    memory_region_init_io(&s->vdc_io, OBJECT(machine), &vdc_ops, s, "q6-vdc",
-                          VDC_SIZE);
-    memory_region_add_subregion(sysmem, VDC_BASE, &s->vdc_io);
-    s->vdc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vdc_kick, s);
+    janus_init(s, &s->vdc, "vdc", VDC_BASE, false, s->vdc_irq);
+    janus_init(s, &s->venc, "venc", VENC_BASE, true, VENC_IRQ);
 
     glob = qdev_new(TYPE_HEXAGON_GLOBALREG);
     object_property_add_child(OBJECT(machine), "global-regs", OBJECT(glob));
@@ -577,8 +651,12 @@ static void htcleo_q6_init(MachineState *machine)
         s->cpu[i] = cpu;
         qemu_register_reset(htcleo_q6_cpu_reset, cpu);
         qdev_prop_set_uint32(DEVICE(cpu), "htid", i);
-        /* thread 0 runs from reset, start enables the others */
-        qdev_prop_set_bit(DEVICE(cpu), "start-powered-off", i != 0);
+        /*
+         * thread 0 runs from reset (with a link, once the apps side
+         * releases it), start enables the others
+         */
+        qdev_prop_set_bit(DEVICE(cpu), "start-powered-off",
+                          i != 0 || s->link_id);
         if (i == 0) {
             qdev_prop_set_uint32(DEVICE(cpu), "exec-start-addr", entry);
         }
@@ -612,6 +690,16 @@ static void htcleo_q6_init(MachineState *machine)
         qemu_chr_fe_set_handlers(&s->link, q6_link_can_receive,
                                  q6_link_receive, NULL, NULL, s, NULL, true);
     }
+}
+
+static bool htcleo_q6_get_venc_pattern(Object *obj, Error **errp)
+{
+    return htcleo_venc_test_pattern;
+}
+
+static void htcleo_q6_set_venc_pattern(Object *obj, bool v, Error **errp)
+{
+    htcleo_venc_test_pattern = v;
 }
 
 static char *htcleo_q6_get_vdc_dump(Object *obj, Error **errp)
@@ -702,6 +790,9 @@ static void htcleo_q6_class_init(ObjectClass *oc, const void *data)
                                   htcleo_q6_set_link);
     object_class_property_add_str(oc, "vdc-dump", htcleo_q6_get_vdc_dump,
                                   htcleo_q6_set_vdc_dump);
+    object_class_property_add_bool(oc, "venc-test-pattern",
+                                   htcleo_q6_get_venc_pattern,
+                                   htcleo_q6_set_venc_pattern);
 }
 
 static const TypeInfo htcleo_q6_info = {
