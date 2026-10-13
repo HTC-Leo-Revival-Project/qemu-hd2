@@ -5,7 +5,10 @@
  *   - uplink: one phase access from a packet RACH (gsm_net.c assigns it on
  *     the CCCH), dynamic allocation with USF GSM_USF, acknowledged mode;
  *     the network resolves contention and acknowledges with PACKET UPLINK
- *     ACK/NACK, the final one polled for a PACKET CONTROL ACK
+ *     ACK/NACK.  The TBF is extended (SI13's NW_EXT_UTBF): it outlives the
+ *     MS's countdown, the MS sending dummy blocks until it has data again,
+ *     until UL_HOLD blocks without data; then the final ACK/NACK, polled
+ *     for a PACKET CONTROL ACK, ends it
  *   - downlink: assigned on the CCCH (IMMEDIATE ASSIGNMENT with a packet
  *     downlink assignment, by TLLI), unacknowledged mode, CS-1, the last
  *     block polled
@@ -40,21 +43,28 @@
  */
 enum { DL_IDLE, DL_ASSIGNING, DL_PACCH, DL_ACTIVE, DL_FINAL };
 #define DL_HOLD         160             /* ~3 s */
-#define DL_KEEP         32
+#define DL_KEEP         8
 #define DL_POLL         8
+#define UL_HOLD         100             /* ~2 s */
 
 struct Gprs {
     bool trace;
+    uint32_t fn;                        /* the PDCH's last block */
     GprsToHost *to_host;
     void *opaque;
     uint32_t tlli;
     /* the uplink TBF */
     bool ul_active, ul_cr_done, ul_final, ul_puan, ul_poll_sent;
-    uint8_t ul_vr;                      /* V(R): the next BSN expected */
-    bool ul_rx[128];                    /* BSNs received */
-    bool ul_done[128];                  /* and taken in order */
+    /*
+     * the receive window (44.060 9.1.5): V(Q) the first BSN not received
+     * yet, V(R) one past the highest received; ul_rx for the 64 BSNs
+     * before V(R)
+     */
+    uint8_t ul_vq, ul_vr;
+    bool ul_rx[128];
     uint8_t ul_blk[128][GSM_BLOCK];
     unsigned ul_idle, ul_since_puan;
+    unsigned ul_quiet;                  /* blocks since the last data */
     uint8_t ul_pdu[LLC_MAX];
     unsigned ul_pdu_len;
     /* the downlink TBF */
@@ -85,6 +95,21 @@ static void G_GNUC_PRINTF(1, 2) gprs_event(const char *fmt, ...)
     s = g_strdup_vprintf(fmt, ap);
     va_end(ap);
     qemu_log_mask(LOG_UNIMP, "gsm-gprs: %s\n", s);
+}
+
+static void G_GNUC_PRINTF(3, 4) gtrace(Gprs *g, uint32_t fn,
+                                       const char *fmt, ...)
+{
+    va_list ap;
+    g_autofree char *s = NULL;
+
+    if (!g->trace) {
+        return;
+    }
+    va_start(ap, fmt);
+    s = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    qemu_log("gsm-gprs %u: %s\n", fn, s);
 }
 
 /* ---- CSN.1 bits ---- */
@@ -219,28 +244,25 @@ static void llc_ul(Gprs *g, const uint8_t *f, size_t n)
         } else {
             sndcp_ul(g, info, len);
         }
-    } else if ((f[1] & 0xef) == 0xeb) {         /* XID: accept as offered */
-        uint8_t x[LLC_MAX];
-        size_t len = MIN(n - 5, sizeof(x) - 2);
+    } else if ((f[1] & 0xef) == 0xeb && !(f[0] & 0x40)) {
+        /*
+         * an XID command (C/R 0 from the MS): the response (C/R 0 from
+         * the network) accepts the values offered
+         */
+        GByteArray *r = g_byte_array_sized_new(n);
+        uint32_t c;
+        uint8_t t[3];
 
         gprs_event("LLC: XID on SAPI %u", sapi);
-        x[0] = 0x40 | sapi;
-        x[1] = f[1];
-        memcpy(x + 2, f + 2, len);
-        {
-            GByteArray *r = g_byte_array_sized_new(len + 5);
-            uint32_t c;
-            uint8_t t[3];
-
-            g_byte_array_append(r, x, 2 + len);
-            c = crc24(r->data, r->len);
-            t[0] = c;
-            t[1] = c >> 8;
-            t[2] = c >> 16;
-            g_byte_array_append(r, t, 3);
-            g_queue_push_tail(&g->dl_q, r);
-            dl_wanted(g);
-        }
+        g_byte_array_append(r, f, n - 3);
+        r->data[0] = sapi;
+        c = crc24(r->data, r->len);
+        t[0] = c;
+        t[1] = c >> 8;
+        t[2] = c >> 16;
+        g_byte_array_append(r, t, 3);
+        g_queue_push_tail(&g->dl_q, r);
+        dl_wanted(g);
     }
 }
 
@@ -428,6 +450,7 @@ static void sndcp_ul(Gprs *g, const uint8_t *p, size_t n)
         g->sn_len += n - h;
     }
     if (!more && g->sn_len) {
+        gtrace(g, g->fn, "to host: %u octets", g->sn_len);
         g->to_host(g->opaque, g->sn_buf, g->sn_len);
         g->sn_len = 0;
     }
@@ -442,6 +465,7 @@ void gprs_from_host(Gprs *g, const uint8_t *ip, size_t len)
     if (!g->pdp) {
         return;
     }
+    gtrace(g, g->fn, "from host: %zu octets", len);
     while (off < len) {
         uint8_t f[N201_U];
         size_t h = 0, chunk;
@@ -465,6 +489,12 @@ void gprs_from_host(Gprs *g, const uint8_t *ip, size_t len)
 }
 
 /* ---- RLC/MAC ---- */
+
+/* the uplink blocks have all come */
+static bool ul_complete(Gprs *g)
+{
+    return g->ul_vq == g->ul_vr;
+}
 
 /* PACKET UPLINK ACK/NACK; final: all received, and poll */
 static void puan(Gprs *g, uint8_t b[GSM_BLOCK], bool final)
@@ -633,9 +663,11 @@ void gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK])
     Bits w = { b + 1, 0, GSM_BLOCK - 1 };
 
     memset(b, 0x2b, GSM_BLOCK);
+    g->fn = fn;
     /* the MS reads the PDCH after a CCCH assignment: the downlink TBF is on */
     if (g->dl == DL_ASSIGNING && g->dl_ia_sent && !g->ul_active) {
         dl_start(g);
+        gtrace(g, fn, "DL TBF on (CCCH)");
     }
     /* an uplink TBF came first: assign the downlink one on the PACCH */
     if (g->dl == DL_ASSIGNING && g->ul_active) {
@@ -645,14 +677,22 @@ void gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK])
         gprs_event("uplink TBF: the MS has gone");
         g->ul_active = false;
     }
+    /* the extended uplink TBF has been idle long enough: end it */
+    if (g->ul_active && !g->ul_final && ++g->ul_quiet >= UL_HOLD &&
+        ul_complete(g)) {
+        g->ul_final = g->ul_puan = true;
+    }
     /* a downlink TBF for the MS of an uplink one, before that one ends */
     if (g->dl == DL_PACCH && g->ul_active && !g->ul_poll_sent) {
         pda(g, b, usf);
         dl_start(g);
+        gtrace(g, fn, "PDA");
         return;
     }
     if (g->ul_active && g->ul_puan) {
         puan(g, b, g->ul_final);
+        gtrace(g, fn, "PUAN V(Q) %u V(R) %u%s", g->ul_vq, g->ul_vr,
+               g->ul_final ? " final" : "");
         g->ul_puan = false;
         g->ul_since_puan = 0;
         if (g->ul_final) {
@@ -662,6 +702,7 @@ void gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK])
     }
     if (g->ul_wanted && !g->ul_active && g->dl == DL_ACTIVE) {
         pua(g, b, usf);
+        gtrace(g, fn, "PUA");
         g->ul_wanted = false;
         gprs_ul_assigned(g);
         g->ul_cr_done = true;                   /* the MS is known */
@@ -682,22 +723,26 @@ void gprs_pdch_dl(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK])
         bool more = !g_queue_is_empty(&g->dl_q);
 
         if (more) {
+            bool poll = ++g->dl_since_poll >= DL_POLL ||
+                        (g_queue_get_length(&g->dl_q) == 1 &&
+                         ((GByteArray *)g_queue_peek_head(&g->dl_q))->len -
+                         g->dl_off <= RLC_DATA);
+
             g->dl_idle = 0;
-            dl_data(g, b, usf, false, false,
-                    ++g->dl_since_poll >= DL_POLL ||
-                    (g_queue_get_length(&g->dl_q) == 1 &&
-                     g_queue_peek_head(&g->dl_q) &&
-                     ((GByteArray *)g_queue_peek_head(&g->dl_q))->len -
-                     g->dl_off <= RLC_DATA));
+            gtrace(g, fn, "DL BSN %u%s, %u frames", g->dl_bsn,
+                   poll ? " polled" : "", g_queue_get_length(&g->dl_q));
+            dl_data(g, b, usf, false, false, poll);
             return;
         }
         if (++g->dl_idle >= DL_HOLD && !g->ul_active) {
+            gtrace(g, fn, "DL release");
             dl_data(g, b, usf, true, true, true);  /* release */
             g->dl = DL_FINAL;
             g->dl_wait = 0;
             return;
         }
         if (g->dl_idle % DL_KEEP == 0) {
+            gtrace(g, fn, "DL keepalive");
             dl_data(g, b, usf, true, false, true);
             return;
         }
@@ -766,32 +811,37 @@ static void ul_block(Gprs *g, const uint8_t *b)
         }
     }
     if (cv == 0) {
-        g->ul_final = true;
-        g->ul_puan = true;
+        g->ul_puan = true;                      /* (the TBF goes on) */
     }
 }
 
 /*
  * acknowledged mode: blocks are kept until those before them have come;
  * a repeat means the MS wants an acknowledgement, which it gets, as it
- * does every 4 new blocks
+ * does every 4 new blocks (the bitmap nacks those missing)
  */
 static void ul_data(Gprs *g, const uint8_t *b)
 {
     unsigned bsn = b[2] >> 1;
 
-    if (g->ul_rx[bsn] || ((bsn - g->ul_vr) & 127) >= 64) {
+    g->ul_quiet = 0;
+    if (((bsn - g->ul_vq) & 127) >= 64 ||
+        (((bsn - g->ul_vq) & 127) < ((g->ul_vr - g->ul_vq) & 127) &&
+         g->ul_rx[bsn])) {
         g->ul_puan = true;                      /* a repeat */
         return;
     }
+    if (((bsn - g->ul_vr) & 127) < 64) {        /* beyond V(R): advance it */
+        while (g->ul_vr != ((bsn + 1) & 127)) {
+            g->ul_rx[g->ul_vr] = false;
+            g->ul_vr = (g->ul_vr + 1) & 127;
+        }
+    }
     g->ul_rx[bsn] = true;
-    g->ul_rx[(bsn + 64) & 127] = false;
     memcpy(g->ul_blk[bsn], b, GSM_BLOCK);
-    while (g->ul_rx[g->ul_vr] && !g->ul_done[g->ul_vr]) {
-        g->ul_done[g->ul_vr] = true;
-        g->ul_done[(g->ul_vr + 64) & 127] = false;
-        ul_block(g, g->ul_blk[g->ul_vr]);
-        g->ul_vr = (g->ul_vr + 1) & 127;
+    while (g->ul_vq != g->ul_vr && g->ul_rx[g->ul_vq]) {
+        ul_block(g, g->ul_blk[g->ul_vq]);
+        g->ul_vq = (g->ul_vq + 1) & 127;
     }
     if (!g->ul_cr_done || ++g->ul_since_puan >= 4) {
         g->ul_puan = true;
@@ -802,10 +852,8 @@ void gprs_pdch_ul(Gprs *g, uint32_t fn, const uint8_t b[GSM_BLOCK])
 {
     g->ul_idle = 0;
     if (b[0] >> 6 == 0) {
-        if (g->trace) {
-            qemu_log("gsm-gprs: UL data TFI %u BSN %u CV %u TI %u\n",
-                     b[1] >> 1 & 31, b[2] >> 1, b[0] >> 2 & 15, b[1] & 1);
-        }
+        gtrace(g, fn, "UL BSN %u CV %u TI %u", b[2] >> 1, b[0] >> 2 & 15,
+               b[1] & 1);
         if (g->ul_active) {
             ul_data(g, b);
         }
@@ -814,14 +862,14 @@ void gprs_pdch_ul(Gprs *g, uint32_t fn, const uint8_t b[GSM_BLOCK])
     if (b[0] >> 6 == 1) {
         unsigned type = b[1] >> 2;
 
-        if (g->trace) {
-            qemu_log("gsm-gprs: UL control, message type %u\n", type);
+        if (type != 3) {                        /* (not a dummy) */
+            gtrace(g, fn, "UL control %u%s", type,
+                   type == 2 && ul_bits(b, 6 + 5 + 72, 1) ? " +UL request" :
+                   "");
         }
         if (type == 1 && g->ul_poll_sent) {     /* PACKET CONTROL ACK */
             g->ul_active = false;
-            if (g->trace) {
-                qemu_log("gsm-gprs: uplink TBF released\n");
-            }
+            gtrace(g, fn, "uplink TBF released");
         } else if (type == 2) {
             /*
              * PACKET DOWNLINK ACK/NACK: TFI (5), Ack/Nack Description (FAI,
@@ -845,10 +893,9 @@ void gprs_ul_assigned(Gprs *g)
 {
     g->ul_active = true;
     g->ul_cr_done = g->ul_final = g->ul_puan = g->ul_poll_sent = false;
-    g->ul_vr = 0;
+    g->ul_vq = g->ul_vr = 0;
     memset(g->ul_rx, 0, sizeof(g->ul_rx));
-    memset(g->ul_done, 0, sizeof(g->ul_done));
-    g->ul_idle = g->ul_since_puan = 0;
+    g->ul_idle = g->ul_since_puan = g->ul_quiet = 0;
     g->ul_pdu_len = 0;
 }
 

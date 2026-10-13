@@ -195,7 +195,14 @@ static void si13_build(uint8_t b[GSM_BLOCK])
     bw_bit(&w, 1);                      /* CONTROL_ACK_TYPE: RLC/MAC block */
     bw_bits(&w, 15, 4);                 /* BS_CV_MAX */
     bw_bit(&w, 0);                      /* no PAN */
-    bw_bit(&w, 0);                      /* no extension */
+    bw_bit(&w, 1);                      /* extension, 6 bits: */
+    bw_bits(&w, 6 - 1, 6);
+    bw_bit(&w, 0);                      /* no EGPRS */
+    bw_bit(&w, 0);                      /* PFC_FEATURE_MODE */
+    bw_bit(&w, 0);                      /* DTM_SUPPORT */
+    bw_bit(&w, 0);                      /* BSS_PAGING_COORDINATION */
+    bw_bit(&w, 0);                      /* CCN_ACTIVE */
+    bw_bit(&w, 1);                      /* NW_EXT_UTBF */
     /* GPRS power control parameters */
     bw_bits(&w, 0, 4);                  /* ALPHA */
     bw_bits(&w, 16, 5);                 /* T_AVG_W */
@@ -1272,6 +1279,11 @@ uint32_t gsm_net_ms_ip(GsmNet *n)
 void gsm_net_set_trace(GsmNet *n, bool on)
 {
     n->trace = on;
+    gprs_set_trace(n->gprs, on);
+}
+
+void gsm_net_set_gprs_trace(GsmNet *n, bool on)
+{
     gprs_set_trace(n->gprs, on);
 }
 

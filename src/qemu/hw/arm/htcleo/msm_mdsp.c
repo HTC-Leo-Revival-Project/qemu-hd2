@@ -154,6 +154,7 @@ struct MsmMdspState {
     uint32_t ctl;
     uint32_t ctl_regs[0x400];
     bool trace;                 /* log doorbells and first writes (+PC) */
+    bool gprs_trace;
     uint32_t gsm_fn;            /* the cell's frame number (= L1's) */
     uint32_t l1_fn;             /* L1's frame number (its frame timer's) */
     int gsm_acq;                /* 0 idle, 1 searching, 2 tone posted */
@@ -278,37 +279,69 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
 }
 
 /*
- * a burst goes out (command 30): the uplink entry at the word address at
- * byte 16 is [length, type, data]: a RACH's [4, 6, RA], a signalling
- * block's [15, 1, 23 octets], a speech frame's [20, 1, ...]
+ * a burst goes out (command 30): byte 12 the number of entries (up to 2),
+ * then for each [flags, word address of the entry].  The flags: bit 8 an
+ * entry, the low byte the channel (GSM_UL_*), bits 14-12 the uplink slot
+ * of a multislot allocation, bit 15 a poll's answer (it goes before a
+ * block the slot's USF asked for).  The entry is [length, type, data]: a
+ * RACH's [4, 6, RA], a signalling block's [15, 1, 23 octets], a speech
+ * frame's [20, 1, ...].  L1 learns which packet data entries went out from
+ * their length being cleared: those it finds still there it sends again.
  */
-static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
+static void gsm_tx_entry(MsmMdspState *s, unsigned flags, uint32_t e)
 {
-    uint32_t e = MEM_B + 2 * lduw_le_p(cmd + 16);
+    unsigned chan = flags & 0xff;
 
-    if (e + 4 + GSM_BLOCK > MEM_C || !lduw_le_p(s->mem + e)) {
-        return;
-    }
-    if (s->trace) {
-        GString *g = g_string_new(NULL);
-
-        for (unsigned k = 0; k < 32; k += 2) {
-            g_string_append_printf(g, " %04x", lduw_le_p(s->mem + e + k));
-        }
-        qemu_log("msm-mdsp: gsm tx l1 fn %u entry %04x:%s\n", s->l1_fn,
-                 lduw_le_p(cmd + 16), g->str);
-        g_string_free(g, true);
-    }
     if (lduw_le_p(s->mem + e) == 4) {
         gsm_net_rach(s->net, s->mem[e + 4], s->l1_fn, s->gsm_fn);
-    } else {
-        /* byte 14: 0x100 an entry, low byte the channel (GSM_UL_*) */
-        unsigned chan = lduw_le_p(cmd + 14) & 0xff;
+        return;
+    }
+    gsm_net_ul(s->net, s->gsm_fn, chan, s->mem + e + 4);
+    if (chan == GSM_UL_PDTCH) {
+        stw_le_p(s->mem + e, 0);                /* sent */
+    }
+}
 
-        gsm_net_ul(s->net, s->gsm_fn, chan, s->mem + e + 4);
-        if (chan == GSM_UL_PDTCH) {
-            /* sent (its USF came): the entry is free for the next block */
-            stw_le_p(s->mem + e, 0);
+static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
+{
+    unsigned n = MAX(MIN(lduw_le_p(cmd + 12), 2), 1);
+    uint8_t slots = 0;
+
+    if (s->trace || (s->gprs_trace &&
+                     (lduw_le_p(cmd + 14) & 0xff) >= GSM_UL_PDTCH)) {
+        GString *g = g_string_new(NULL);
+
+        for (unsigned k = 0; k < 24; k += 2) {
+            g_string_append_printf(g, " %04x", lduw_le_p(cmd + k));
+        }
+        for (unsigned i = 0; i < n; i++) {
+            uint32_t x = MEM_B + 2 * lduw_le_p(cmd + 16 + 4 * i);
+
+            if (x + 8 <= MEM_C) {
+                g_string_append_printf(g, " | %04x %04x %04x %04x",
+                                       lduw_le_p(s->mem + x),
+                                       lduw_le_p(s->mem + x + 2),
+                                       lduw_le_p(s->mem + x + 4),
+                                       lduw_le_p(s->mem + x + 6));
+            }
+        }
+        qemu_log("msm-mdsp: gsm tx fn %u l1 fn %u:%s\n", s->gsm_fn, s->l1_fn,
+                 g->str);
+        g_string_free(g, true);
+    }
+    /* polls' answers first, then the rest, one entry a slot */
+    for (int poll = 1; poll >= 0; poll--) {
+        for (unsigned i = 0; i < n; i++) {
+            unsigned flags = lduw_le_p(cmd + 14 + 4 * i);
+            unsigned slot = flags >> 12 & 7;
+            uint32_t e = MEM_B + 2 * lduw_le_p(cmd + 16 + 4 * i);
+
+            if (!(flags >> 15) != !poll || slots & 1 << slot ||
+                e + 4 + GSM_BLOCK > MEM_C || !lduw_le_p(s->mem + e)) {
+                continue;
+            }
+            slots |= 1 << slot;
+            gsm_tx_entry(s, flags, e);
         }
     }
 }
@@ -577,6 +610,12 @@ static void mdsp_reset(DeviceState *dev)
     gsm_net_reset(s->net);
 }
 
+static void mdsp_set_gprs_trace(Object *obj, bool value, Error **errp)
+{
+    MSM_MDSP(obj)->gprs_trace = value;
+    gsm_net_set_gprs_trace(MSM_MDSP(obj)->net, value);
+}
+
 static bool mdsp_get_trace(Object *obj, Error **errp)
 {
     return MSM_MDSP(obj)->trace;
@@ -725,6 +764,7 @@ static void mdsp_init(Object *obj)
     s->seen = g_hash_table_new(g_direct_hash, g_direct_equal);
     s->net = gsm_net_new(mdsp_to_host, s);
     object_property_add_bool(obj, "trace", mdsp_get_trace, mdsp_set_trace);
+    object_property_add_bool(obj, "gprs-trace", NULL, mdsp_set_gprs_trace);
     object_property_add_str(obj, "sms", mdsp_get_sms, mdsp_set_sms);
     object_property_add_str(obj, "call", mdsp_get_call, mdsp_set_call);
     object_property_add_bool(obj, "hangup", mdsp_get_hangup, mdsp_set_hangup);

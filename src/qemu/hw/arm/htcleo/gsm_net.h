@@ -22,6 +22,7 @@ GsmNet *gsm_net_new(void (*to_host)(void *opaque, const uint8_t *ip,
                                     size_t len), void *opaque);
 void gsm_net_reset(GsmNet *n);
 void gsm_net_set_trace(GsmNet *n, bool on);
+void gsm_net_set_gprs_trace(GsmNet *n, bool on);
 
 /* the idle-mode block (BCCH or CCCH) whose four frames include fn, else
  * the next one */
