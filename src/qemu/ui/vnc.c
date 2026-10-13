@@ -58,9 +58,14 @@
 #include "io/dns-resolver.h"
 #include "monitor/monitor.h"
 
-#define VNC_REFRESH_INTERVAL_BASE GUI_REFRESH_INTERVAL_DEFAULT
-#define VNC_REFRESH_INTERVAL_INC  50
-#define VNC_REFRESH_INTERVAL_MAX  GUI_REFRESH_INTERVAL_IDLE
+/*
+ * Poll the guest display at 60 Hz, and at no less than 30 Hz when it is
+ * idle, so a touch shows up on the client within a frame or two (the
+ * htcleo web UI streams this to a browser).
+ */
+#define VNC_REFRESH_INTERVAL_BASE 16
+#define VNC_REFRESH_INTERVAL_INC  8
+#define VNC_REFRESH_INTERVAL_MAX  33
 static const struct timeval VNC_REFRESH_STATS = { 0, 500000 };
 static const struct timeval VNC_REFRESH_LOSSY = { 2, 0 };
 
