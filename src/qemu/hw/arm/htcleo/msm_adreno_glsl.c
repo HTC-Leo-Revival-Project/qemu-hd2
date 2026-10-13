@@ -526,9 +526,10 @@ static void emit_vfetch(Tr *t, const SqFetch *f)
     temp_ref(t, f->src, f->src_rel);
     g_string_append_printf(o, ".%c%s;\n", comp[f->scomp & 3],
                            f->round ? " + 0.5" : "");
-    g_string_append_printf(o, "    int va = %u * int(floor(vi)) + %d;\n"
+    g_string_append_printf(o, "    int va = (%u * int(floor(vi)) + %d) * "
+                           "vunit(%d);\n"
                            "    uvec4 dw = uvec4(0u);\n", f->stride,
-                           f->offset);
+                           f->offset, slot);
     for (int k = 0; k < ndw; k++) {
         g_string_append_printf(o, "    dw[%d] = vswap(vfetch_word(%d, va + "
                                "%d), %d);\n", k, slot, 4 * k, slot);

@@ -66,6 +66,14 @@ typedef struct SqAlu {
     bool sneg;
 } SqAlu;
 
+/*
+ * Vertex fetch strides and offsets are bytes, or dwords as on Xenos when
+ * the fetch constant's second dword has bit 25 set.  The Android blob
+ * never sets it; Windows Mobile's sets it for its 2D blits (a 32_32_FLOAT
+ * stream with stride 2, a 16_16 one with stride 1).
+ */
+#define ADRENO_VFETCH_UNIT(fc1) (((fc1) >> 25) & 1 ? 4u : 1u)
+
 typedef struct SqFetch {
     bool vtx;
     uint8_t op;
