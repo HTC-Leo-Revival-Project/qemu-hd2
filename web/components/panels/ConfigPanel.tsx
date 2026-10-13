@@ -22,7 +22,7 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
 
   const setNand = (nand: string) => {
     const patch: Partial<EmulatorConfig> = { nand };
-    if (nands.some((i) => i.name === nand && i.os === "winmo")) Object.assign(patch, { baseband: "lle", dsp: "hle" });
+    if (nands.some((i) => i.name === nand && i.os === "winmo")) patch.baseband = "lle";
     onChange(patch);
   };
 
@@ -71,11 +71,10 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
         icon={<Cpu {...I} />}
         value={config.dsp}
         choices={dspChoices}
-        disabled={config.baseband !== "lle" || winmo}
+        disabled={config.baseband !== "lle"}
         onChange={(dsp) => onChange({ dsp })}
       />
       {config.baseband !== "lle" && <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">The DSP firmware runs on top of the real baseband.</p>}
-      {winmo && <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">Windows Mobile runs without the DSP firmware.</p>}
       {config.dsp === "lle" && (
         <>
           <Divider />

@@ -179,7 +179,7 @@ export class Emulator extends EventEmitter {
      * Windows Mobile boots straight from NAND (the machine finds the ROM's
      * XIP partition) and needs the real baseband; no cLK menu to drive
      */
-    if (nandOs(cfg.nand) === "winmo") cfg = { ...cfg, baseband: "lle", dsp: "hle", boot: "menu" };
+    if (nandOs(cfg.nand) === "winmo") cfg = { ...cfg, baseband: "lle", boot: "menu" };
     const dsp = cfg.baseband === "lle" && cfg.dsp === "lle";
     for (const f of ["qmp.sock", "webqmp.sock", "vnc.sock", "q6vnc.sock", "q6webqmp.sock", "ramcon.log", "qemu.log"]) fs.rmSync(path.join(IMAGES, f), { force: true });
     if (!fs.existsSync(path.join(IMAGES, cfg.nand))) throw new Error(`NAND image ${cfg.nand} not found in images/`);
