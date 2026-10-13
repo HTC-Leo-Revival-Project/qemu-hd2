@@ -1,5 +1,8 @@
 # HTC HD2 (htcleo) on QEMU
 
+> [!WARNING]
+> **Vibecoded.** This project was written largely by an AI coding agent (Claude), with little line-by-line human review. Expect rough edges and bugs, and check anything important before relying on it.
+
 A QEMU machine (`-M htcleo`) that boots the phone's real software stack:
 cLK bootloader → Linux 2.6.32 (tytung r3.6) → Android 4.0 (NexusHD2 ICS CM9),
 all from an emulated NAND, with no changes to the kernel or ROM.
