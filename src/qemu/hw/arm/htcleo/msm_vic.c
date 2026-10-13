@@ -13,14 +13,15 @@
  * 0xFFFFFFFF) to mean "nothing pending"; set the "l4" property for that.
  *
  * "redeliver-lo/-hi" mark lines whose edges, when they come while software
- * has the line masked, are held and latched 100 us after it unmasks the
- * line, not at once.  AMSS's interrupt glue (tramp_l4.c) masks a line
- * while its handler runs and unmasks it in the handler's exit, just before
- * it marks the handler done; an interrupt dispatched in between is taken
- * for a nested one, masked, cleared and dropped.  The proc_comm handler is
- * done once it writes its answer, so on the phone the next command cannot
- * ring that early; here the apps core, on another host thread, can, and the
- * command was never answered (the LLE boot hang).
+ * has the line masked or when software clears them while it is masked, are
+ * held and latched 100 us after it unmasks the line.  AMSS's interrupt glue
+ * (tramp_l4.c) takes an interrupt that comes while the line's handler runs
+ * for a nested one: it masks the line, clears it and drops it, and the
+ * handler's exit only unmasks the line.  The proc_comm handler is done once
+ * it writes its answer, so on the phone the next command cannot ring that
+ * early; here the apps core, on another host thread, can, and the command
+ * was never answered (the LLE boot hang).  (The glue also clears the edge
+ * it is handling that way, which is then delivered once more: harmless.)
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
@@ -259,6 +260,8 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             (val & (1u << (s->watch & 31)))) {
             vic_wlog(s, 'C', !!(s->latch[b] & (1u << (s->watch & 31))));
         }
+        /* a redeliver line's edge cleared while masked is held as well */
+        s->held[b] |= s->latch[b] & val & s->redeliver[b] & ~s->enable[b];
         s->latch[b] &= ~val;
         s->soft[b] &= ~val;
         break;
