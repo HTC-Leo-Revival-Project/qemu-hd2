@@ -10,6 +10,7 @@
 #define SIM_IMSI        "310260000000000"
 #define SIM_ICCID       "89014103211118510720"
 #define SIM_MSISDN      "+15555218135"
+#define SIM_SMSC        "+12063130004"   /* the network's SMS centre */
 #define SIM_SPN         "T-Mobile"
 
 typedef struct SimCard SimCard;
