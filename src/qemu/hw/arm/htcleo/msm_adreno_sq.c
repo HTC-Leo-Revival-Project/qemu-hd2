@@ -962,8 +962,8 @@ static void decode_vertex(const SqFetch *f, uint32_t *dw, float *v)
         v[2] = adreno_half_to_float(dw[1]);
         v[3] = adreno_half_to_float(dw[1] >> 16);
         break;
-    case 33: case 34: case 35:  /* FMT_32[_32[_32_32]] */
-        for (int k = 0; k < f->fmt - 32; k++) {
+    case 33: case 34: case 35:  /* FMT_32, FMT_32_32, FMT_32_32_32_32 */
+        for (int k = 0; k < vfetch_dwords(f->fmt); k++) {
             v[k] = f->sign ? (float)(int32_t)dw[k] : (float)dw[k];
             if (f->norm) {
                 v[k] /= f->sign ? 2147483647.0f : 4294967295.0f;

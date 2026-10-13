@@ -563,8 +563,8 @@ static void emit_vfetch(Tr *t, const SqFetch *f)
                         "h2f(dw.x >> 16), h2f(dw.y & 0xffffu), "
                         "h2f(dw.y >> 16));\n");
         break;
-    case 33: case 34: case 35:
-        for (int k = 0; k < f->fmt - 32; k++) {
+    case 33: case 34: case 35:  /* FMT_32, FMT_32_32, FMT_32_32_32_32 */
+        for (int k = 0; k < ndw; k++) {
             g_string_append_printf(o, "    fv[%d] = %s(dw[%d])%s;\n", k,
                                    f->sign ? "float(int" : "float(",
                                    k, f->sign ? ")" : "");
