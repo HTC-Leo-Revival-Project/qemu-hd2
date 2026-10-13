@@ -469,6 +469,8 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->vic = qdev_new(TYPE_MSM_VIC);
     qdev_prop_set_bit(s->vic, "l4", true);
     qdev_prop_set_bit(s->vic, "trace", s->trace);
+    /* the apps doorbells, lines 56-63 (msm_vic.c) */
+    qdev_prop_set_uint32(s->vic, "redeliver-hi", 0xff000000);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->vic), &error_fatal);
     memory_region_add_subregion(&s->mem, MODEM_VIC_PHYS,
                     sysbus_mmio_get_region(SYS_BUS_DEVICE(s->vic), 0));
