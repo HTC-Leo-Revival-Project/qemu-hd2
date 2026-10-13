@@ -1,0 +1,9 @@
+hd2-frame.webp
+
+Derived from "HTC HD2 - Front.jpg" by Beamish4, Wikimedia Commons,
+https://commons.wikimedia.org/wiki/File:HTC_HD2_-_Front.jpg
+licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/).
+
+Changes: perspective-corrected to a front view, background and screen
+area cut out to transparency.  These derived images are shared under the
+same license.

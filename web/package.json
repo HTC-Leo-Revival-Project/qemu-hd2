@@ -1,0 +1,31 @@
+{
+  "name": "hd2-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server/index.ts",
+    "build": "next build",
+    "start": "NODE_ENV=production node server/index.ts",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^1.56.0",
+    "next": "16.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/turbopack": "^4",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/ws": "^8.18.2",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "type": "module"
+}

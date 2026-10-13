@@ -1,0 +1,195 @@
+@import "tailwindcss";
+
+/* Android 4.0 "Holo Dark" */
+:root {
+  --holo-blue: #33b5e5;
+  --holo-blue-dark: #0099cc;
+  --holo-blue-glow: rgba(51, 181, 229, 0.35);
+  --holo-green: #99cc00;
+  --holo-red: #ff4444;
+  --holo-orange: #ffbb33;
+  --holo-bg-top: #000000;
+  --holo-bg-bottom: #272d33;
+  --holo-bar: #1a1a1a;
+  --holo-panel: rgba(16, 18, 20, 0.92);
+  --holo-dialog: #282828;
+  --holo-divider: rgba(255, 255, 255, 0.1);
+  --holo-divider-strong: rgba(255, 255, 255, 0.18);
+  --holo-text: #ffffff;
+  --holo-text-2: #bebebe;
+  --holo-text-3: #808080;
+  --holo-pressed: rgba(51, 181, 229, 0.6);
+  --holo-focus: rgba(51, 181, 229, 0.25);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: var(--font-roboto);
+  --font-mono: var(--font-roboto-mono);
+  --color-holo-blue: var(--holo-blue);
+  --color-holo-blue-dark: var(--holo-blue-dark);
+  --color-holo-green: var(--holo-green);
+  --color-holo-red: var(--holo-red);
+  --color-holo-orange: var(--holo-orange);
+  --color-holo-bar: var(--holo-bar);
+  --color-holo-panel: var(--holo-panel);
+  --color-holo-dialog: var(--holo-dialog);
+  --color-holo-divider: var(--holo-divider);
+  --color-holo-text: var(--holo-text);
+  --color-holo-text-2: var(--holo-text-2);
+  --color-holo-text-3: var(--holo-text-3);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: linear-gradient(180deg, var(--holo-bg-top) 0%, #0d1012 45%, var(--holo-bg-bottom) 100%) fixed;
+  color: var(--holo-text);
+  font-family: var(--font-roboto), "Roboto", sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: var(--holo-blue-glow);
+}
+
+/* scrollbars: the thin Holo fast-scroll thumb */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.25);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* list rows press like ICS: a flat holo-blue wash */
+.holo-pressable {
+  transition: background-color 120ms ease-out;
+}
+.holo-pressable:hover {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+.holo-pressable:active {
+  background-color: var(--holo-pressed);
+}
+.holo-pressable:focus-visible {
+  outline: none;
+  background-color: var(--holo-focus);
+}
+
+/* holo text field: underline that turns blue on focus */
+.holo-field {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.35);
+  box-shadow: inset 0 -1px 0 transparent;
+  color: var(--holo-text);
+  padding: 6px 2px 5px;
+  outline: none;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+.holo-field:focus {
+  border-bottom-color: var(--holo-blue);
+  box-shadow: inset 0 -1px 0 var(--holo-blue);
+}
+
+/* holo seek bar */
+.holo-seek {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 32px;
+  background: transparent;
+  cursor: pointer;
+}
+.holo-seek::-webkit-slider-runnable-track {
+  height: 3px;
+  background: linear-gradient(to right, var(--holo-blue) var(--p, 50%), rgba(255, 255, 255, 0.22) var(--p, 50%));
+}
+.holo-seek::-moz-range-track {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.22);
+}
+.holo-seek::-moz-range-progress {
+  height: 3px;
+  background: var(--holo-blue);
+}
+.holo-seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 22px;
+  height: 22px;
+  margin-top: -9.5px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--holo-blue) 0 4px, rgba(51, 181, 229, 0.35) 5px 10px, transparent 11px);
+  border: 0;
+  transition: transform 120ms;
+}
+.holo-seek::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 0;
+  background: radial-gradient(circle, var(--holo-blue) 0 4px, rgba(51, 181, 229, 0.35) 5px 10px, transparent 11px);
+}
+.holo-seek:active::-webkit-slider-thumb {
+  transform: scale(1.35);
+}
+
+/* the ICS indeterminate spinner */
+@keyframes holo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.holo-spinner {
+  border-radius: 50%;
+  border: 3px solid rgba(51, 181, 229, 0.15);
+  border-top-color: var(--holo-blue);
+  border-right-color: var(--holo-blue);
+  animation: holo-spin 0.9s linear infinite;
+}
+
+@keyframes holo-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes holo-dialog-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* the hardware keys light up the way the HD2's key backlight does */
+.hd2-key {
+  border-radius: 999px;
+  transition: background-color 90ms, box-shadow 90ms;
+}
+.hd2-key:hover {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+.hd2-key[data-down="true"] {
+  background-color: rgba(51, 181, 229, 0.28);
+  box-shadow: 0 0 18px 2px rgba(51, 181, 229, 0.45);
+}
