@@ -22,6 +22,8 @@
  *   0xAB005000  outgoing interrupts, write 1: +0 to the modem, +4 to the
  *               apps processor (the SMSM interrupt table's second byte
  *               picks the register)
+ *   0xA0700000  audio interface DMA (htcleo_q6_audif.c), interrupt 12
+ *   0xA1100000  video decoder core (htcleo_q6_vdc.c), interrupt 16
  *   0xABF00000  "TCM IO": interrupt routing the kernel sets up at boot
  *
  * The six hardware threads share one pipeline and take turns every cycle,
@@ -62,6 +64,7 @@
 #include "hw/hexagon/hexagon_globalreg.h"
 #include "hw/hexagon/hexagon_tlb.h"
 #include "hw/hexagon/htcleo_q6_vdc.h"
+#include "hw/hexagon/htcleo_q6_audif.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -78,6 +81,8 @@
 #define Q6_TIMER_IRQ            3
 #define Q6_TIMER_HZ             32768       /* sleep clock */
 #define Q6_IPC_BASE             0xAB005000
+#define AUDIF_BASE              0xA0700000
+#define AUDIF_IRQ               12
 #define VDC_BASE                0xA1100000
 #define VDC_SIZE                0x5000
 #define VDC_STATUS              0x0010      /* bits 0-1: AXI/CRIF errors */
@@ -582,6 +587,18 @@ static void htcleo_q6_init(MachineState *machine)
         object_property_set_link(OBJECT(cpu), "tlb", OBJECT(tlb),
                                  &error_fatal);
         qdev_realize_and_unref(DEVICE(cpu), NULL, &error_fatal);
+    }
+
+    {
+        /* audio interface DMA; its audiodev comes from -global */
+        DeviceState *af = qdev_new(TYPE_HTCLEO_Q6_AUDIF);
+
+        object_property_add_child(OBJECT(machine), "audif", OBJECT(af));
+        qdev_prop_set_bit(af, "trace", s->trace);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(af), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(af), 0, AUDIF_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(af), 0,
+                           qdev_get_gpio_in(DEVICE(s->cpu[0]), AUDIF_IRQ));
     }
 
     if (s->link_id) {
