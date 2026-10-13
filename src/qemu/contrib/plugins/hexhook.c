@@ -7,6 +7,7 @@
  *   -plugin libhexhook.so,hook=0x108c0bb0,hook=...,dump=0x108c0bb0:2:8
  *     hook=VA        print r0-r5 and r31 (lr) of the vCPU when VA runs
  *     dump=VA:R:N    also print N words of memory at the address in rR
+ *                    (R 0x... : at that fixed address)
  *     memr=LO-HI     print each instruction that reads data in [LO, HI)
  *     memrp=LO-HI    the same for a physical range
  *     pcr=LO-HI      only watch the instructions in that code range
@@ -28,6 +29,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 typedef struct {
     uint64_t va;
     int dump_reg, dump_n;
+    uint32_t dump_addr;             /* dump_reg < 0: fixed address */
 } Hook;
 
 static GArray *hooks;
@@ -36,15 +38,16 @@ static bool memr_phys;                  /* the range is physical */
 static uint64_t pcr_lo, pcr_hi = ~0ULL;  /* only instrument code here */
 static GHashTable *memr_seen;
 static long memr_all;                   /* log every read, this many */
-static bool mem_stores;                 /* log stores instead of loads */
+static int mem_stores;                  /* 1 stores instead of loads, 2 both */
 static struct qemu_plugin_register *regs[NREGS];
+static bool have_reg[NREGS];        /* r0's handle may be NULL */
 
 static uint32_t reg(int n)
 {
     g_autoptr(GByteArray) buf = g_byte_array_new();
     uint32_t v = 0;
 
-    if (!regs[n] || !qemu_plugin_read_register(regs[n], buf) || buf->len < 4) {
+    if (!have_reg[n] || !qemu_plugin_read_register(regs[n], buf) || buf->len < 4) {
         return 0;
     }
     memcpy(&v, buf->data, 4);
@@ -61,7 +64,7 @@ static void on_exec(unsigned int vcpu, void *udata)
                     reg(1), reg(2), reg(3), reg(4), reg(5), reg(31));
     if (h->dump_n) {
         g_autoptr(GByteArray) mem = g_byte_array_new();
-        uint32_t a = reg(h->dump_reg);
+        uint32_t a = h->dump_reg < 0 ? h->dump_addr : reg(h->dump_reg);
 
         g_string_append_printf(s, "\n  [r%d %08x]", h->dump_reg, a);
         if (qemu_plugin_read_memory_vaddr(a, mem, h->dump_n * 4)) {
@@ -87,7 +90,9 @@ static void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
 
     uint64_t a = vaddr;
 
-    if (qemu_plugin_mem_is_store(info) != mem_stores) {
+    bool st = qemu_plugin_mem_is_store(info);
+
+    if (mem_stores < 2 && st != mem_stores) {
         return;
     }
     if (memr_phys) {
@@ -113,11 +118,17 @@ static void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
     if (hwp && !qemu_plugin_hwaddr_is_io(hwp)) {
         pa = qemu_plugin_hwaddr_phys_addr(hwp);
     }
+    qemu_plugin_mem_value v = qemu_plugin_mem_get_value(info);
+    uint64_t val = v.type == QEMU_PLUGIN_MEM_VALUE_U8 ? v.data.u8 :
+                   v.type == QEMU_PLUGIN_MEM_VALUE_U16 ? v.data.u16 :
+                   v.type == QEMU_PLUGIN_MEM_VALUE_U32 ? v.data.u32 :
+                   v.data.u64;
     g_autofree char *s = g_strdup_printf("hexhook: %s %08" PRIx64
                                          " (va %08" PRIx64 " pa %08" PRIx64
-                                         ") from pc %08" PRIx64 " cpu%u\n",
-                                         mem_stores ? "write" : "read", a,
-                                         vaddr, pa, pc, vcpu);
+                                         ") from pc %08" PRIx64 " cpu%u"
+                                         " = %" PRIx64 "\n",
+                                         st ? "write" : "read", a,
+                                         vaddr, pa, pc, vcpu, val);
     qemu_plugin_outs(s);
 }
 
@@ -164,6 +175,7 @@ static void on_vcpu_init(unsigned int vcpu, void *userdata)
             snprintf(b, sizeof(b), "r%02d", n);
             if (!strcmp(d->name, a) || !strcmp(d->name, b)) {
                 regs[n] = d->handle;
+                have_reg[n] = true;
             }
         }
     }
@@ -210,7 +222,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 return -1;
             }
             h.va = strtoull(f[0], NULL, 0);
-            h.dump_reg = atoi(f[1]);
+            if (!strncmp(f[1], "0x", 2)) {
+                h.dump_reg = -1;
+                h.dump_addr = strtoul(f[1], NULL, 0);
+            } else {
+                h.dump_reg = atoi(f[1]);
+            }
             h.dump_n = atoi(f[2]);
             g_array_append_val(hooks, h);
         } else {
