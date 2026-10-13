@@ -14,7 +14,10 @@ A="adb -s 127.0.0.1:5555"
 # next boot then skips the full NAND scan, which in LLE mode costs a
 # proc_comm round trip to AMSS per NAND command)
 [ -n "$NO_CHECKPOINT" ] || timeout 15 $A shell 'sync; for m in /data /cache /system; do mount -o remount,ro $m; done' >/dev/null 2>&1
-pkill -x qemu-system-arm; pkill -x qemu-system-hex; sleep 1
+# only this checkout's emulator: others may be running
+for p in $(pgrep -x qemu-system-arm) $(pgrep -x qemu-system-hex); do
+  [ "$(readlink /proc/$p/cwd)" = "$(readlink -f "$I")" ] && kill $p
+done; sleep 1
 "$R/tools/start-q6.sh" "$@"
 
 qmon() { timeout 5 python3 "$R/tools/qmon.py" "$@" 2>/dev/null; }
