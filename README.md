@@ -126,7 +126,9 @@ python3 tools/hd2_radio.py images/RUU_signed.nbh --dsp images/dsp1.elf
 tools/start-q6.sh
 ```
 
-Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder's motion search is not modelled). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers.
+Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder codes P pictures without motion vectors by default). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers. `tools/boot-q6.sh` boots this mode for scripts and reports hangs.
+
+Known problems of the real-firmware modes (a rare boot hang, slow boots after an unclean stop, DSP speed, the experimental motion search) are in [quirks.md](quirks.md).
 
 <a name="gpu-adreno-200"></a>
 <h2><img src="docs/holo/h-gpu-adreno-200.png" width="196" height="40" alt="GPU (Adreno 200)"></h2>
