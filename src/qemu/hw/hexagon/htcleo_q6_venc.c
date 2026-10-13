@@ -9,10 +9,10 @@
  * fetches macroblocks and does the motion search.  Reverse-engineered
  * from the firmware (which buffers its kernels read, and how):
  *
- *   header        word 1 source picture luma, word 2 the reconstruction
- *                 of this picture (the firmware writes it), word 3
- *                 MB rows << 16 | MB columns; the reference of a P
- *                 picture is the previous command's reconstruction
+ *   header        word 1 source picture luma, word 2 the reference
+ *                 picture (the previous picture's reconstruction, which
+ *                 the firmware writes into the next command's word 2),
+ *                 word 3 MB rows << 16 | MB columns
  *   reg 14        the output DMA table: six-word entries, bits 8-11 of
  *                 word 0 the stream (0 source MBs, 2 prediction MBs, 7
  *                 MB information), word 3 its buffer
@@ -26,15 +26,20 @@
  *   reg 114b      offset of the MB's source luma (16x16, stride 16) in
  *                 the source stream
  *   reg 114c      offset of its prediction luma in the prediction stream
- *   reg 114d      offset of its 20-byte information record: word 2 bits
- *                 0-1 = 3 gives MPEG-4 mb_type 0 (INTER), else bits 2-3:
- *                 0 INTRA (3), 3 INTER4V (2); words 3 and 4 the vectors
- *                 (bytes)
+ *   reg 114d      offset of its 20-byte information record, the motion
+ *                 search's result: word 2 bits 0-1 = 3 codes the MB intra,
+ *                 else bits 2-3 = 3 inter with one vector, 0 inter with
+ *                 four; words 3 and 4 the vectors, x and y signed bytes in
+ *                 quarter pels (MPEG-4 codes the half pels)
  *   the chroma the firmware reads from the pictures itself
  *
- * The motion search is not modelled yet: every macroblock is coded with
- * a zero vector and the co-located reference macroblock as prediction,
- * which any decoder reconstructs identically.
+ * By default (venc-me=0) there is no motion search and every MB of a P
+ * picture is coded intra, which always decodes correctly.  venc-me=1/2 is
+ * an experimental search (full pels over +-15, then half pels, a zero
+ * vector bias, intra for MBs flatter than their best prediction) whose
+ * prediction stream carries the vector's interpolated block; the
+ * firmware codes those vectors as expected, but its inter frames still
+ * overflow the 25 KB output buffer ("Buffer overrun"), not yet understood.
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -50,10 +55,155 @@
 #define STREAM_SRC      0x0
 #define STREAM_PRED     0x2
 #define STREAM_INFO     0x7
+/* word 2 of an MB information record: the macroblock's coding */
+#define INFO_INTRA      0x3         /* bits 0-1 = 3 */
+#define INFO_INTER      0xc         /* bits 2-3 = 3: one vector */
+#define INFO_INTER4V    0x0         /* bits 2-3 = 0: four vectors */
 
-static uint32_t last_recon;         /* the reference of the next picture */
 static unsigned frame_no;
 bool htcleo_venc_test_pattern;      /* debug: paint the source pictures */
+uint32_t htcleo_venc_me;            /* motion search: 0 none, 1 full, 2 half pel */
+
+#define ME_RANGE        15          /* full pels each way (f_code 1) */
+#define ME_ZERO_BIAS    128         /* SAD bonus of the zero vector */
+#define ME_INTRA_BIAS   512         /* intra when deviation + this < SAD */
+
+/* the pictures of one encode, luma, in host memory */
+typedef struct VencPics {
+    uint8_t *src, *ref;
+    int w, h;
+} VencPics;
+
+static int sad16(const uint8_t *a, const uint8_t *b, int stride, int limit)
+{
+    int sad = 0;
+
+    for (int y = 0; y < 16 && sad < limit; y++) {
+        for (int x = 0; x < 16; x++) {
+            sad += abs(a[y * stride + x] - b[y * stride + x]);
+        }
+    }
+    return sad;
+}
+
+/* the 16x16 prediction at half-pel vector (mvx, mvy), MPEG-4 rounding 0 */
+static void pred_mb(const VencPics *p, int mbx, int mby, int mvx, int mvy,
+                    uint8_t *out)
+{
+    int x0 = mbx * 16 + (mvx >> 1), y0 = mby * 16 + (mvy >> 1);
+    int fx = mvx & 1, fy = mvy & 1;
+    const uint8_t *r = p->ref + y0 * p->w + x0;
+
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            const uint8_t *q = r + y * p->w + x;
+            int v;
+
+            if (fx && fy) {
+                v = (q[0] + q[1] + q[p->w] + q[p->w + 1] + 2) >> 2;
+            } else if (fx) {
+                v = (q[0] + q[1] + 1) >> 1;
+            } else if (fy) {
+                v = (q[0] + q[p->w] + 1) >> 1;
+            } else {
+                v = q[0];
+            }
+            out[y * 16 + x] = v;
+        }
+    }
+}
+
+/* is the half-pel vector's block (with its interpolation taps) inside? */
+static bool mv_inside(const VencPics *p, int mbx, int mby, int mvx, int mvy)
+{
+    int x0 = mbx * 16 * 2 + mvx, y0 = mby * 16 * 2 + mvy;
+
+    return x0 >= 0 && y0 >= 0 && x0 + 30 + (mvx & 1) * 2 <= (p->w - 1) * 2 &&
+           y0 + 30 + (mvy & 1) * 2 <= (p->h - 1) * 2;
+}
+
+static int sad_mv(const VencPics *p, int mbx, int mby, int mvx, int mvy,
+                  int limit)
+{
+    uint8_t blk[256];
+    const uint8_t *s = p->src + mby * 16 * p->w + mbx * 16;
+    int sad = 0;
+
+    if (!((mvx | mvy) & 1)) {
+        return sad16(s, p->ref + (mby * 16 + mvy / 2) * p->w + mbx * 16 +
+                     mvx / 2, p->w, limit);
+    }
+    pred_mb(p, mbx, mby, mvx, mvy, blk);
+    for (int y = 0; y < 16 && sad < limit; y++) {
+        for (int x = 0; x < 16; x++) {
+            sad += abs(s[y * p->w + x] - blk[y * 16 + x]);
+        }
+    }
+    return sad;
+}
+
+/*
+ * The MB's vector in half pels, or false for intra: a full search over
+ * +-ME_RANGE pels, then the eight half-pel neighbours of the best.
+ */
+static bool search_mb(const VencPics *p, int mbx, int mby, int *bx, int *by)
+{
+    const uint8_t *s = p->src + mby * 16 * p->w + mbx * 16;
+    int best = sad_mv(p, mbx, mby, 0, 0, INT_MAX) - ME_ZERO_BIAS;
+    int mean = 0, dev = 0;
+
+    *bx = *by = 0;
+    if (htcleo_venc_me >= 1) {
+        for (int dy = -ME_RANGE; dy <= ME_RANGE; dy++) {
+            for (int dx = -ME_RANGE; dx <= ME_RANGE; dx++) {
+                int sad;
+
+                if ((!dx && !dy) || !mv_inside(p, mbx, mby, dx * 2, dy * 2)) {
+                    continue;
+                }
+                sad = sad_mv(p, mbx, mby, dx * 2, dy * 2, best);
+                if (sad < best) {
+                    best = sad;
+                    *bx = dx * 2;
+                    *by = dy * 2;
+                }
+            }
+        }
+    }
+    if (htcleo_venc_me >= 2) {
+        int cx = *bx, cy = *by;
+
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int sad;
+
+                if ((!dx && !dy) ||
+                    !mv_inside(p, mbx, mby, cx + dx, cy + dy)) {
+                    continue;
+                }
+                sad = sad_mv(p, mbx, mby, cx + dx, cy + dy, best);
+                if (sad < best) {
+                    best = sad;
+                    *bx = cx + dx;
+                    *by = cy + dy;
+                }
+            }
+        }
+    }
+    /* intra when the MB is flatter than its best prediction */
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            mean += s[y * p->w + x];
+        }
+    }
+    mean = (mean + 128) >> 8;
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            dev += abs(s[y * p->w + x] - mean);
+        }
+    }
+    return dev + ME_INTRA_BIAS >= best;
+}
 
 /* a moving gradient with a box, so every encoder stage shows */
 static void paint_test_pattern(uint32_t luma, uint32_t chroma, int w, int h)
@@ -103,20 +253,20 @@ static void copy_mb(uint32_t pic, int stride, int mbx, int mby, uint32_t dst)
 int htcleo_venc_encode(uint32_t addr, bool trace)
 {
     g_autofree uint32_t *w = g_new0(uint32_t, CMD_MAX);
-    uint32_t src, recon, ref, buf_src = 0, buf_pred = 0, buf_info = 0;
+    uint32_t src, ref, buf_src = 0, buf_pred = 0, buf_info = 0;
     uint32_t off_src = 0, off_pred = 0, off_info = 0;
     bool got_src = false, got_pred = false, got_info = false, search = false;
     uint32_t fifo[8];               /* fetched MBs, row << 16 | column */
     unsigned fifo_rd = 0, fifo_wr = 0;
     int mbw, mbh, stride, nmb = 0;
+    VencPics pics = { 0 };
 
     physical_memory_read(addr, w, CMD_MAX * 4);
     src = le32_to_cpu(w[1]);
-    recon = le32_to_cpu(w[2]);
+    ref = le32_to_cpu(w[2]);
     mbw = le32_to_cpu(w[3]) & 0xffff;
     mbh = le32_to_cpu(w[3]) >> 16;
     stride = mbw * 16;
-    ref = last_recon ? last_recon : recon;
     if (htcleo_venc_test_pattern && mbw <= 80 && mbh <= 46) {
         /* the firmware reads the chroma itself, from luma + w * h */
         paint_test_pattern(src, src + stride * mbh * 16, stride, mbh * 16);
@@ -126,6 +276,15 @@ int htcleo_venc_encode(uint32_t addr, bool trace)
         qemu_log_mask(LOG_UNIMP, "q6-venc: unsupported picture %dx%d MBs\n",
                       mbw, mbh);
         return -1;
+    }
+
+    pics.w = stride;
+    pics.h = mbh * 16;
+    if (ref) {
+        pics.src = g_malloc(pics.w * pics.h);
+        pics.ref = g_malloc(pics.w * pics.h);
+        physical_memory_read(src, pics.src, pics.w * pics.h);
+        physical_memory_read(ref, pics.ref, pics.w * pics.h);
     }
 
     for (int i = 4; i < CMD_MAX && w[i]; ) {
@@ -162,18 +321,39 @@ int htcleo_venc_encode(uint32_t addr, bool trace)
                     if (got_src && buf_src) {
                         copy_mb(src, stride, mbx, mby, buf_src + off_src);
                     }
-                    if (got_pred && buf_pred) {
-                        copy_mb(ref, stride, mbx, mby, buf_pred + off_pred);
-                    }
-                    if (got_info && buf_info) {
-                        /*
-                         * word 2: bits 0-1 = 3 picks the firmware's MB
-                         * type 0 (MPEG-4 INTER, one vector); vectors 0
-                         */
-                        uint32_t rec[5] = { 0, 0, cpu_to_le32(3), 0, 0 };
+                    if (got_pred || got_info) {
+                        int mvx = 0, mvy = 0;
+                        bool inter = true;
+                        uint32_t rec[5] = { 0 };
+                        uint8_t blk[256];
 
-                        physical_memory_write(buf_info + off_info, rec,
-                                              sizeof(rec));
+                        if (pics.ref && htcleo_venc_me) {
+                            inter = search_mb(&pics, mbx, mby, &mvx, &mvy);
+                        } else {
+                            inter = false;  /* no search: intra MBs */
+                        }
+                        if (!inter) {
+                            rec[2] = cpu_to_le32(INFO_INTRA);
+                        } else {
+                            /* one vector, in quarter pels */
+                            rec[2] = cpu_to_le32(INFO_INTER);
+                            rec[3] = cpu_to_le32((uint8_t)(mvx * 2) |
+                                                 (uint8_t)(mvy * 2) << 8);
+                        }
+                        if (got_pred && buf_pred) {
+                            if (pics.ref) {
+                                pred_mb(&pics, mbx, mby, mvx, mvy, blk);
+                                physical_memory_write(buf_pred + off_pred,
+                                                      blk, sizeof(blk));
+                            } else {
+                                copy_mb(ref, stride, mbx, mby,
+                                        buf_pred + off_pred);
+                            }
+                        }
+                        if (got_info && buf_info) {
+                            physical_memory_write(buf_info + off_info, rec,
+                                                  sizeof(rec));
+                        }
                     }
                     nmb++;
                 }
@@ -254,10 +434,11 @@ int htcleo_venc_encode(uint32_t addr, bool trace)
     }
 
     if (trace) {
-        qemu_log("q6-venc: %dx%d, %d MBs, src %08x ref %08x recon %08x, "
+        qemu_log("q6-venc: %dx%d, %d MBs, src %08x ref %08x, "
                  "streams %08x/%08x/%08x\n", mbw * 16, mbh * 16, nmb, src,
-                 ref, recon, buf_src, buf_pred, buf_info);
+                 ref, buf_src, buf_pred, buf_info);
     }
-    last_recon = recon;
+    g_free(pics.src);
+    g_free(pics.ref);
     return 0;
 }

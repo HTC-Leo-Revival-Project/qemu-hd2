@@ -12,5 +12,6 @@ int htcleo_vdc_decode(uint32_t addr, bool trace, const char *dump_yuv);
 /* run one encoder command buffer; 0 on success */
 int htcleo_venc_encode(uint32_t addr, bool trace);
 extern bool htcleo_venc_test_pattern;
+extern uint32_t htcleo_venc_me;
 
 #endif
