@@ -68,8 +68,9 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
           <ListPref
             title="DSP clock (icount shift)"
             icon={<Gauge {...I} />}
-            value={String(config.dspShift) as "0" | "1" | "2" | "3" | "4"}
+            value={String(config.dspShift) as "-1" | "0" | "1" | "2" | "3" | "4"}
             choices={[
+              { value: "-1", label: "auto", summary: "QEMU adjusts the shift to follow real time" },
               { value: "0", label: "shift=0 (1 ns per instruction)" },
               { value: "1", label: "shift=1 (default)" },
               { value: "2", label: "shift=2" },

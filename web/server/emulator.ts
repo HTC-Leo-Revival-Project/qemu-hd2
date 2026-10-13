@@ -229,7 +229,7 @@ export class Emulator extends EventEmitter {
       const q6 = [
         "-M", `htcleo-q6,link=q6link,apps-irq=11,modem-irq=2,trace=off`,
         "-kernel", "dsp1.elf",
-        "-icount", `shift=${cfg.dspShift}`,
+        "-icount", `shift=${cfg.dspShift < 0 ? "auto" : cfg.dspShift}`,
         ...mem,
         "-chardev", `socket,id=q6link,path=${SOCK.q6link}`,
         "-audiodev", `${backend},id=q6snd`, "-global", "htcleo-q6-audif.audiodev=q6snd",
@@ -238,6 +238,7 @@ export class Emulator extends EventEmitter {
         "-qmp", `unix:${SOCK.q6qmp},server,nowait`,
         "-qmp", `unix:${SOCK.q6webqmp},server,nowait`,
         "-d", "guest_errors,unimp", "-D", "q6.log",
+        ...splitArgs(process.env.Q6_ARGS ?? ""),
       ];
       this.hexagon = this.spawn(QEMU_HEXAGON, q6, "q6.out", "hexagon");
     }
@@ -283,8 +284,11 @@ export class Emulator extends EventEmitter {
         this.setState("stopped", "The emulator exited");
       }
     });
-    const q6 = fs.existsSync(SOCK.q6webqmp) ? SOCK.q6webqmp : SOCK.q6qmp;
-    if (this.running?.dsp === "lle" && (await waitFor(q6, 6000))) this.q6qmp = await Qmp.connect(q6).catch(() => null);
+    if (this.running?.dsp === "lle") {
+      /* a QEMU we just launched creates q6webqmp.sock a moment later; an adopted one may predate it */
+      const q6 = this.hexagon || fs.existsSync(SOCK.q6webqmp) ? SOCK.q6webqmp : SOCK.q6qmp;
+      if (await waitFor(q6, 6000)) this.q6qmp = await Qmp.connect(q6).catch(() => null);
+    }
     await this.connectVnc();
     void this.refreshSensors();
   }

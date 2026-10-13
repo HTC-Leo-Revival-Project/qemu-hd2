@@ -36,7 +36,7 @@ export const DEFAULT_CONFIG: EmulatorConfig = {
   mobileData: true,
   adbPort: 5555,
   amssLog: false,
-  dspShift: 1,
+  dspShift: -1,
   extraArgs: "",
   encoder: "x264",
   quality: 20,

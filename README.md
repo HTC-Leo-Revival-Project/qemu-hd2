@@ -44,6 +44,14 @@ tools/start.sh            # headless; picks "BOOT FROM NAND" in cLK
 
 Boot to the Android UI takes about 30 s. The first boot runs dexopt and takes longer.
 
+### Web UI
+
+`web/` is a browser front end: the live screen inside a photo of a real HD2, the hardware keys, touch, typing, and the boot configuration (HLE/LLE baseband, the QDSP6 firmware, NAND and SD images, GPU renderer, audio route) in an Android 4 Holo interface. The screen streams as H.264 to WebCodecs, about 50 ms from a tap to the picture, and the sound streams as PCM. It needs QEMU built with VNC (`meson configure src/qemu/build -Dvnc=enabled`).
+```bash
+cd web && npm install && npm run dev     # http://127.0.0.1:3000
+```
+See `web/README.md`.
+
 ```bash
 adb connect 127.0.0.1:5555 && adb shell    # root shell
 ```
