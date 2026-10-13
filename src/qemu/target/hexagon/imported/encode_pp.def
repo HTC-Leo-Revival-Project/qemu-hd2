@@ -2118,7 +2118,7 @@ ALU64_RRR_ENC(A4_modwrapu,       "0011","111","-","111","ddddd")
 
 
 DEF_FIELDROW_DESC32(ICLASS_ALU64" 0100 -------- PP------ --------","[#4] Rdd=(Rs,Rt)")
-LEGACY_ALU64_RRR_ENC(S2_packhl,  "0100","--0","-","---","ddddd")
+ALU64_RRR_ENC(S2_packhl_deprecated, "0100","--0","-","---","ddddd")
 ALU64_RRR_ENC(A4_bitsplit,       "0100","--1","-","---","ddddd")
 
 
@@ -2151,8 +2151,8 @@ ALU64_RRR_ENC(A2_subh_h16_sat_lh,"0101","011","-","101","ddddd")
 ALU64_RRR_ENC(A2_subh_h16_sat_hl,"0101","011","-","110","ddddd")
 ALU64_RRR_ENC(A2_subh_h16_sat_hh,"0101","011","-","111","ddddd")
 
-LEGACY_ALU64_RRR_ENC(A2_addsat,  "0101","100","-","0--","ddddd")
-LEGACY_ALU64_RRR_ENC(A2_subsat,  "0101","100","-","1--","ddddd")
+ALU64_RRR_ENC(A2_addsat_deprecated, "0101","100","-","0--","ddddd")
+ALU64_RRR_ENC(A2_subsat_deprecated, "0101","100","-","1--","ddddd")
 
 ALU64_RRR_ENC(A2_min,            "0101","101","-","0--","ddddd")
 ALU64_RRR_ENC(A2_minu,           "0101","101","-","1--","ddddd")

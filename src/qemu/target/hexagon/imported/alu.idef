@@ -61,6 +61,15 @@ Q6INSN(A2_subsat,"Rd32=sub(Rt32,Rs32):sat",ATTRIBS(),
 "Subtract 32-bit registers with saturation",
 { RdV=fSAT(fSE32_64(RtV) - fSE32_64(RsV)); })
 
+/* the V2 encodings (ALU64 space) of the two, still used by V2 code */
+Q6INSN(A2_addsat_deprecated,"Rd32=add(Rs32,Rt32):sat:deprecated",ATTRIBS(),
+"Add 32-bit registers with saturation (V2 encoding)",
+{ RdV=fSAT(fSE32_64(RsV)+fSE32_64(RtV)); })
+
+Q6INSN(A2_subsat_deprecated,"Rd32=sub(Rt32,Rs32):sat:deprecated",ATTRIBS(),
+"Subtract 32-bit registers with saturation (V2 encoding)",
+{ RdV=fSAT(fSE32_64(RtV) - fSE32_64(RsV)); })
+
 
 Q6INSN(A2_addi,"Rd32=add(Rs32,#s16)",ATTRIBS(),
 "Add a signed immediate to a register",

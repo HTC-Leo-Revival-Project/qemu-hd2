@@ -902,6 +902,15 @@ Q6INSN(S2_packhl,"Rdd32=packhl(Rs32,Rt32)",ATTRIBS(),
     fSETHALF(3,RddV,fGETHALF(1,RsV));
 })
 
+Q6INSN(S2_packhl_deprecated,"Rdd32=packhl(Rs32,Rt32):deprecated",ATTRIBS(),
+"Pack high halfwords and low halfwords together (V2 encoding)",
+{
+    fSETHALF(0,RddV,fGETHALF(0,RtV));
+    fSETHALF(1,RddV,fGETHALF(0,RsV));
+    fSETHALF(2,RddV,fGETHALF(1,RtV));
+    fSETHALF(3,RddV,fGETHALF(1,RsV));
+})
+
 Q6INSN(A2_swiz,"Rd32=swiz(Rs32)",ATTRIBS(A_ARCHV2),
 "Endian swap the bytes of Rs",
 {
