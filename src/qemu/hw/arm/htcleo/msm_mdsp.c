@@ -199,13 +199,15 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
 {
     uint32_t met = MEM_B + 2 * lduw_le_p(cmd + 4);
     bool has_dat = lduw_le_p(cmd + 24) != 0xffff;
+    int kind = GSM_DL_SIGNAL;
     uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
     uint8_t b[GSM_BLOCK];
 
-    if (met + 28 > MEM_C || dat + 12 + 24 > MEM_C) {
+    /* (14 halfwords on signalling channels, 18 on traffic channels) */
+    if (met + 36 > MEM_C || dat + 12 + 24 > MEM_C) {
         return;
     }
-    memset(s->mem + met, 0, 28);
+    memset(s->mem + met, 0, 36);
     stw_le_p(s->mem + met + 2, seq);
     stw_le_p(s->mem + met + 6, 0x100);
     stw_le_p(s->mem + met + 8, 0x100);
@@ -213,20 +215,36 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     if (!has_dat) {
         return;
     }
-    /* the block's first frame: dedicated reads come burst by burst */
-    gsm_net_dl(s->net, gsm_net_dedicated(s->net) ? s->gsm_fn - 3 :
-               gsm_net_block_fn(s->gsm_fn), b);
+    if (gsm_net_dedicated(s->net)) {
+        /*
+         * byte 22: bit 0 decode, bit 4 a traffic channel's SACCH, bit 12
+         * first burst; the block's four reads end at this frame
+         */
+        kind = gsm_net_ded_dl(s->net, s->gsm_fn - 3,
+                              lduw_le_p(cmd + 22) & 0x10, b);
+    } else {
+        gsm_net_dl(s->net, gsm_net_block_fn(s->gsm_fn), b);
+    }
+    /*
+     * [length in halfwords with this header, seq, frame type, status (bit
+     * 1: CRC OK; bits 15-13 PDCH), ?, ?].  The frame type on a traffic
+     * channel (AMSS's 0xC8C7E4): bit 0 a FACCH frame, else speech (bits
+     * 2-5 other kinds: SID, ...); on signalling channels bit 0 is not set.
+     */
     memset(s->mem + dat, 0, 12 + 24);
-    memcpy(s->mem + dat + 12, b, GSM_BLOCK);
+    if (kind != GSM_DL_SPEECH) {
+        memcpy(s->mem + dat + 12, b, GSM_BLOCK);
+    }
     stw_le_p(s->mem + dat + 2, seq);
-    stw_le_p(s->mem + dat + 6, 2);              /* bit 1: CRC OK */
+    stw_le_p(s->mem + dat + 4, kind == GSM_DL_FACCH);
+    stw_le_p(s->mem + dat + 6, 2);
     stw_le_p(s->mem + dat, GSM_BLOCK);
 }
 
 /*
  * a burst goes out (command 30): the uplink entry at the word address at
  * byte 16 is [length, type, data]: a RACH's [4, 6, RA], a signalling
- * block's [15, 1, 23 octets]
+ * block's [15, 1, 23 octets], a speech frame's [20, 1, ...]
  */
 static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
 {
@@ -248,7 +266,9 @@ static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
     if (lduw_le_p(s->mem + e) == 4) {
         gsm_net_rach(s->net, s->mem[e + 4], s->l1_fn, s->gsm_fn);
     } else {
-        gsm_net_ul(s->net, s->gsm_fn, s->mem + e + 4);
+        /* byte 14: 0x100 an entry, low byte the channel (GSM_UL_*) */
+        gsm_net_ul(s->net, s->gsm_fn, lduw_le_p(cmd + 14) & 0xff,
+                   s->mem + e + 4);
     }
 }
 

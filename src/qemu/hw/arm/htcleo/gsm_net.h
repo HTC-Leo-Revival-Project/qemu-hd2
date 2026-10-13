@@ -22,10 +22,18 @@ void gsm_net_set_trace(GsmNet *n, bool on);
 uint32_t gsm_net_block_fn(uint32_t fn);
 /* the MS is on the dedicated channel the network gave it */
 bool gsm_net_dedicated(GsmNet *n);
-/* the downlink block that starts at cell frame bfn, as the MS reads it */
+/* the idle-mode block (BCCH/CCCH) that starts at cell frame bfn */
 void gsm_net_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK]);
-/* an uplink block sent at cell frame fn (dedicated mode) */
-void gsm_net_ul(GsmNet *n, uint32_t fn, const uint8_t f[GSM_BLOCK]);
+/*
+ * the dedicated channel's block that starts at cell frame bfn: the
+ * SACCH's (sacch: the MS says so, as it does on a traffic channel), else
+ * the SDCCH's, or on a traffic channel a FACCH frame or speech
+ */
+enum { GSM_DL_SPEECH, GSM_DL_SIGNAL, GSM_DL_FACCH };
+int gsm_net_ded_dl(GsmNet *n, uint32_t bfn, bool sacch, uint8_t b[GSM_BLOCK]);
+/* an uplink block sent at cell frame fn on the dedicated channel */
+enum { GSM_UL_SPEECH = 0, GSM_UL_SDCCH = 4, GSM_UL_FACCH = 5 };
+void gsm_net_ul(GsmNet *n, uint32_t fn, int chan, const uint8_t f[GSM_BLOCK]);
 /* a RACH: its content, L1's frame number and the cell's */
 void gsm_net_rach(GsmNet *n, uint8_t ra, uint32_t l1_fn, uint32_t fn);
 

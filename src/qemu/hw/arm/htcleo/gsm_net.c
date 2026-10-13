@@ -11,8 +11,8 @@
  *   - CM service requests and paging responses
  *   - calls (CC): an MS's call is answered after a few seconds; a call to
  *     the MS (gsm_net_mt_call) is paged for and set up; either side hangs
- *     up.  There is no traffic channel: the call stays on the SDCCH, so
- *     it has no speech.
+ *     up.  Calls get a TCH/F on timeslot 2 (early assignment); FACCH
+ *     frames go in the place of speech, which is silence for now.
  *   - SMS (CP/RP/TP): texts from the MS are acknowledged and logged,
  *     texts to it (gsm_net_mt_sms) are paged for and delivered
  * The channel is released when nothing is left to do.
@@ -74,7 +74,9 @@ struct GsmNet {
     uint8_t mi[9];                      /* the MS's identity (IMSI), LV */
     /* the dedicated channel */
     bool ded, releasing;
-    unsigned idle, foreign, cm_wait;
+    bool tch;                           /* on the traffic channel */
+    bool assigning;                     /* until ASSIGNMENT COMPLETE */
+    unsigned idle, cm_wait;
     unsigned sacch_n;
     GsmLapdm l2[2];                     /* SAPI 0, SAPI 3 */
     /* SMS */
@@ -362,8 +364,18 @@ static void lapdm_ul(GsmNet *n, GsmLapdm *l, const uint8_t *f)
 
     if ((c & 3) == 3) {                         /* U frames */
         switch (c & ~0x10) {
-        case 0x2f:                              /* SABM: UA, information */
+        case 0x2f: {                            /* SABM: UA, information */
+            /* (the messages queued go on the new link, after a handover) */
+            GsmMsg q[ARRAY_SIZE(l->q)];
+            unsigned qn = l->qn;
+
+            memcpy(q, l->q, sizeof(q));
             lapdm_reset(l);
+            memcpy(l->q, q, sizeof(q));
+            l->qn = qn;
+            if (qn) {
+                l->q[0].off = 0;
+            }
             l->up = true;
             memset(l->ua, 0x2b, GSM_BLOCK);
             l->ua[0] = l->sapi << 2 | 1;
@@ -375,6 +387,7 @@ static void lapdm_ul(GsmNet *n, GsmLapdm *l, const uint8_t *f)
                 net_l3(n, l->sapi, f + 3, len);
             }
             break;
+        }
         case 0x63:                              /* UA to our SABM */
             if (l->est_pending) {
                 l->est_pending = false;
@@ -496,6 +509,22 @@ static void cc_set(GsmNet *n, int st)
     n->cc_timer = 0;
 }
 
+/* ASSIGNMENT COMMAND: TCH/F on timeslot 2, speech full rate */
+static void net_assign(GsmNet *n)
+{
+    static const uint8_t ass[] = {
+        0x06, 0x2e, 0x01 << 3 | 2,
+        GSM_TSC << 5 | (GSM_ARFCN >> 8 & 3), GSM_ARFCN & 0xff,
+        0x00, 0x63, 0x01,
+    };
+
+    if (!n->tch && !n->assigning) {
+        net_send(n, 0, ass, sizeof(ass));
+        n->assigning = true;
+        net_event(n, "assignment to TCH/F");
+    }
+}
+
 static void cc_disconnect(GsmNet *n)
 {
     static const uint8_t cause[] = { 0x02, 0xe0, 0x90 };    /* normal */
@@ -596,10 +625,11 @@ static void net_service(GsmNet *n)
         }
     }
     /* an MS's call: alerting, then answered */
-    if (n->cc == CC_MO_PROC && ++n->cc_timer >= ANSWER_BLOCKS / 2) {
+    if (n->cc == CC_MO_PROC && !n->assigning &&
+        ++n->cc_timer >= ANSWER_BLOCKS / 2) {
         cc_send(n, 0x01, NULL, 0);
         cc_set(n, CC_MO_ALERT);
-    } else if (n->cc == CC_MO_ALERT && ++n->cc_timer >= ANSWER_BLOCKS) {
+    } else if (n->cc == CC_MO_ALERT && ++n->cc_timer >= ANSWER_BLOCKS * 2) {
         cc_send(n, 0x07, NULL, 0);
         cc_set(n, CC_MO_CONNECT);
     }
@@ -659,6 +689,16 @@ static void net_mm(GsmNet *n, const uint8_t *m, unsigned len)
 
 static void net_rr(GsmNet *n, const uint8_t *m, unsigned len)
 {
+    if ((m[1] & 0x3f) == 0x29) {                /* ASSIGNMENT COMPLETE */
+        n->assigning = false;
+        net_event(n, "on TCH/F");
+        return;
+    }
+    if ((m[1] & 0x3f) == 0x2f) {                /* ASSIGNMENT FAILURE */
+        n->assigning = n->tch = false;
+        net_event(n, "assignment failed");
+        return;
+    }
     if ((m[1] & 0x3f) == 0x27) {                /* PAGING RESPONSE */
         if (len > 4 && 4u + m[3] < len) {
             net_identity(n, m + 4 + m[3], len - 4 - m[3]);
@@ -699,23 +739,15 @@ static void net_cc(GsmNet *n, const uint8_t *m, unsigned len)
         net_event(n, "call to %s", num ? num : "?");
         cc_send(n, 0x02, NULL, 0);              /* CALL PROCEEDING */
         cc_set(n, CC_MO_PROC);
+        net_assign(n);
         break;
     }
     case 0x0f:                                  /* CONNECT ACKNOWLEDGE */
         cc_set(n, CC_ACTIVE);
         break;
-    case 0x08: {                                /* CALL CONFIRMED */
-        /* early assignment: TCH/F on timeslot 2, speech full rate */
-        static const uint8_t ass[] = {
-            0x06, 0x2e, 0x01 << 3 | 2,
-            GSM_TSC << 5 | (GSM_ARFCN >> 8 & 3), GSM_ARFCN & 0xff,
-            0x00, 0x63, 0x01,
-        };
-
-        net_send(n, 0, ass, sizeof(ass));
-        net_event(n, "assignment to TCH/F");
+    case 0x08:                                  /* CALL CONFIRMED */
+        net_assign(n);                          /* early assignment */
         break;
-    }
     case 0x01:                                  /* ALERTING */
         cc_set(n, CC_MT_RING);
         break;
@@ -855,7 +887,7 @@ static void net_l3(GsmNet *n, unsigned sapi, const uint8_t *m, unsigned len)
 
 static void net_free_channel(GsmNet *n)
 {
-    n->ded = n->releasing = false;
+    n->ded = n->releasing = n->tch = n->assigning = false;
     lapdm_reset(&n->l2[0]);
     lapdm_reset(&n->l2[1]);
     n->sms = SMS_IDLE;
@@ -935,35 +967,6 @@ void gsm_net_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK])
         si1, si2, si3, si4, si3, si4, si3, si4,
     };
 
-    if (n->ded) {
-        /* an idle mode read: the MS has left the channel */
-        if ((t3 >= 4 && t3 < 32) || t3 >= 48) {
-            if (++n->foreign >= 2 || ++n->idle > 40) {
-                net_free_channel(n);
-            }
-        } else {
-            n->foreign = 0;
-        }
-    }
-    if (n->ded) {
-        n->idle++;
-        if (t3 < 4) {
-            net_service(n);
-            if (!lapdm_dl(&n->l2[0], b) && !lapdm_dl(&n->l2[1], b)) {
-                memcpy(b, l2_fill, GSM_BLOCK);
-            }
-            if (n->releasing && !n->l2[0].up && !n->l2[0].ua_pending) {
-                net_free_channel(n);
-            }
-        } else {
-            memcpy(b, n->sacch_n++ & 1 ? si6 : si5, GSM_BLOCK);
-        }
-        if (n->trace) {
-            qemu_log("gsm-net: DL t3 %u: %02x %02x %02x %02x %02x %02x\n", t3,
-                     b[0], b[1], b[2], b[3], b[4], b[5]);
-        }
-        return;
-    }
     if (t3 == 2) {
         memcpy(b, bcch[tc], GSM_BLOCK);
     } else if (n->ia_bfn && bfn == n->ia_bfn) {
@@ -995,16 +998,65 @@ void gsm_net_dl(GsmNet *n, uint32_t bfn, uint8_t b[GSM_BLOCK])
     }
 }
 
-void gsm_net_ul(GsmNet *n, uint32_t fn, const uint8_t f[GSM_BLOCK])
+int gsm_net_ded_dl(GsmNet *n, uint32_t bfn, bool sacch, uint8_t b[GSM_BLOCK])
+{
+    int kind = GSM_DL_SIGNAL;
+    bool tch = n->tch;
+
+    /* SDCCH/8: subchannel 0 at frames 0-3, the SACCHs at 32-47 */
+    if (!n->tch && bfn % 51 >= 32) {
+        sacch = true;
+    }
+
+    if (sacch) {
+        memcpy(b, n->sacch_n++ & 1 ? si6 : si5, GSM_BLOCK);
+    } else {
+        /* the MS sends something every block: if not, it has left */
+        if (++n->idle > 24) {
+            net_event(n, "the MS left the channel");
+            net_free_channel(n);
+            memcpy(b, l2_fill, GSM_BLOCK);
+            return GSM_DL_SIGNAL;
+        }
+        net_service(n);
+        if (!lapdm_dl(&n->l2[0], b) && !lapdm_dl(&n->l2[1], b)) {
+            memcpy(b, l2_fill, GSM_BLOCK);
+            kind = tch ? GSM_DL_SPEECH : GSM_DL_SIGNAL;
+        } else if (tch) {
+            kind = GSM_DL_FACCH;
+        }
+        if (n->releasing && !n->l2[0].up && !n->l2[0].ua_pending) {
+            net_free_channel(n);
+        }
+    }
+    if (n->trace && kind != GSM_DL_SPEECH) {
+        qemu_log("gsm-net: DL %s: %02x %02x %02x %02x %02x %02x\n",
+                 sacch ? "SACCH" : kind == GSM_DL_FACCH ? "FACCH" : "SDCCH",
+                 b[0], b[1], b[2], b[3], b[4], b[5]);
+    }
+    return kind;
+}
+
+void gsm_net_ul(GsmNet *n, uint32_t fn, int chan, const uint8_t f[GSM_BLOCK])
 {
     unsigned t3 = fn % 51, sapi = f[0] >> 2 & 7;
 
-    if (t3 >= 47) {
+    if (n->ded) {
+        n->idle = 0;
+    }
+    if (chan == GSM_UL_SPEECH) {
+        return;
+    }
+    if (chan == GSM_UL_SDCCH && t3 >= 47) {
         return;                         /* the SACCH: measurement reports */
     }
     if (n->trace) {
-        qemu_log("gsm-net: UL t3 %u: %02x %02x %02x %02x %02x %02x\n", t3,
+        qemu_log("gsm-net: UL %s: %02x %02x %02x %02x %02x %02x\n",
+                 chan == GSM_UL_FACCH ? "FACCH" : "SDCCH",
                  f[0], f[1], f[2], f[3], f[4], f[5]);
+    }
+    if (chan == GSM_UL_FACCH && n->ded && !n->tch) {
+        n->tch = true;                  /* the MS is on its traffic channel */
     }
     if (sapi != 0 && sapi != 3) {
         return;
@@ -1017,7 +1069,6 @@ void gsm_net_ul(GsmNet *n, uint32_t fn, const uint8_t f[GSM_BLOCK])
         n->releasing = false;
         n->ia_bfn = 0;
     }
-    n->idle = n->foreign = 0;
     lapdm_ul(n, l2(n, sapi), f);
 }
 
