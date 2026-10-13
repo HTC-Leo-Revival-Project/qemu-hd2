@@ -12,8 +12,8 @@
  *   0x70..0x7c TF (w) / RF (r)
  *
  * Transmit: the driver programs NCF_TX with the byte count and has the ADM
- * copy the bytes into TF; once all NCF_TX bytes arrived TX_READY is raised
- * and the bytes go to the peer.
+ * copy the bytes into TF; once all NCF_TX bytes arrived TX_READY and TXLEV
+ * are raised and the bytes go to the peer.
  *
  * Receive: the driver writes DMRX, enables the stale event and queues an ADM
  * box command reading RF.  Bytes from the peer are pushed into that command
@@ -89,6 +89,7 @@ struct MsmUartDmState {
     bool stale_en;
     uint32_t snap;              /* bytes delivered in this receive */
     uint32_t ncf_tx;            /* bytes still expected in this transmit */
+    bool txlev;                 /* the TX FIFO drained after a transmit */
     GByteArray *rx;             /* bytes from the peer not yet delivered */
     GByteArray *tx;
     QEMUTimer *stale_timer;
@@ -97,10 +98,16 @@ struct MsmUartDmState {
     void *peer;
 };
 
+/*
+ * TXLEV: the TX FIFO has drained to its watermark (TFWR) after a transmit;
+ * the FIFO empties at once here, so it comes with the end of each transmit
+ * and goes with the start of the next.  It does not stand while the port
+ * is idle: Windows Mobile's driver unmasks it as it opens the port, with
+ * nothing to send, and its interrupt would never stop.
+ */
 static uint32_t uartdm_isr(MsmUartDmState *s)
 {
-    /* the TX FIFO is always drained at once */
-    return s->isr | ISR_TXLEV;
+    return s->isr | (s->txlev ? ISR_TXLEV : 0);
 }
 
 static void uartdm_update(MsmUartDmState *s)
@@ -177,6 +184,7 @@ static void uartdm_tx_word(MsmUartDmState *s, uint32_t v)
         }
         g_byte_array_set_size(s->tx, 0);
         s->isr |= ISR_TX_READY;
+        s->txlev = true;
         uartdm_update(s);
     }
 }
@@ -193,6 +201,7 @@ static void uartdm_cr(MsmUartDmState *s, uint32_t v)
         break;
     case CH_RESET_TX:
         s->ncf_tx = 0;
+        s->txlev = false;
         g_byte_array_set_size(s->tx, 0);
         break;
     case CH_RESET_STALE:
@@ -321,6 +330,7 @@ static void uartdm_write(void *opaque, hwaddr off, uint64_t val,
         break;
     case R_NCF_TX:
         s->ncf_tx = val;
+        s->txlev = false;
         g_byte_array_set_size(s->tx, 0);
         break;
     case R_BADR:
@@ -351,6 +361,7 @@ static void uartdm_reset(DeviceState *dev)
     s->imr = s->isr = 0;
     s->stale_en = false;
     s->snap = s->ncf_tx = 0;
+    s->txlev = false;
     g_byte_array_set_size(s->rx, 0);
     g_byte_array_set_size(s->tx, 0);
     timer_del(s->stale_timer);
