@@ -41,7 +41,19 @@ The machine is in `src/qemu/hw/arm/htcleo/`.
 <a name="images"></a>
 <h2><img src="docs/holo/h-images.png" width="106" height="40" alt="Images"></h2>
 
-`images/nand.img` is the phone's raw NAND: a dump of your own, or one built with `tools/hd2_mknand.py` (see `--help`). `tools/mksdcard.sh images/sdcard.img 1024` makes an optional FAT32 microSD.
+`images/nand.img` is the phone's raw 512 MiB NAND: a dump of your own, or one built from a bootloader and a NAND ROM zip:
+
+```bash
+cd images
+python3 ../tools/hd2_mknand.py --nbh LEOIMG.nbh --rom rom.zip -o nand.img   # or --lk lk.bin
+../tools/mksdcard.sh sdcard.img 1024                                        # optional microSD (FAT32)
+```
+
+`hd2_mknand.py` lays the NAND out as a flashed phone would have it: the bootloader in the OS area, the partition table, the ROM installed (boot.img and yaffs2 `/system` and `/data`) and the factory WiFi/BT MAC addresses. Other options:
+- `--recovery recovery.img` adds a recovery image;
+- `--system-mb`, `--cache-mb` set the partition sizes;
+- `--wifi-mac`, `--bt-mac` set the MACs (`tools/hd2_setmac.py` changes them in an existing image);
+- `--gpu` renders with the emulated Adreno GPU instead of in software (see [GPU](#gpu-adreno-200)).
 
 <a name="run"></a>
 <h2><img src="docs/holo/h-run.png" width="76" height="40" alt="Run"></h2>
