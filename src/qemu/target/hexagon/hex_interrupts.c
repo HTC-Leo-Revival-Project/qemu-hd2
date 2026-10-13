@@ -284,6 +284,9 @@ static void restore_state(CPUHexagonState *env, bool int_accepted)
 
 static void hex_accept_int(CPUHexagonState *env, int int_num)
 {
+    /* taking an interrupt drops the thread's reservation */
+    env->llsc_addr = ~0;
+
     CPUState *cs = env_cpu(env);
     HexagonCPU *cpu = env_archcpu(env);
     uint32_t evb =

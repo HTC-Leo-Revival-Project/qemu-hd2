@@ -93,6 +93,13 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
 
     ssr = env->t_sreg[HEX_SREG_SSR];
     if (GET_SSR_FIELD(SSR_EX, ssr) == 1) {
+        qemu_log_mask(LOG_GUEST_ERROR, "hexagon: thread %u exception 0x%x "
+                      "(cause 0x%x) while EX, pc %08x elr %08x s5 %08x "
+                      "badva0 %08x\n", (unsigned)env->threadId,
+                      (unsigned)cs->exception_index, env->cause_code,
+                      env->gpr[HEX_REG_PC], env->t_sreg[HEX_SREG_ELR],
+                      env->t_sreg[HEX_SREG_BADVA1],
+                      env->t_sreg[HEX_SREG_BADVA0]);
         HexagonCPU *cpu = env_archcpu(env);
         if (cpu->globalregs) {
             hexagon_globalreg_write(cpu->globalregs, HEX_SREG_DIAG,

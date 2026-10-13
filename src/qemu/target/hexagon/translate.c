@@ -896,6 +896,18 @@ void process_store(DisasContext *ctx, int slot_num)
     {
         TCGv address = tcg_temp_new();
         tcg_gen_mov_tl(address, hex_store_addr[slot_num]);
+#ifndef CONFIG_USER_ONLY
+        {
+            /* the reservation monitor sees every store (op_helper.c) */
+            TCGLabel *no_resv = gen_new_label();
+            TCGv any = tcg_temp_new();
+
+            tcg_gen_ld_tl(any, tcg_env, offsetof(CPUHexagonState, resv_any));
+            tcg_gen_brcondi_tl(TCG_COND_EQ, any, 0, no_resv);
+            gen_helper_store_snoop(tcg_env, hex_store_addr[slot_num]);
+            gen_set_label(no_resv);
+        }
+#endif
 
         /*
          * If we know the width from the DisasContext, we can

@@ -1563,6 +1563,67 @@ void HELPER(raise_stack_overflow)(CPUHexagonState *env, uint32_t slot,
     cpu_loop_exit_restore(cs, 0);
 }
 
+/*
+ * A store-conditional that succeeded: the hardware reservation monitor
+ * would also have cancelled the other hardware threads' reservations on
+ * that address.  Comparing values alone (cmpxchg) lets a thread whose
+ * locked word changed and changed back succeed (ABA), which corrupts the
+ * lock-free queues of the QDSP6 firmware.
+ */
+void HELPER(sc_done)(CPUHexagonState *env, uint32_t addr, uint32_t ok)
+{
+    CPUState *cs;
+
+    if (!ok) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        CPUHexagonState *e = cpu_env(cs);
+
+        if (e != env && e->llsc_addr == addr) {
+            e->llsc_addr = ~0;
+        }
+    }
+}
+
+/* a load-locked: stores must now be checked against reservations */
+void HELPER(ll_done)(CPUHexagonState *env)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        cpu_env(cs)->resv_any = 1;
+    }
+}
+
+/*
+ * A store while some thread may hold a reservation: like the hardware
+ * monitor, cancel the other threads' reservations on that doubleword.
+ */
+void HELPER(store_snoop)(CPUHexagonState *env, uint32_t addr)
+{
+    CPUState *cs;
+    bool any = false;
+
+    CPU_FOREACH(cs) {
+        CPUHexagonState *e = cpu_env(cs);
+
+        if (e->llsc_addr == (target_ulong)~0) {
+            continue;
+        }
+        if (e != env && ((e->llsc_addr ^ addr) & ~7u) == 0) {
+            e->llsc_addr = ~0;
+            continue;
+        }
+        any = true;
+    }
+    if (!any) {
+        CPU_FOREACH(cs) {
+            cpu_env(cs)->resv_any = 0;
+        }
+    }
+}
+
 /* clear interrupt auto-disable: the interrupts in mask can be taken again */
 static bool hex_is_v2(CPUHexagonState *env)
 {

@@ -494,6 +494,9 @@ static inline void gen_load_locked4u(TCGv dest, TCGv vaddr, int mem_index)
     tcg_gen_qemu_ld_tl(dest, vaddr, mem_index, MO_LE | MO_UL | MO_ALIGN);
     tcg_gen_mov_tl(hex_llsc_addr, vaddr);
     tcg_gen_mov_tl(hex_llsc_val, dest);
+#ifndef CONFIG_USER_ONLY
+    gen_helper_ll_done(tcg_env);
+#endif
 }
 
 static inline void gen_load_locked8u(TCGv_i64 dest, TCGv vaddr, int mem_index)
@@ -501,6 +504,9 @@ static inline void gen_load_locked8u(TCGv_i64 dest, TCGv vaddr, int mem_index)
     tcg_gen_qemu_ld_i64(dest, vaddr, mem_index, MO_LE | MO_UQ | MO_ALIGN);
     tcg_gen_mov_tl(hex_llsc_addr, vaddr);
     tcg_gen_mov_i64(hex_llsc_val_i64, dest);
+#ifndef CONFIG_USER_ONLY
+    gen_helper_ll_done(tcg_env);
+#endif
 }
 
 static inline void gen_store_conditional4(DisasContext *ctx,
@@ -519,6 +525,9 @@ static inline void gen_store_conditional4(DisasContext *ctx,
                               ctx->mem_idx, MO_32 | MO_ALIGN);
     tcg_gen_movcond_tl(TCG_COND_EQ, pred, tmp, hex_llsc_val,
                        one, zero);
+#ifndef CONFIG_USER_ONLY
+    gen_helper_sc_done(tcg_env, hex_llsc_addr, pred);
+#endif
     tcg_gen_br(done);
 
     gen_set_label(fail);
@@ -545,6 +554,9 @@ static inline void gen_store_conditional8(DisasContext *ctx,
     tcg_gen_movcond_i64(TCG_COND_EQ, tmp, tmp, hex_llsc_val_i64,
                         one, zero);
     tcg_gen_extrl_i64_i32(pred, tmp);
+#ifndef CONFIG_USER_ONLY
+    gen_helper_sc_done(tcg_env, hex_llsc_addr, pred);
+#endif
     tcg_gen_br(done);
 
     gen_set_label(fail);

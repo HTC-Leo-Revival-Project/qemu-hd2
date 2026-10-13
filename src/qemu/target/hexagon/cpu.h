@@ -154,6 +154,7 @@ typedef struct CPUArchState {
     float_status fp_status;
 
     target_ulong llsc_addr;
+    target_ulong resv_any;      /* some hardware thread may hold one */
     target_ulong llsc_val;
     uint64_t     llsc_val_i64;
 
