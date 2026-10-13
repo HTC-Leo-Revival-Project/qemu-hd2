@@ -106,6 +106,8 @@ struct HtcleoTs {
     uint8_t cmd[4];
     int cmd_len;
     bool data_pending;
+    bool reply;             /* a 0x52 register reply waits to be read */
+    uint8_t reply_buf[4];
     bool down;
     bool was_down;
     uint16_t x, y;
@@ -140,15 +142,40 @@ static int ts_event(I2CSlave *i2c, enum i2c_event ev)
         s->cmd_len = 0;
         s->pos = 0;
     } else if (ev == I2C_FINISH && s->cmd_len) {
-        if (s->cmd_len == 3 && s->cmd[0] == 0xD0 && s->cmd[1] == 0x00 &&
-            s->cmd[2] == 0x01) {
+        /*
+         * Android sends the bare "D0 00 01"; Windows Mobile uses the Elan
+         * packets: 54 RR xx xx writes register RR (D0: report mode), and
+         * 53 RR 00 01 reads it, answered by 52 RV VV V0 on the next read.
+         */
+        const uint8_t *c = s->cmd;
+        int n = s->cmd_len;
+
+        if (n == 4 && c[0] == 0x54) {
+            c++;
+            n--;
+        }
+        if (n == 3 && c[0] == 0xD0 && c[1] == 0x00 && c[2] == 0x01) {
             s->enabled = true;          /* start reporting */
+        } else if (s->cmd_len == 4 && s->cmd[0] == 0x53) {
+            uint16_t v = s->cmd[1] == 0x00 ? 0x1050 : 0;   /* fw version */
+
+            s->reply_buf[0] = 0x52;
+            s->reply_buf[1] = (s->cmd[1] & 0xF0) | (v >> 12);
+            s->reply_buf[2] = v >> 4;
+            s->reply_buf[3] = (v << 4) | 1;
+            s->reply = true;
+            s->data_pending = true;
+            ts_update_irq(s);
         }
         s->cmd_len = 0;
     }
     if (ev == I2C_START_RECV) {
         s->pos = 0;
-        if (!s->enabled) {
+        if (s->reply) {
+            memset(s->buf, 0, sizeof(s->buf));
+            memcpy(s->buf, s->reply_buf, sizeof(s->reply_buf));
+            s->reply = false;
+        } else if (!s->enabled) {
             /* until it is enabled the controller answers with its ID */
             memset(s->buf, 0, sizeof(s->buf));
             s->buf[0] = 0x55;
