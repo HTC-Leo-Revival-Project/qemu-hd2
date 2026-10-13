@@ -20,8 +20,9 @@
  * handler's exit only unmasks the line.  The proc_comm handler is done once
  * it writes its answer, so on the phone the next command cannot ring that
  * early; here the apps core, on another host thread, can, and the command
- * was never answered (the LLE boot hang).  (The glue also clears the edge
- * it is handling that way, which is then delivered once more: harmless.)
+ * was never answered (the LLE boot hang).  The handler also masks and
+ * clears the edge it handles, which is then delivered once more; such an
+ * edge is not held again.
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
@@ -63,10 +64,11 @@ struct MsmVicState {
     /* "redeliver" lines: edges that came while masked, latched later */
     uint32_t redeliver[2];
     uint32_t held[2];
+    uint32_t relatched[2];      /* latched from held[], not by an edge */
     QEMUTimer *held_timer;
     /* the last events of one line, kept quietly for "watch-log" */
     int32_t watch;
-    struct { int64_t ns; char kind; uint32_t arg, pc; } wlog[256];
+    struct { int64_t ns; char kind; uint32_t arg, pc, rep; } wlog[256];
     unsigned wlog_n;                /* VEC_RD returns NO_PEND_VAL when idle */
 };
 
@@ -114,8 +116,19 @@ static int vic_first_pending(MsmVicState *s, bool want_fiq)
 
 static void vic_wlog(MsmVicState *s, char kind, uint32_t arg)
 {
-    unsigned i = s->wlog_n++ % ARRAY_SIZE(s->wlog);
+    unsigned i;
 
+    /* a run of the same event is one entry with a count */
+    if (s->wlog_n) {
+        i = (s->wlog_n - 1) % ARRAY_SIZE(s->wlog);
+        if (s->wlog[i].kind == kind && s->wlog[i].arg == arg) {
+            s->wlog[i].rep++;
+            s->wlog[i].ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            return;
+        }
+    }
+    i = s->wlog_n++ % ARRAY_SIZE(s->wlog);
+    s->wlog[i].rep = 1;
     s->wlog[i].ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     s->wlog[i].kind = kind;
     s->wlog[i].arg = arg;
@@ -143,6 +156,7 @@ static void vic_set_irq(void *opaque, int n, int level)
             s->held[b] |= bit;
         } else {
             s->latch[b] |= bit;
+            s->relatched[b] &= ~bit;
         }
     }
     vic_update(s);
@@ -225,9 +239,13 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (s->watch >= 0 && (s->watch >> 5) == b) {
             uint32_t wb = 1u << (s->watch & 31);
 
-            /* writes of this line alone (not the kernel's mask-all) */
+            /* N: this line alone; n: with others (the kernel's) */
             if (val == wb) {
                 vic_wlog(s, 'N', !!(s->latch[b] & wb));  /* enable */
+            } else if (val & wb) {
+                vic_wlog(s, 'n', !!(s->latch[b] & wb));
+            } else if (!(off & 0x20) && (s->enable[b] & wb)) {
+                vic_wlog(s, 'd', !!(s->latch[b] & wb));  /* by a full write */
             }
         }
         if (off & 0x20) {
@@ -243,8 +261,9 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case 0x20: case 0x24:
         if (s->watch >= 0 && (s->watch >> 5) == b &&
-            val == (1u << (s->watch & 31))) {
-            vic_wlog(s, 'D', !!(s->latch[b] & (1u << (s->watch & 31))));
+            (val & (1u << (s->watch & 31)))) {
+            vic_wlog(s, val == 1u << (s->watch & 31) ? 'D' : 'd',
+                     !!(s->latch[b] & (1u << (s->watch & 31))));
         }
         s->enable[b] &= ~val;
         break;
@@ -260,8 +279,13 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             (val & (1u << (s->watch & 31)))) {
             vic_wlog(s, 'C', !!(s->latch[b] & (1u << (s->watch & 31))));
         }
-        /* a redeliver line's edge cleared while masked is held as well */
-        s->held[b] |= s->latch[b] & val & s->redeliver[b] & ~s->enable[b];
+        /*
+         * a redeliver line's edge cleared while masked is held as well
+         * (once: not one latched from held, or every delivery would repeat)
+         */
+        s->held[b] |= s->latch[b] & val & s->redeliver[b] & ~s->enable[b] &
+                      ~s->relatched[b];
+        s->relatched[b] &= ~val;
         s->latch[b] &= ~val;
         s->soft[b] &= ~val;
         break;
@@ -303,6 +327,7 @@ static void vic_reset(DeviceState *dev)
     memset(s->polarity, 0, sizeof(s->polarity));
     memset(s->latch, 0, sizeof(s->latch));
     memset(s->held, 0, sizeof(s->held));
+    memset(s->relatched, 0, sizeof(s->relatched));
     timer_del(s->held_timer);
     memset(s->soft, 0, sizeof(s->soft));
     s->masteren = s->l4 ? 3 : 0;
@@ -317,6 +342,7 @@ static void vic_held_latch(void *opaque)
 
     for (int b = 0; b < 2; b++) {
         s->latch[b] |= s->held[b] & s->enable[b];
+        s->relatched[b] |= s->held[b] & s->enable[b];
         s->held[b] &= ~s->enable[b];
     }
     vic_update(s);
@@ -333,9 +359,13 @@ static char *vic_get_wlog(Object *obj, Error **errp)
     for (unsigned k = s->wlog_n - n; k != s->wlog_n; k++) {
         unsigned i = k % ARRAY_SIZE(s->wlog);
 
-        g_string_append_printf(g, "%c%u@-%.6f/%x ", s->wlog[i].kind,
+        g_string_append_printf(g, "%c%u@-%.6f/%x", s->wlog[i].kind,
                                s->wlog[i].arg,
                                (now - s->wlog[i].ns) / 1e9, s->wlog[i].pc);
+        if (s->wlog[i].rep > 1) {
+            g_string_append_printf(g, "x%u", s->wlog[i].rep);
+        }
+        g_string_append_c(g, ' ');
     }
     g_string_append_printf(g, "(%u events)", s->wlog_n);
     return g_string_free(g, false);
