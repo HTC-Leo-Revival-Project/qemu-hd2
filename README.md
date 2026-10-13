@@ -104,7 +104,7 @@ The `qom-set` commands go through `python3 tools/qmon.py images/qmp.sock "..."`.
 <a name="real-baseband-firmware"></a>
 <h2><img src="docs/holo/h-real-baseband-firmware.png" width="247" height="40" alt="Real baseband firmware"></h2>
 
-`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it and the SIM works. The modem DSP (mDSP) is modelled at its command interface, with a GSM cell and network behind it (MCC 310, MNC 260, ARFCN 133): AMSS scans, camps, and registers with a location update, and Android shows the network in service. Calls, SMS and data do not go over it yet (they use the modelled modem in the default mode):
+`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it and the SIM works. The modem DSP (mDSP) is modelled at its command interface, with a GSM cell and network behind it (MCC 310, MNC 260, ARFCN 133; `hw/arm/htcleo/gsm_net.c`): AMSS scans, camps and registers, and calls and texts work both ways. Calls have no speech yet, and data does not go over it yet (the default mode's modelled modem has it). The network's other side is driven over QMP: `qom-set /machine/modem-lle/mdsp sms "+15551234:text"`, `... call +15551234` (reads back the call's state), `... hangup on`, and `qom-get ... events` lists what the phone sent:
 
 ```bash
 cd images

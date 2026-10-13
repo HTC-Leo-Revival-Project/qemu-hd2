@@ -87,11 +87,15 @@ at the mDSP's command interface (AMSS's GSM L1 drives it as on the phone):
 - The cell is on every ARFCN: the RF synthesizer's tuning (SBI writes) is
   not decoded, so power scans find it everywhere and AMSS may camp on any
   ARFCN; channels are assigned on 133 (its cell allocation).
-- Registration: RACH, IMMEDIATE ASSIGNMENT (SDCCH/8 on timeslot 1), LAPDm
-  SAPI 0, LOCATION UPDATING ACCEPT without authentication or ciphering,
-  CHANNEL RELEASE. No TMSI is given.
-- Not yet: paging, calls (TCH), SMS (SAPI 3), GPRS. The modelled modem of
-  the default mode has all of these.
+- Registration, calls and texts: RACH, IMMEDIATE ASSIGNMENT (SDCCH/8 on
+  timeslot 1), LAPDm on SAPI 0 and 3, location updating without
+  authentication or ciphering (no TMSI), CM service, paging by IMSI,
+  calls on a TCH/F (timeslot 2, early assignment), SMS both ways.
+  Answered calls carry silence: speech frames are not routed anywhere.
+- Not yet: speech, GPRS (data), supplementary services, handovers.
+- The cell keeps L1's frame numbers instead of its own time: AMSS restarts
+  the GSM frame timer after sleep by a register write, which lands a
+  variable time late here, and L1 would drift from an independent cell.
 - AMSS sometimes misses a GSM frame tick when the modem core is slow
   ("Missed 1 GSM frames"); a RACH's request reference then names a frame
   AMSS does not expect, and it retries the RACH.
