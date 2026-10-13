@@ -1,11 +1,9 @@
 # HTC HD2 (htcleo) on QEMU
 
 > [!WARNING]
-> **Vibecoded.** This project was written largely by an AI coding agent (Claude), with little line-by-line human review. Expect rough edges and bugs, and check anything important before relying on it.
+> **Vibecoded.** This project was written FULLY by an AI coding agent (Claude), with little (actually 0) human review. Expect bullshit, don't ask me about this (i really don't know how it works either).
 
-A QEMU machine (`-M htcleo`) that boots the phone's real software stack:
-cLK bootloader → Linux 2.6.32 (tytung r3.6) → Android 4.0 (NexusHD2 ICS CM9),
-all from an emulated NAND, with no changes to the kernel or ROM.
+A QEMU machine (`-M htcleo`) that boots the HTC HD2
 
 ## Build
 
@@ -24,15 +22,15 @@ python3 ../tools/hd2_mknand.py --lk ../firmware/lk-user.bin --rom ../firmware/dl
 ```
 
 `hd2_mknand.py` lays out the NAND the way cLK expects:
-- the ROM area at block 0x212 and the partition table;
-- boot.img;
-- yaffs2 /system and /data, installed the same way the ROM's updater-script would;
-- the factory WiFi/BT MAC addresses in block 505.
+- the ROM area at block 0x212 and the partition table
+- boot.img
+- yaffs2 /system and /data
+- the factory WiFi/BT MAC addresses in block 505
 
 ## Run
 
 ```bash
-tools/start.sh            # headless; picks "BOOT FROM NAND" in cLK
+tools/start.sh
 ```
 
 - `start.sh` attaches `images/sdcard.img` when it exists.
@@ -45,7 +43,7 @@ tools/start.sh            # headless; picks "BOOT FROM NAND" in cLK
 - To get a window, drop `-display none` from the script or pass `-display gtk`.
 - Stop QEMU with `python3 tools/qmon.py images/qmp.sock quit`.
 
-Boot to the Android UI takes about 30 s. The first boot runs dexopt and takes longer.
+Boot to the Android UI takes about 30 s.
 
 ### Web UI
 
