@@ -11,6 +11,8 @@
  *     memr=LO-HI     print each instruction that reads data in [LO, HI)
  *     memrp=LO-HI    the same for a physical range
  *     pcr=LO-HI      only watch the instructions in that code range
+ *     snap=VA:PA:LEN:FILE  the first time VA runs, save LEN bytes of
+ *                    physical memory at PA to FILE
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -30,6 +32,8 @@ typedef struct {
     uint64_t va;
     int dump_reg, dump_n;
     uint32_t dump_addr;             /* dump_reg < 0: fixed address */
+    uint64_t snap_pa, snap_len;
+    char *snap_file;                /* saved once, then NULL */
 } Hook;
 
 static GArray *hooks;
@@ -77,6 +81,26 @@ static void on_exec(unsigned int vcpu, void *udata)
         } else {
             g_string_append(s, " unreadable");
         }
+    }
+    if (h->snap_file) {
+        FILE *f = fopen(h->snap_file, "wb");
+
+        for (uint64_t o = 0; f && o < h->snap_len; o += 0x10000) {
+            g_autoptr(GByteArray) b = g_byte_array_new();
+            size_t n = MIN(0x10000, h->snap_len - o);
+
+            if (qemu_plugin_read_memory_hwaddr(h->snap_pa + o, b, n) !=
+                QEMU_PLUGIN_HWADDR_OPERATION_OK) {
+                g_byte_array_set_size(b, n);
+                memset(b->data, 0, n);
+            }
+            fwrite(b->data, 1, n, f);
+        }
+        if (f) {
+            fclose(f);
+        }
+        g_string_append_printf(s, "\n  saved %s", h->snap_file);
+        h->snap_file = NULL;
     }
     g_string_append_c(s, '\n');
     qemu_plugin_outs(s->str);
@@ -213,9 +237,22 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
             pcr_lo = strtoull(kv[1], &end, 0);
             pcr_hi = *end == '-' ? strtoull(end + 1, NULL, 0) : pcr_lo + 4;
+        } else if (!strcmp(kv[0], "snap")) {
+            g_auto(GStrv) f = g_strsplit(kv[1], ":", 4);
+            Hook h = { 0 };
+
+            if (!f[0] || !f[1] || !f[2] || !f[3]) {
+                fprintf(stderr, "hexhook: snap=VA:PA:LEN:FILE\n");
+                return -1;
+            }
+            h.va = strtoull(f[0], NULL, 0);
+            h.snap_pa = strtoull(f[1], NULL, 0);
+            h.snap_len = strtoull(f[2], NULL, 0);
+            h.snap_file = g_strdup(f[3]);
+            g_array_append_val(hooks, h);
         } else if (!strcmp(kv[0], "dump")) {
             g_auto(GStrv) f = g_strsplit(kv[1], ":", 3);
-            Hook h;
+            Hook h = { 0 };
 
             if (!f[0] || !f[1] || !f[2]) {
                 fprintf(stderr, "hexhook: dump=VA:R:N\n");

@@ -85,18 +85,15 @@ def gen_analyze_func(f, tag, regs, imms):
 
     f.write("    mark_implicit_writes(ctx);\n")
 
-    ## A destination the semantics write in pieces (fSETHALF and the like)
-    ## is written straight into the register when the packet needs no
-    ## commit; if it is also a source of this instruction, a later piece
-    ## would read the clobbered source (Rd = cmpy(Rd, Rt) on V2 code).
-    pieces = set(re.findall(
-        r"fSET(?:HALF|UHALF|BYTE|UBYTE|WORD)\(\s*[^,]+,\s*(R\w+V)\b",
-        hex_common.semdict[tag]))
+    ## Without a commit the destination is written straight into the
+    ## register while the instruction runs.  When it is also one of the
+    ## instruction's sources, generated code that writes the destination
+    ## before its last use of the source reads the clobbered value
+    ## (Rd = cmpy(Rd, Rt) on V2 code, among others), so commit.
     for register in regs:
         reg_type, reg_id = register
         wreg = hex_common.get_register(tag, reg_type, reg_id)
-        if (reg_type != "R" or not wreg.is_written() or wreg.is_read() or
-                f"{reg_type}{reg_id}V" not in pieces):
+        if reg_type != "R" or not wreg.is_written() or wreg.is_read():
             continue
         wlen = 2 if wreg.is_pair() else 1
         for register2 in regs:
