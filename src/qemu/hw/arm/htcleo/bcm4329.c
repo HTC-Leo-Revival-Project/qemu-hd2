@@ -148,6 +148,7 @@ static const struct { uint16_t id; uint8_t rev; } core_info[NCORES] = {
 #define WLC_E_ASSOC         7
 #define WLC_E_DISASSOC      11
 #define WLC_E_LINK          16
+#define WLC_E_NDIS_LINK     18
 #define WLC_E_SCAN_COMPLETE 26
 #define WLC_E_STATUS_NO_NETWORKS 3
 
@@ -300,6 +301,27 @@ static void bcm_send_event(Bcm4329State *s, uint32_t type, uint32_t status,
     bcm_queue_frame(s, CHAN_EVENT, bdc, sizeof(bdc), ev, sizeof(ev));
 }
 
+/* is event type enabled in the host's "event_msgs" mask? */
+static bool bcm_event_enabled(Bcm4329State *s, uint32_t type)
+{
+    GByteArray *m = g_hash_table_lookup(s->iovars, "event_msgs");
+
+    return m && type / 8 < m->len && (m->data[type / 8] >> (type % 8)) & 1;
+}
+
+/*
+ * The link came up or went down.  The WinCE firmware also reports it as
+ * WLC_E_NDIS_LINK, which is what Windows Mobile's driver waits for before
+ * it indicates media connect to NDIS.
+ */
+static void bcm_link_event(Bcm4329State *s, bool up)
+{
+    bcm_send_event(s, WLC_E_LINK, 0, up, ap_bssid);
+    if (bcm_event_enabled(s, WLC_E_NDIS_LINK)) {
+        bcm_send_event(s, WLC_E_NDIS_LINK, 0, up, ap_bssid);
+    }
+}
+
 /* ---- the access point -------------------------------------------------------- */
 
 static void bcm_fill_bss_info(uint8_t *b)
@@ -341,7 +363,7 @@ static void bcm_disassociate(Bcm4329State *s)
     if (s->associated) {
         s->associated = false;
         bcm_send_event(s, WLC_E_DISASSOC, 0, 0, ap_bssid);
-        bcm_send_event(s, WLC_E_LINK, 0, 0, ap_bssid);
+        bcm_link_event(s, false);
     }
 }
 
@@ -360,7 +382,7 @@ static void bcm_timer(void *opaque)
         s->associated = true;
         bcm_send_event(s, WLC_E_AUTH, 0, 0, ap_bssid);
         bcm_send_event(s, WLC_E_ASSOC, 0, 0, ap_bssid);
-        bcm_send_event(s, WLC_E_LINK, 0, 1, ap_bssid);
+        bcm_link_event(s, true);
         bcm_send_event(s, WLC_E_SET_SSID, 0, 0, ap_bssid);
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
     } else if (s->pending_join < 0) {
@@ -592,6 +614,225 @@ static int bcm_ioctl(Bcm4329State *s, uint32_t cmd, bool set, uint8_t *buf,
     return 0;
 }
 
+/*
+ * ---- firmware: NDIS OIDs ----------------------------------------------------
+ *
+ * The Windows Mobile driver (bcmsddhd) hands NDIS OIDs to the dongle as CDC
+ * commands: the WinCE firmware answers the 802.11 OIDs itself, and runs
+ * OIDs WL_OID_BASE + n as wl ioctl n.  A query's reply carries the bytes
+ * written; a failure sets CDCF_IOC_ERROR with the NDIS status in the status
+ * word and the bytes needed in the length.
+ */
+#define WL_OID_BASE             0xFFE41420u
+
+#define OID_802_3_PERMANENT_ADDRESS     0x01010101u
+#define OID_802_3_CURRENT_ADDRESS       0x01010102u
+#define OID_802_11_BSSID                0x0D010101u
+#define OID_802_11_SSID                 0x0D010102u
+#define OID_802_11_INFRASTRUCTURE_MODE  0x0D010108u
+#define OID_802_11_ADD_WEP              0x0D010113u
+#define OID_802_11_REMOVE_WEP           0x0D010114u
+#define OID_802_11_DISASSOCIATE         0x0D010115u
+#define OID_802_11_AUTHENTICATION_MODE  0x0D010118u
+#define OID_802_11_PRIVACY_FILTER       0x0D010119u
+#define OID_802_11_BSSID_LIST_SCAN      0x0D01011Au
+#define OID_802_11_ENCRYPTION_STATUS    0x0D01011Bu
+#define OID_802_11_RELOAD_DEFAULTS      0x0D01011Cu
+#define OID_802_11_ADD_KEY              0x0D01011Du
+#define OID_802_11_REMOVE_KEY           0x0D01011Eu
+#define OID_802_11_ASSOCIATION_INFORMATION 0x0D01011Fu
+#define OID_802_11_NETWORK_TYPES_SUPPORTED 0x0D010203u
+#define OID_802_11_NETWORK_TYPE_IN_USE  0x0D010204u
+#define OID_802_11_TX_POWER_LEVEL       0x0D010205u
+#define OID_802_11_RSSI                 0x0D010206u
+#define OID_802_11_FRAGMENTATION_THRESHOLD 0x0D010209u
+#define OID_802_11_RTS_THRESHOLD        0x0D01020Au
+#define OID_802_11_SUPPORTED_RATES      0x0D01020Eu
+#define OID_802_11_CONFIGURATION        0x0D010211u
+#define OID_802_11_POWER_MODE           0x0D010216u
+#define OID_802_11_BSSID_LIST           0x0D010217u
+
+#define NDIS_STATUS_SUCCESS             0u
+#define NDIS_STATUS_NOT_SUPPORTED       0xC00000BBu
+#define NDIS_STATUS_ADAPTER_NOT_READY   0xC0010011u
+#define NDIS_STATUS_INVALID_LENGTH      0xC0010014u
+
+#define NDIS_CONFIG_LEN         32
+#define NDIS_BSSID_EX_FIXED     116     /* NDIS_WLAN_BSSID_EX up to its IEs */
+
+/* NDIS_802_11_CONFIGURATION for the AP's channel */
+static void oid_fill_config(uint8_t *b)
+{
+    memset(b, 0, NDIS_CONFIG_LEN);
+    stl_le_p(b + 0, NDIS_CONFIG_LEN);
+    stl_le_p(b + 4, 100);                       /* beacon period (TU) */
+    stl_le_p(b + 12, (2407 + 5 * AP_CHANNEL) * 1000);  /* DSConfig, kHz */
+    stl_le_p(b + 16, 16);                       /* FHConfig.Length */
+}
+
+/* NDIS_WLAN_BSSID_EX for the AP; returns its (4-aligned) length */
+static size_t oid_fill_bssid_ex(uint8_t *b)
+{
+    size_t sl = strlen(ap_ssid), ie = NDIS_BSSID_EX_FIXED + 12, len;
+
+    memcpy(b + 4, ap_bssid, 6);
+    stl_le_p(b + 12, sl);
+    memcpy(b + 16, ap_ssid, sl);
+    stl_le_p(b + 48, 0);                        /* privacy: open */
+    stl_le_p(b + 52, (uint32_t)AP_RSSI);
+    stl_le_p(b + 56, 3);                        /* Ndis802_11OFDM24 */
+    oid_fill_config(b + 60);
+    stl_le_p(b + 92, 1);                        /* Ndis802_11Infrastructure */
+    memcpy(b + 96, ap_rates, sizeof(ap_rates));
+    /* fixed IEs: timestamp, beacon interval, capabilities (ESS) */
+    stw_le_p(b + NDIS_BSSID_EX_FIXED + 8, 100);
+    stw_le_p(b + NDIS_BSSID_EX_FIXED + 10, 0x0401);
+    b[ie++] = 0;                                /* SSID */
+    b[ie++] = sl;
+    memcpy(b + ie, ap_ssid, sl);
+    ie += sl;
+    b[ie++] = 1;                                /* supported rates */
+    b[ie++] = 8;
+    memcpy(b + ie, ap_rates, 8);
+    ie += 8;
+    b[ie++] = 3;                                /* DS parameter set */
+    b[ie++] = 1;
+    b[ie++] = AP_CHANNEL;
+    b[ie++] = 50;                               /* extended rates */
+    b[ie++] = sizeof(ap_rates) - 8;
+    memcpy(b + ie, ap_rates + 8, sizeof(ap_rates) - 8);
+    ie += sizeof(ap_rates) - 8;
+    stl_le_p(b + 112, ie - NDIS_BSSID_EX_FIXED);
+    len = ROUND_UP(ie, 4);
+    stl_le_p(b + 0, len);
+    return len;
+}
+
+/*
+ * Run an OID on buf (len bytes, the request's data).  Returns the NDIS
+ * status; *n is the bytes written, or the bytes needed on failure.
+ */
+static uint32_t bcm_oid(Bcm4329State *s, uint32_t oid, bool set, uint8_t *buf,
+                        size_t len, size_t *n)
+{
+    uint8_t tmp[256];
+    size_t want = 4;
+    uint32_t v = 0;
+
+    *n = len;
+    if (oid >= WL_OID_BASE && oid < WL_OID_BASE + 0x400) {
+        return bcm_ioctl(s, oid - WL_OID_BASE, set, buf, len) ?
+               NDIS_STATUS_NOT_SUPPORTED : NDIS_STATUS_SUCCESS;
+    }
+    if (set) {
+        switch (oid) {
+        case OID_802_11_BSSID_LIST_SCAN:
+            s->scanning = true;
+            bcm_kick(s, SCAN_MS);
+            break;
+        case OID_802_11_SSID:
+            /* NDIS_802_11_SSID is laid out like wlc_ssid_t */
+            bcm_ioctl(s, WLC_SET_SSID, true, buf, len);
+            break;
+        case OID_802_11_DISASSOCIATE:
+            bcm_disassociate(s);
+            break;
+        }
+        return NDIS_STATUS_SUCCESS;
+    }
+
+    memset(tmp, 0, sizeof(tmp));
+    switch (oid) {
+    case OID_802_3_PERMANENT_ADDRESS:
+    case OID_802_3_CURRENT_ADDRESS:
+        memcpy(tmp, s->mac, 6);
+        want = 6;
+        break;
+    case OID_802_11_BSSID:
+        if (!s->associated) {
+            *n = 0;
+            return NDIS_STATUS_ADAPTER_NOT_READY;
+        }
+        memcpy(tmp, ap_bssid, 6);
+        want = 6;
+        break;
+    case OID_802_11_SSID:
+        if (s->associated) {
+            stl_le_p(tmp, strlen(ap_ssid));
+            memcpy(tmp + 4, ap_ssid, strlen(ap_ssid));
+        }
+        want = 36;
+        break;
+    case OID_802_11_INFRASTRUCTURE_MODE:
+        v = 1;
+        break;
+    case OID_802_11_AUTHENTICATION_MODE:
+        v = 0;                                  /* open */
+        break;
+    case OID_802_11_ENCRYPTION_STATUS:
+        v = 1;                                  /* disabled */
+        break;
+    case OID_802_11_PRIVACY_FILTER:
+    case OID_802_11_POWER_MODE:
+        v = 0;
+        break;
+    case OID_802_11_NETWORK_TYPES_SUPPORTED:
+        stl_le_p(tmp, 2);
+        stl_le_p(tmp + 4, 1);                   /* DS */
+        stl_le_p(tmp + 8, 3);                   /* OFDM 2.4 GHz */
+        want = 12;
+        break;
+    case OID_802_11_NETWORK_TYPE_IN_USE:
+        v = 3;
+        break;
+    case OID_802_11_TX_POWER_LEVEL:
+        v = 100;                                /* mW */
+        break;
+    case OID_802_11_RSSI:
+        if (!s->associated) {
+            *n = 0;
+            return NDIS_STATUS_ADAPTER_NOT_READY;
+        }
+        v = (uint32_t)AP_RSSI;
+        break;
+    case OID_802_11_FRAGMENTATION_THRESHOLD:
+    case OID_802_11_RTS_THRESHOLD:
+        v = 2346;
+        break;
+    case OID_802_11_SUPPORTED_RATES:
+        memcpy(tmp, ap_rates, sizeof(ap_rates));
+        want = 16;
+        break;
+    case OID_802_11_CONFIGURATION:
+        oid_fill_config(tmp);
+        want = NDIS_CONFIG_LEN;
+        break;
+    case OID_802_11_BSSID_LIST:
+        /* NDIS_802_11_BSSID_LIST_EX: our one AP, always in range */
+        stl_le_p(tmp, 1);
+        want = 4 + oid_fill_bssid_ex(tmp + 4);
+        break;
+    default:
+        if ((oid >> 16) == 0x0D01) {
+            *n = 0;
+            return NDIS_STATUS_NOT_SUPPORTED;
+        }
+        /* general and statistics OIDs: zeros */
+        memset(buf, 0, len);
+        return NDIS_STATUS_SUCCESS;
+    }
+    if (want == 4) {
+        stl_le_p(tmp, v);
+    }
+    if (len < want) {
+        *n = want;
+        return NDIS_STATUS_INVALID_LENGTH;
+    }
+    memcpy(buf, tmp, want);
+    *n = want;
+    return NDIS_STATUS_SUCCESS;
+}
+
 static void bcm_control(Bcm4329State *s, const uint8_t *p, size_t len)
 {
     uint32_t cmd, msglen, flags;
@@ -608,6 +849,26 @@ static void bcm_control(Bcm4329State *s, const uint8_t *p, size_t len)
     dlen = MIN(msglen & 0xFFFF, 2048);
     rsp = g_malloc0(16 + dlen);
     memcpy(rsp + 16, p + 16, MIN(dlen, len - 16));
+    if (cmd >= 0x10000) {
+        size_t n;
+        uint32_t st = bcm_oid(s, cmd, flags & CDCF_IOC_SET, rsp + 16, dlen,
+                              &n);
+
+        DPRINTF("oid %08x %s len %zu -> %08x (%zu)\n", cmd,
+                flags & CDCF_IOC_SET ? "set" : "query", dlen, st, n);
+        if (st) {
+            flags |= CDCF_IOC_ERROR;
+            dlen = 0;
+        } else {
+            dlen = MIN(n, dlen);
+        }
+        stl_le_p(rsp, cmd);
+        stl_le_p(rsp + 4, (msglen & ~0xFFFFu) | (uint16_t)n);
+        stl_le_p(rsp + 8, flags);
+        stl_le_p(rsp + 12, st);
+        bcm_queue_frame(s, CHAN_CONTROL, NULL, 0, rsp, 16 + dlen);
+        return;
+    }
     ret = bcm_ioctl(s, cmd, flags & CDCF_IOC_SET, rsp + 16, dlen);
     DPRINTF("cdc cmd %u flags %08x len %zu -> %d\n", cmd, flags, dlen, ret);
     if (ret) {
