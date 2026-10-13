@@ -129,6 +129,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmMdspState, MSM_MDSP)
 #define B_SCH_WR        (MEM_B + 0xAE0)
 #define GSM_BSIC        0x0A                /* NCC 1, BCC 2 */
 #define GSM_CMD_ACCCH   29              /* receive a CCCH/BCCH block */
+/*
+ * transmit (command 30): the uplink entry's word address at byte 16, an
+ * entry [length, type, data...]; a RACH's is [4, 6, RA]
+ */
+#define GSM_CMD_TX      30
+#define GSM_ARFCN       133             /* the cell's, in its allocation */
+#define GSM_TSC         2               /* = BCC */
 #define GSM_FCCH_SNR    0x400
 #define GSM_NOISE       0x40            /* energy of an empty channel */
 #define GSM_CELL        0x186a0         /* energy of the cell */
@@ -150,6 +157,22 @@ struct MsmMdspState {
     int gsm_acq;                /* 0 idle, 1 searching, 2 tone posted */
     uint16_t gsm_acq_id;
     uint32_t gsm_acq_l1fn;      /* L1's frame number when it started */
+    uint32_t rach_fn;           /* L1's frame number of the last RACH */
+    uint8_t rach_ra;            /* and its content */
+    uint32_t ia_bfn;            /* the CCCH block that answers it, or 0 */
+    /* the network's side of the SDCCH it assigned (see gsm_net_ul) */
+    bool ded;                   /* the MS is on it */
+    bool l2_up;                 /* SAPI 0 is established */
+    bool ua_pending, rr_pending, release;
+    uint8_t ua[23];
+    uint8_t vs, va, vr;         /* LAPDm V(S), V(A), V(R) */
+    uint8_t last_i[23];         /* the unacknowledged I frame */
+    unsigned t200;              /* SDCCH blocks it has been unacknowledged */
+    unsigned idle;              /* SDCCH blocks since the MS sent anything */
+    uint8_t l3q[4][20];         /* L3 messages to send */
+    uint8_t l3q_len[4];
+    unsigned l3q_n;
+    unsigned sacch_n;
     GHashTable *seen;
 };
 
@@ -191,7 +214,7 @@ static void gsm_power(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
  * The modelled cell's broadcast (3GPP 44.018): system information for MCC
  * 310, MNC 260 (the SIM's network), LAC 1, cell 1, in the BCCH block by
  * TC (SI1, SI2, SI3, SI4, then SI3/SI4 in the optional slots); the other
- * CCCH blocks are L2 fill frames for now.
+ * CCCH blocks page nobody, or assign a channel to a RACH.
  */
 static const uint8_t gsm_si3[23] = {
     0x49, 0x06, 0x1b,                   /* L2 pseudo length 18, RR, SI3 */
@@ -225,8 +248,9 @@ static const uint8_t gsm_si4[23] = {
     0x70, 0x00, 0x00,
     0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
 };
+/* idle CCCH blocks: PAGING REQUEST TYPE 1 paging nobody */
 static const uint8_t gsm_fill[23] = {
-    0x01, 0x03, 0x01, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+    0x15, 0x06, 0x21, 0x00, 0x01, 0xf0, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
     0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
 };
 
@@ -249,25 +273,265 @@ static uint32_t gsm_block_fn(uint32_t fn)
     return fn - t3 + 51 + 2;
 }
 
-static const uint8_t *gsm_block(uint32_t bfn)
+/* the first CCCH (not BCCH) block that starts after frame fn */
+static uint32_t gsm_ccch_after(uint32_t fn)
+{
+    uint32_t b = gsm_block_fn(fn);
+
+    while (b <= fn || b % 51 == 2) {
+        b = gsm_block_fn(b + 4);
+    }
+    return b;
+}
+
+/*
+ * IMMEDIATE ASSIGNMENT (44.018 9.1.18) answering the last RACH: SDCCH/8
+ * subchannel 0 on timeslot 1 of the cell's carrier, the request reference
+ * (RA and the RACH's frame number as T1', T3, T2), timing advance 0
+ */
+static void gsm_imm_ass(MsmMdspState *s, uint8_t b[23])
+{
+    uint32_t fn = s->rach_fn;
+    unsigned t1p = fn / 1326 % 32, t2 = fn % 26, t3 = fn % 51;
+    const uint8_t m[] = {
+        0x2d, 0x06, 0x3f,                   /* L2 pseudo length 11, RR, IA */
+        0x00,                               /* dedicated, normal paging */
+        0x08 << 3 | 1,                      /* SDCCH/8 subchannel 0, TN 1 */
+        GSM_TSC << 5 | (GSM_ARFCN >> 8 & 3), GSM_ARFCN & 0xff,
+        s->rach_ra, t1p << 3 | t3 >> 3, (t3 & 7) << 5 | t2,
+        0x00,                               /* timing advance */
+        0x00,                               /* mobile allocation: none */
+    };
+
+    memset(b, 0x2b, 23);
+    memcpy(b, m, sizeof(m));
+}
+
+static const uint8_t *gsm_block(MsmMdspState *s, uint32_t bfn)
 {
     unsigned t3 = bfn % 51, tc = (bfn / 51) % 8;
+    static uint8_t ia[23];
 
     static const uint8_t *const bcch[8] = {
         gsm_si1, gsm_si2, gsm_si3, gsm_si4, gsm_si3, gsm_si4, gsm_si3, gsm_si4,
     };
 
-    return t3 == 2 ? bcch[tc] : gsm_fill;
+    if (t3 == 2) {
+        return bcch[tc];
+    }
+    if (s->ia_bfn && bfn == s->ia_bfn) {
+        gsm_imm_ass(s, ia);
+        return ia;
+    }
+    return gsm_fill;
+}
+
+/*
+ * The network behind the cell, on the SDCCH an IMMEDIATE ASSIGNMENT gives
+ * (SDCCH/8 subchannel 0 on timeslot 1): LAPDm (44.006) SAPI 0 with window
+ * 1, and the network side of MM/RR (24.008, 44.018): a location update is
+ * accepted without authentication and the channel released.  The SACCH
+ * carries SI5 and SI6.
+ */
+static const uint8_t gsm_si5[23] = {
+    0x00, 0x00, 0x03, 0x03,             /* L1 header: power, TA; UI */
+    0x49, 0x06, 0x1d,                   /* L2 pseudo length 18, RR, SI5 */
+    0x8e, 0x42, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+static const uint8_t gsm_si6[23] = {
+    0x00, 0x00, 0x03, 0x03,
+    0x2d, 0x06, 0x1e,                   /* L2 pseudo length 11, RR, SI6 */
+    0x00, 0x01,                         /* cell identity */
+    0x13, 0x00, 0x62, 0x00, 0x01,       /* LAI */
+    0x2f, 0xff,                         /* cell options, NCC permitted */
+    0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+};
+static const uint8_t gsm_l2_fill[23] = {
+    0x01, 0x03, 0x01, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+    0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b, 0x2b,
+};
+
+static void gsm_net_send(MsmMdspState *s, const uint8_t *m, unsigned n)
+{
+    if (s->l3q_n < ARRAY_SIZE(s->l3q) && n <= sizeof(s->l3q[0])) {
+        memcpy(s->l3q[s->l3q_n], m, n);
+        s->l3q_len[s->l3q_n++] = n;
+    }
+}
+
+/* an L3 message from the MS */
+static void gsm_net_l3(MsmMdspState *s, const uint8_t *m, unsigned n)
+{
+    unsigned pd = m[0] & 0xf, mt = n > 1 ? m[1] & 0x3f : 0;
+
+    if (s->trace) {
+        qemu_log("msm-mdsp: gsm net: L3 pd %u type %02x (%u bytes)\n", pd, mt,
+                 n);
+    }
+    if (pd == 5 && mt == 0x08) {
+        /* LOCATION UPDATING REQUEST: ACCEPT (the LAI), then release */
+        static const uint8_t acc[] = { 0x05, 0x02, 0x13, 0x00, 0x62, 0x00, 0x01 };
+        static const uint8_t rel[] = { 0x06, 0x0d, 0x00 };
+
+        gsm_net_send(s, acc, sizeof(acc));
+        gsm_net_send(s, rel, sizeof(rel));
+        s->release = true;
+    }
+}
+
+static void gsm_net_ack(MsmMdspState *s, unsigned nr)
+{
+    if (((nr - s->va) & 7) <= ((s->vs - s->va) & 7)) {
+        s->va = nr;
+    }
+}
+
+/* an SDCCH frame from the MS (format B) */
+static void gsm_net_ul(MsmMdspState *s, const uint8_t *f)
+{
+    uint8_t c = f[1];
+    unsigned len = MIN(f[2] >> 2, 20);
+
+    if ((f[0] >> 2 & 7) != 0) {         /* SAPI 3 (SMS) not yet */
+        return;
+    }
+    s->idle = 0;
+    if ((c & 3) == 3) {                 /* U frames */
+        switch (c & ~0x10) {
+        case 0x2f:                      /* SABM: UA with its information */
+            s->ded = s->l2_up = true;
+            s->vs = s->va = s->vr = 0;
+            s->l3q_n = 0;
+            s->release = false;
+            memset(s->ua, 0x2b, 23);
+            s->ua[0] = 0x01;
+            s->ua[1] = 0x63 | (c & 0x10);
+            s->ua[2] = len << 2 | 1;
+            memcpy(s->ua + 3, f + 3, len);
+            s->ua_pending = true;
+            if (len) {
+                gsm_net_l3(s, f + 3, len);
+            }
+            break;
+        case 0x43:                      /* DISC: UA, the channel is free */
+            memcpy(s->ua, gsm_l2_fill, 23);
+            s->ua[1] = 0x63 | (c & 0x10);
+            s->ua_pending = true;
+            s->l2_up = false;
+            break;
+        }
+    } else if (!(c & 1)) {              /* I frames */
+        gsm_net_ack(s, c >> 5);
+        if ((c >> 1 & 7) == s->vr) {
+            s->vr = (s->vr + 1) & 7;
+            gsm_net_l3(s, f + 3, len);
+        }
+        s->rr_pending = true;
+    } else {                            /* S frames */
+        gsm_net_ack(s, c >> 5);
+    }
+    if (s->trace) {
+        qemu_log("msm-mdsp: gsm net: UL %02x %02x %02x %02x %02x %02x"
+                 " V(S) %u V(A) %u V(R) %u\n", f[0], f[1], f[2], f[3], f[4],
+                 f[5], s->vs, s->va, s->vr);
+    }
+}
+
+/* the next SDCCH block to the MS */
+static void gsm_net_dl(MsmMdspState *s, uint8_t b[23])
+{
+    memcpy(b, gsm_l2_fill, 23);
+    if (s->ua_pending) {
+        memcpy(b, s->ua, 23);
+        s->ua_pending = false;
+        if (!s->l2_up) {
+            s->ded = false;             /* released */
+        }
+        return;
+    }
+    if (!s->l2_up) {
+        if (s->ded && ++s->idle > 8) {
+            s->ded = false;             /* the MS has left */
+        }
+        return;
+    }
+    if (s->vs != s->va) {
+        /* T200: the I frame is resent after three blocks unacknowledged */
+        if (++s->t200 < 3) {
+            goto rr;
+        }
+        memcpy(b, s->last_i, 23);
+        b[1] = s->vr << 5 | (b[1] & 0x1f);
+        s->t200 = 0;
+        s->rr_pending = false;
+        return;
+    }
+    if (s->l3q_n) {
+        unsigned n = s->l3q_len[0];
+
+        memset(b, 0x2b, 23);
+        b[0] = 0x03;
+        b[1] = s->vr << 5 | s->vs << 1;
+        b[2] = n << 2 | 1;
+        memcpy(b + 3, s->l3q[0], n);
+        memcpy(s->last_i, b, 23);
+        memmove(s->l3q[0], s->l3q[1], sizeof(s->l3q[0]) * --s->l3q_n);
+        memmove(s->l3q_len, s->l3q_len + 1, s->l3q_n);
+        s->vs = (s->vs + 1) & 7;
+        s->t200 = 0;
+        s->rr_pending = false;
+        return;
+    }
+    if (s->release && ++s->idle > 8) {
+        s->ded = s->l2_up = false;      /* released, the MS did not say so */
+        return;
+    }
+rr:
+    if (s->rr_pending) {
+        b[0] = 0x01;
+        b[1] = s->vr << 5 | 0x01;
+        s->rr_pending = false;
+    }
+}
+
+/* a downlink block on the dedicated channel, by its first frame */
+static const uint8_t *gsm_ded_block(MsmMdspState *s, unsigned t3,
+                                    bool consume)
+{
+    static uint8_t b[23];
+
+    if (t3 < 4) {
+        if (consume) {
+            gsm_net_dl(s, b);
+        }
+        return b;
+    }
+    if (t3 >= 32 && t3 < 48) {
+        return s->sacch_n & 1 ? gsm_si6 : gsm_si5;
+    }
+    return gsm_l2_fill;
 }
 
 /* receive a CCCH/BCCH block: its metrics and its decoded 23 octets */
 static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
 {
     uint32_t met = MEM_B + 2 * lduw_le_p(cmd + 4);
+    bool has_dat = lduw_le_p(cmd + 24) != 0xffff;
     uint32_t dat = MEM_B + 2 * lduw_le_p(cmd + 24);
-    uint32_t bfn = gsm_block_fn(s->gsm_fn);
-    const uint8_t *blk = gsm_block(bfn);
+    uint32_t bfn;
+    const uint8_t *blk;
 
+    if (s->ded) {
+        /* the four reads of a block: the last one takes the data */
+        bfn = s->gsm_fn - (has_dat ? 3 : 0);
+        blk = gsm_ded_block(s, bfn % 51, has_dat);
+        if (has_dat && bfn % 51 >= 32 && bfn % 51 < 48) {
+            s->sacch_n++;
+        }
+    } else {
+        bfn = gsm_block_fn(s->gsm_fn);
+        blk = gsm_block(s, bfn);
+    }
     if (met + 28 > MEM_C || dat + 12 + 24 > MEM_C) {
         return;
     }
@@ -276,17 +540,61 @@ static void gsm_accch(MsmMdspState *s, uint16_t seq, const uint8_t *cmd)
     stw_le_p(s->mem + met + 6, 0x100);
     stw_le_p(s->mem + met + 8, 0x100);
     stw_le_p(s->mem + met, 1);
-    memset(s->mem + dat, 0, 12 + 24);
-    memcpy(s->mem + dat + 12, blk, 23);
-    stw_le_p(s->mem + dat + 2, seq);
-    stw_le_p(s->mem + dat + 6, 2);              /* bit 1: CRC OK */
-    stw_le_p(s->mem + dat, 23);
+    if (has_dat) {
+        memset(s->mem + dat, 0, 12 + 24);
+        memcpy(s->mem + dat + 12, blk, 23);
+        stw_le_p(s->mem + dat + 2, seq);
+        stw_le_p(s->mem + dat + 6, 2);          /* bit 1: CRC OK */
+        stw_le_p(s->mem + dat, 23);
+    }
     if (s->trace) {
         qemu_log("msm-mdsp: gsm accch seq %04x fn %u block %u (t3 %u tc %u)"
                  " met %04x dat %04x %s\n", seq, s->gsm_fn, bfn, bfn % 51,
                  (bfn / 51) % 8, lduw_le_p(cmd + 4), lduw_le_p(cmd + 24),
                  blk == gsm_si1 ? "SI1" : blk == gsm_si2 ? "SI2" :
-                 blk == gsm_si3 ? "SI3" : blk == gsm_si4 ? "SI4" : "fill");
+                 blk == gsm_si3 ? "SI3" : blk == gsm_si4 ? "SI4" :
+                 blk == gsm_fill ? "fill" : s->ded ? "dedicated" :
+                 "IMMEDIATE ASSIGNMENT");
+        if (s->ded && has_dat) {
+            qemu_log("msm-mdsp: gsm net: DL %02x %02x %02x %02x %02x %02x\n",
+                     blk[0], blk[1], blk[2], blk[3], blk[4], blk[5]);
+        }
+    }
+}
+
+/* a burst goes out: a RACH is answered in the next CCCH block or so */
+static void gsm_tx(MsmMdspState *s, const uint8_t *cmd)
+{
+    uint32_t e = MEM_B + 2 * lduw_le_p(cmd + 16);
+
+    if (s->trace && e + 64 <= MEM_C && lduw_le_p(s->mem + e)) {
+        GString *g = g_string_new(NULL);
+
+        for (unsigned k = 0; k < 32; k += 2) {
+            g_string_append_printf(g, " %04x", lduw_le_p(s->mem + e + k));
+        }
+        qemu_log("msm-mdsp: gsm tx l1 fn %u entry %04x:%s\n", s->l1_fn,
+                 lduw_le_p(cmd + 16), g->str);
+        g_string_free(g, true);
+    }
+    if (e + 6 > MEM_C || !lduw_le_p(s->mem + e)) {
+        return;
+    }
+    if (lduw_le_p(s->mem + e) != 4) {
+        /* an SDCCH frame: [15, 1, 23 octets]; not the SACCH's (t3 47-50) */
+        unsigned t3 = s->gsm_fn % 51;
+
+        if (e + 4 + 23 <= MEM_C && (t3 < 47 || !s->ded)) {
+            gsm_net_ul(s, s->mem + e + 4);
+        }
+        return;
+    }
+    s->rach_fn = s->l1_fn;
+    s->rach_ra = s->mem[e + 4];
+    s->ia_bfn = gsm_ccch_after(s->gsm_fn + 2);
+    if (s->trace) {
+        qemu_log("msm-mdsp: gsm RACH ra %02x fn %u (cell %u), answer in"
+                 " block %u\n", s->rach_ra, s->rach_fn, s->gsm_fn, s->ia_bfn);
     }
 }
 
@@ -389,6 +697,8 @@ static void mdsp_gsm_frame(void *opaque, int n, int level)
                 gsm_power(s, seq, buf + off);
             } else if (id == GSM_CMD_ACCCH) {
                 gsm_accch(s, seq, buf + off);
+            } else if (id == GSM_CMD_TX) {
+                gsm_tx(s, buf + off);
             } else if (id == GSM_CMD_RX &&
                        (lduw_le_p(buf + off + 16) == GSM_RX_ACQ ||
                         lduw_le_p(buf + off + 16) == GSM_RX_ACQ_CAMP)) {
