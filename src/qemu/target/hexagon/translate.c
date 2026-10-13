@@ -244,8 +244,18 @@ static void gen_exception_decode_fail(DisasContext *ctx, int nwords, int excp)
     target_ulong fail_pc = ctx->base.pc_next + nwords * sizeof(uint32_t);
 
     gen_exec_counters(ctx);
+#ifndef CONFIG_USER_ONLY
+    /*
+     * A precise exception at the packet: excp is a cause code, not an
+     * event (as an event, INVALID_PACKET would read as interrupt 5 and
+     * the packet would be skipped silently).
+     */
+    tcg_gen_movi_tl(hex_gpr[HEX_REG_PC], ctx->base.pc_next);
+    gen_precise_exception(excp, ctx->base.pc_next);
+#else
     tcg_gen_movi_tl(hex_gpr[HEX_REG_PC], fail_pc);
     gen_exception(excp, fail_pc);
+#endif
     ctx->base.is_jmp = DISAS_NORETURN;
     ctx->base.pc_next = fail_pc;
 }
@@ -1204,6 +1214,14 @@ static void decode_and_translate_packet(CPUHexagonState *env, DisasContext *ctx)
         gen_commit_packet(ctx);
         ctx->base.pc_next += ctx->pkt.encod_pkt_size_in_bytes;
     } else {
+        g_autoptr(GString) w = g_string_new(NULL);
+
+        for (i = 0; i < nwords; i++) {
+            g_string_append_printf(w, " %08x", words[i]);
+        }
+        qemu_log_mask(LOG_GUEST_ERROR | LOG_UNIMP,
+                      "hexagon: undecodable packet at %08x:%s\n",
+                      (uint32_t)ctx->base.pc_next, w->str);
         gen_exception_decode_fail(ctx, nwords, HEX_CAUSE_INVALID_PACKET);
     }
 }
