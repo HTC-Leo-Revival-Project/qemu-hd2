@@ -1,0 +1,1144 @@
+/*
+ * Adreno 200 texture unit: fetch constants, mipmaps and filtering
+ *
+ * A texture fetch constant is 6 dwords (SQ_FETCH_0 + 6n), as on Xenos:
+ *   0: type, per-component sign, clamp x/y/z, pitch/32, tiled
+ *   1: format, endian, clamp policy, base address
+ *   2: width-1, height-1 (and depth-1)
+ *   3: number format, swizzle, exponent adjust, mag/min/mip filters
+ *   4: min/max mip level, LOD bias (1/32)
+ *   5: border colour, dimension, mip address
+ * Level 0 is at the base address with the constant's pitch.  Levels 1+
+ * start at the mip address, each in a power-of-two pitch and height of at
+ * least 32 blocks, 4 KiB aligned (freedreno's fd2 layout).  Tiled surfaces
+ * use the Xenos 2D tiling, in blocks for the compressed formats.
+ *
+ * Formats: 8/16/32-bit integer and float ones, ETC1, DXT1/3/5, DXT3A,
+ * DXT5A, DXN and ATC (Adreno's own: RGB, explicit and interpolated
+ * alpha).  The LOD comes from the 2x2 quads' coordinate differences;
+ * point/linear filtering, nearest/linear mipmapping.
+ *
+ * This code is licensed under the GNU GPL v2 or later.
+ */
+#include "qemu/osdep.h"
+#include <math.h>
+#include "msm_adreno_gl.h"
+
+enum { FMT_ETC1_RGBA_INTERP = 46, FMT_ETC1_RGB = 47, FMT_ETC1_RGBA = 48 };
+
+typedef struct TexFmt {
+    uint8_t bpb;            /* bytes per block */
+    uint8_t bw;             /* block width/height in texels (1 or 4) */
+    uint8_t bits[4];        /* uncompressed channel widths from bit 0 */
+    uint8_t kind;           /* 0 fixed, 1 float16, 2 float32, 3 block */
+} TexFmt;
+
+static bool tex_format(unsigned fmt, TexFmt *t)
+{
+    static const TexFmt tbl[64] = {
+        [1]  = { 1, 1, { 8, 0, 0, 0 } },        /* FMT_1 (as 8) */
+        [2]  = { 1, 1, { 8, 0, 0, 0 } },        /* FMT_8 */
+        [3]  = { 2, 1, { 5, 5, 5, 1 } },        /* FMT_1_5_5_5 */
+        [4]  = { 2, 1, { 5, 6, 5, 0 } },        /* FMT_5_6_5 */
+        [5]  = { 2, 1, { 6, 5, 5, 0 } },        /* FMT_6_5_5 */
+        [6]  = { 4, 1, { 8, 8, 8, 8 } },        /* FMT_8_8_8_8 */
+        [7]  = { 4, 1, { 10, 10, 10, 2 } },     /* FMT_2_10_10_10 */
+        [8]  = { 1, 1, { 8, 0, 0, 0 } },        /* FMT_8_A */
+        [9]  = { 1, 1, { 8, 0, 0, 0 } },        /* FMT_8_B */
+        [10] = { 2, 1, { 8, 8, 0, 0 } },        /* FMT_8_8 */
+        [13] = { 2, 1, { 1, 5, 5, 5 } },        /* FMT_5_5_5_1 */
+        [14] = { 4, 1, { 8, 8, 8, 8 } },        /* FMT_8_8_8_8_A */
+        [15] = { 2, 1, { 4, 4, 4, 4 } },        /* FMT_4_4_4_4 */
+        [16] = { 4, 1, { 8, 8, 8, 0 } },        /* FMT_8_8_8 (as 32 bpp) */
+        [18] = { 8, 4, { 0 }, 3 },              /* FMT_DXT1 */
+        [19] = { 16, 4, { 0 }, 3 },             /* FMT_DXT2_3 */
+        [20] = { 16, 4, { 0 }, 3 },             /* FMT_DXT4_5 */
+        [21] = { 4, 1, { 2, 10, 10, 10 } },     /* FMT_10_10_10_2 */
+        [22] = { 4, 1, { 8, 24, 0, 0 } },       /* FMT_24_8 */
+        [24] = { 2, 1, { 16, 0, 0, 0 } },       /* FMT_16 */
+        [25] = { 4, 1, { 16, 16, 0, 0 } },      /* FMT_16_16 */
+        [26] = { 8, 1, { 16, 16, 16, 16 } },    /* FMT_16_16_16_16 */
+        [30] = { 2, 1, { 16, 0, 0, 0 }, 1 },    /* FMT_16_FLOAT */
+        [31] = { 4, 1, { 16, 16, 0, 0 }, 1 },   /* FMT_16_16_FLOAT */
+        [32] = { 8, 1, { 16, 16, 16, 16 }, 1 }, /* FMT_16_16_16_16_FLOAT */
+        [33] = { 4, 1, { 32, 0, 0, 0 } },       /* FMT_32 */
+        [34] = { 8, 1, { 32, 32, 0, 0 } },      /* FMT_32_32 */
+        [36] = { 4, 1, { 32, 0, 0, 0 }, 2 },    /* FMT_32_FLOAT */
+        [37] = { 8, 1, { 32, 32, 0, 0 }, 2 },   /* FMT_32_32_FLOAT */
+        [38] = { 16, 1, { 32, 32, 32, 32 }, 2 },/* FMT_32_32_32_32_FLOAT */
+        [39] = { 8, 4, { 0 }, 3 },              /* FMT_ATI_TC_RGB */
+        [40] = { 16, 4, { 0 }, 3 },             /* FMT_ATI_TC_RGBA */
+        [41] = { 8, 4, { 0 }, 3 },              /* FMT_ATI_TC_555_565_RGB */
+        [42] = { 16, 4, { 0 }, 3 },             /* ..._RGBA (explicit) */
+        [43] = { 16, 4, { 0 }, 3 },             /* FMT_ATI_TC_RGBA_INTERP */
+        [44] = { 16, 4, { 0 }, 3 },             /* ..._RGBA_INTERP */
+        [46] = { 16, 4, { 0 }, 3 },             /* FMT_ETC1_RGBA_INTERP */
+        [47] = { 8, 4, { 0 }, 3 },              /* FMT_ETC1_RGB */
+        [48] = { 16, 4, { 0 }, 3 },             /* FMT_ETC1_RGBA */
+        [49] = { 16, 4, { 0 }, 3 },             /* FMT_DXN */
+        [58] = { 8, 4, { 0 }, 3 },              /* FMT_DXT3A */
+        [59] = { 8, 4, { 0 }, 3 },              /* FMT_DXT5A */
+    };
+
+    *t = tbl[fmt & 63];
+    return t->bpb != 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compressed blocks: one texel (x, y in 0..3) as RGBA in 0..1        */
+/* ------------------------------------------------------------------ */
+
+static void rgb565(uint16_t c, int *rgb)
+{
+    rgb[0] = ((c >> 11) & 31) * 255 / 31;
+    rgb[1] = ((c >> 5) & 63) * 255 / 63;
+    rgb[2] = (c & 31) * 255 / 31;
+}
+
+/* DXT1-style colour block; four colours always for DXT3/5 */
+static void dxt_color(const uint8_t *b, int i, bool dxt1, float *out)
+{
+    uint16_t c0 = lduw_le_p(b), c1 = lduw_le_p(b + 2);
+    int sel = (ldl_le_p(b + 4) >> (2 * i)) & 3;
+    int a[3], c[3];
+
+    rgb565(c0, a);
+    rgb565(c1, c);
+    out[3] = 1.0f;
+    for (int k = 0; k < 3; k++) {
+        int v;
+
+        if (!dxt1 || c0 > c1) {
+            switch (sel) {
+            case 0: v = a[k]; break;
+            case 1: v = c[k]; break;
+            case 2: v = (2 * a[k] + c[k]) / 3; break;
+            default: v = (a[k] + 2 * c[k]) / 3; break;
+            }
+        } else {
+            switch (sel) {
+            case 0: v = a[k]; break;
+            case 1: v = c[k]; break;
+            case 2: v = (a[k] + c[k]) / 2; break;
+            default: v = 0; out[3] = 0.0f; break;
+            }
+        }
+        out[k] = v / 255.0f;
+    }
+}
+
+/* DXT5/BC4-style interpolated 8-bit channel */
+static float dxt5_alpha(const uint8_t *b, int i)
+{
+    int a0 = b[0], a1 = b[1];
+    uint64_t bits = ldq_le_p(b) >> 16;
+    int sel = (bits >> (3 * i)) & 7;
+
+    if (sel == 0) {
+        return a0 / 255.0f;
+    }
+    if (sel == 1) {
+        return a1 / 255.0f;
+    }
+    if (a0 > a1) {
+        return ((8 - sel) * a0 + (sel - 1) * a1) / 7 / 255.0f;
+    }
+    if (sel == 6) {
+        return 0.0f;
+    }
+    if (sel == 7) {
+        return 1.0f;
+    }
+    return ((6 - sel) * a0 + (sel - 1) * a1) / 5 / 255.0f;
+}
+
+/* explicit 4-bit alpha */
+static float explicit_alpha(const uint8_t *b, int i)
+{
+    return ((ldq_le_p(b) >> (4 * i)) & 15) / 15.0f;
+}
+
+/* ATC (Adreno) colour block: colour0 RGB555 with a mode bit, colour1 565 */
+static void atc_color(const uint8_t *b, int i, float *out)
+{
+    uint16_t c0 = lduw_le_p(b), c1 = lduw_le_p(b + 2);
+    int sel = (ldl_le_p(b + 4) >> (2 * i)) & 3;
+    int a[3], c[3];
+
+    a[0] = ((c0 >> 10) & 31) * 255 / 31;
+    a[1] = ((c0 >> 5) & 31) * 255 / 31;
+    a[2] = (c0 & 31) * 255 / 31;
+    rgb565(c1, c);
+    for (int k = 0; k < 3; k++) {
+        int v;
+
+        if (!(c0 & 0x8000)) {
+            switch (sel) {
+            case 0: v = a[k]; break;
+            case 1: v = (5 * a[k] + 3 * c[k]) / 8; break;
+            case 2: v = (3 * a[k] + 5 * c[k]) / 8; break;
+            default: v = c[k]; break;
+            }
+        } else {
+            switch (sel) {
+            case 0: v = 0; break;
+            case 1: v = MAX(a[k] - c[k] / 4, 0); break;
+            case 2: v = a[k]; break;
+            default: v = c[k]; break;
+            }
+        }
+        out[k] = v / 255.0f;
+    }
+    out[3] = 1.0f;
+}
+
+static void etc1_texel(const uint8_t *b, int x, int y, float out[4])
+{
+    static const int tbl[8][4] = {
+        { 2, 8, -2, -8 }, { 5, 17, -5, -17 }, { 9, 29, -9, -29 },
+        { 13, 42, -13, -42 }, { 18, 60, -18, -60 }, { 24, 80, -24, -80 },
+        { 33, 106, -33, -106 }, { 47, 183, -47, -183 },
+    };
+    uint32_t hi = ldl_be_p(b), lo = ldl_be_p(b + 4);
+    bool diff = hi & 2, flip = hi & 1;
+    int sub = flip ? (y >= 2) : (x >= 2);
+    int base[3], cw;
+    int idx = x * 4 + y;
+    int msb = (lo >> (16 + idx)) & 1, lsb = (lo >> idx) & 1;
+    int mod;
+
+    if (diff) {
+        for (int k = 0; k < 3; k++) {
+            int c5 = (hi >> (27 - 8 * k)) & 0x1f;
+            int d = ((int)((hi >> (24 - 8 * k)) & 7) << 29) >> 29;
+
+            if (sub) {
+                c5 += d;
+            }
+            c5 &= 0x1f;
+            base[k] = (c5 << 3) | (c5 >> 2);
+        }
+    } else {
+        for (int k = 0; k < 3; k++) {
+            base[k] = ((hi >> (28 - 8 * k - (sub ? 4 : 0))) & 0xf) * 17;
+        }
+    }
+    cw = (hi >> (sub ? 2 : 5)) & 7;
+    mod = tbl[cw][(msb << 1) | lsb];
+    for (int k = 0; k < 3; k++) {
+        out[k] = MIN(MAX(base[k] + mod, 0), 255) / 255.0f;
+    }
+    out[3] = 1.0f;
+}
+
+static void block_texel(unsigned fmt, const uint8_t *b, int x, int y,
+                        float out[4])
+{
+    int i = y * 4 + x;
+
+    switch (fmt) {
+    case 18:    /* DXT1 */
+        dxt_color(b, i, true, out);
+        break;
+    case 19:    /* DXT2/3 */
+        dxt_color(b + 8, i, false, out);
+        out[3] = explicit_alpha(b, i);
+        break;
+    case 20:    /* DXT4/5 */
+        dxt_color(b + 8, i, false, out);
+        out[3] = dxt5_alpha(b, i);
+        break;
+    case 49:    /* DXN: two interpolated channels */
+        out[0] = dxt5_alpha(b, i);
+        out[1] = dxt5_alpha(b + 8, i);
+        out[2] = 0.0f;
+        out[3] = 1.0f;
+        break;
+    case 58:    /* DXT3A */
+        out[0] = out[1] = out[2] = out[3] = explicit_alpha(b, i);
+        break;
+    case 59:    /* DXT5A */
+        out[0] = out[1] = out[2] = out[3] = dxt5_alpha(b, i);
+        break;
+    case 39:
+    case 41:    /* ATC RGB */
+        atc_color(b, i, out);
+        break;
+    case 40:
+    case 42:    /* ATC explicit alpha */
+        atc_color(b + 8, i, out);
+        out[3] = explicit_alpha(b, i);
+        break;
+    case 43:
+    case 44:    /* ATC interpolated alpha */
+        atc_color(b + 8, i, out);
+        out[3] = dxt5_alpha(b, i);
+        break;
+    case FMT_ETC1_RGB:
+        etc1_texel(b, x, y, out);
+        break;
+    case FMT_ETC1_RGBA:
+        etc1_texel(b + 8, x, y, out);
+        out[3] = explicit_alpha(b, i);
+        break;
+    case FMT_ETC1_RGBA_INTERP:
+        etc1_texel(b + 8, x, y, out);
+        out[3] = dxt5_alpha(b, i);
+        break;
+    default:
+        out[0] = out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Levels and texels                                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct TexLevel {
+    uint32_t base;          /* GPU address */
+    uint32_t pitch;         /* in blocks */
+    uint32_t w, h;          /* in texels */
+    uint32_t ox, oy;        /* block offset inside a packed mip tail */
+} TexLevel;
+
+typedef struct TexDesc {
+    const uint32_t *fc;
+    TexFmt tf;
+    unsigned fmt;
+    bool tiled;
+    unsigned bpb_log2;
+    unsigned dim;
+    uint32_t w0, h0;
+    int nlevels;
+    int packed_level;       /* first level of the packed tail, or 99 */
+    unsigned clamp[2];
+    unsigned sign[4];
+    bool integer;
+    int exp_adj;
+    uint32_t swz;
+    float border[4];
+    uint32_t face_size;     /* cube maps: bytes per face of level 0 */
+    bool fast;              /* unsigned normalized: direct decode */
+} TexDesc;
+
+static unsigned log2_ceil(uint32_t v)
+{
+    return v <= 1 ? 0 : 32 - clz32(v - 1);
+}
+
+/*
+ * Block offset of a level inside the 32x32 tile its packed mip tail
+ * shares (Xenos: Xenia's texture_util.cc GetPackedMipOffset, 2D).
+ */
+static void packed_offset(uint32_t w, uint32_t h, int level, uint32_t *x,
+                          uint32_t *y)
+{
+    unsigned lw = log2_ceil(w), lh = log2_ceil(h);
+    unsigned ls = MIN(lw, lh);
+    unsigned base = ls > 4 ? ls - 4 : 0;
+    unsigned pm = level - base;
+
+    *x = *y = 0;
+    if (pm < 3) {
+        if (lw > lh) {
+            *y = 16 >> pm;
+        } else {
+            *x = 16 >> pm;
+        }
+    } else if (lw > lh) {
+        *x = (1u << (lw - base)) >> (pm - 2);
+    } else {
+        *y = (1u << (lh - base)) >> (pm - 2);
+    }
+}
+
+/*
+ * Level 0 is at the base address with the constant's pitch.  Mips start at
+ * the mip address; each is a level of the texture rounded up to a power of
+ * two, its pitch and height aligned to 32 blocks, 4 KiB aligned.  With
+ * SQ_TEX_5 PACKED_MIPS the levels whose smaller side is 16 or less share
+ * one 32x32-block tile (as on Xenos).
+ */
+static void tex_level(const TexDesc *t, int level, TexLevel *lv)
+{
+    const uint32_t *fc = t->fc;
+    uint32_t bw = t->tf.bw;
+    int stored = MIN(level, t->packed_level);
+
+    lv->w = MAX(t->w0 >> level, 1u);
+    lv->h = MAX(t->h0 >> level, 1u);
+    lv->ox = lv->oy = 0;
+    if (level >= t->packed_level) {
+        /* in blocks, also for the compressed formats */
+        packed_offset(t->w0, t->h0, level, &lv->ox, &lv->oy);
+    }
+    if (stored == 0) {
+        lv->base = fc[1] & 0xfffff000;
+        lv->pitch = ((fc[0] >> 22) & 0x1ff) * 32;
+        lv->pitch = lv->pitch ? lv->pitch / bw : DIV_ROUND_UP(lv->w, bw);
+        if (t->packed_level == 0) {
+            lv->pitch = ROUND_UP(lv->pitch, 32);
+        }
+        return;
+    }
+    lv->base = fc[5] & 0xfffff000;
+    for (int k = 1; k <= stored; k++) {
+        uint32_t wt = MAX(pow2ceil(t->w0) >> k, 1u);
+        uint32_t ht = MAX(pow2ceil(t->h0) >> k, 1u);
+        uint32_t pitch = ROUND_UP(DIV_ROUND_UP(wt, bw), 32);
+        uint32_t rows = ROUND_UP(DIV_ROUND_UP(ht, bw), 32);
+        uint32_t bytes = pitch << t->bpb_log2;
+
+        if (!t->tiled) {
+            bytes = ROUND_UP(bytes, 256);
+            pitch = bytes >> t->bpb_log2;
+        }
+        if (k == stored) {
+            lv->pitch = pitch;
+            break;
+        }
+        lv->base += ROUND_UP(bytes * rows, 4096);
+    }
+}
+
+static const float u8f[256] = {
+#define F(i) (i) / 255.0f
+#define F4(i) F(i), F(i + 1), F(i + 2), F(i + 3)
+#define F16(i) F4(i), F4(i + 4), F4(i + 8), F4(i + 12)
+#define F64(i) F16(i), F16(i + 16), F16(i + 32), F16(i + 48)
+    F64(0), F64(64), F64(128), F64(192),
+#undef F64
+#undef F16
+#undef F4
+#undef F
+};
+
+static float srgb_to_linear(float c)
+{
+    return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+/* texel (x, y) of a level, wrapped/clamped already; raw XYZW */
+static void tex_texel(MsmAdrenoState *s, AdrenoTlb *tlb, const TexDesc *t,
+                      const TexLevel *lv, int x, int y, uint32_t face,
+                      float out[4])
+{
+    uint32_t bw = t->tf.bw;
+    uint32_t bx = x / bw + lv->ox, by = y / bw + lv->oy;
+    uint32_t off;
+    uint8_t blk[16];
+    const uint8_t *p;
+    uint32_t addr;
+
+    off = t->tiled ? adreno_tiled_offset(bx, by, ROUND_UP(lv->pitch, 32),
+                                         t->bpb_log2)
+                   : (by * lv->pitch + bx) << t->bpb_log2;
+    addr = lv->base + face * t->face_size + off;
+    p = adreno_host_ptr(s, tlb, addr);
+    if (!p || ((addr & 0xfff) + t->tf.bpb > 0x1000)) {
+        adreno_tlb_read(s, tlb, addr, blk, t->tf.bpb);
+        p = blk;
+    }
+    if (t->tf.kind == 3) {
+        block_texel(t->fmt, p, x & 3, y & 3, out);
+        return;
+    }
+    if (t->fast) {
+        /* the common unsigned normalized formats */
+        uint16_t h;
+
+        switch (t->fmt) {
+        case 6: case 14:    /* 8_8_8_8 */
+            out[0] = u8f[p[0]];
+            out[1] = u8f[p[1]];
+            out[2] = u8f[p[2]];
+            out[3] = u8f[p[3]];
+            return;
+        case 2: case 8: case 9:    /* 8 */
+            out[0] = u8f[p[0]];
+            out[1] = out[2] = 0.0f;
+            out[3] = 1.0f;
+            return;
+        case 10:            /* 8_8 */
+            out[0] = u8f[p[0]];
+            out[1] = u8f[p[1]];
+            out[2] = 0.0f;
+            out[3] = 1.0f;
+            return;
+        case 4:             /* 5_6_5 */
+            h = lduw_le_p(p);
+            out[0] = (h & 31) * (1.0f / 31);
+            out[1] = ((h >> 5) & 63) * (1.0f / 63);
+            out[2] = (h >> 11) * (1.0f / 31);
+            out[3] = 1.0f;
+            return;
+        case 15:            /* 4_4_4_4 */
+            h = lduw_le_p(p);
+            out[0] = (h & 15) * (1.0f / 15);
+            out[1] = ((h >> 4) & 15) * (1.0f / 15);
+            out[2] = ((h >> 8) & 15) * (1.0f / 15);
+            out[3] = (h >> 12) * (1.0f / 15);
+            return;
+        case 3:             /* 1_5_5_5 (X Y Z 5 bits, W 1 bit) */
+            h = lduw_le_p(p);
+            out[0] = (h & 31) * (1.0f / 31);
+            out[1] = ((h >> 5) & 31) * (1.0f / 31);
+            out[2] = ((h >> 10) & 31) * (1.0f / 31);
+            out[3] = h >> 15;
+            return;
+        }
+    }
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    if (t->tf.kind == 1) {
+        for (int k = 0; k < 4 && t->tf.bits[k]; k++) {
+            out[k] = adreno_half_to_float(lduw_le_p(p + 2 * k));
+        }
+        return;
+    }
+    if (t->tf.kind == 2) {
+        for (int k = 0; k < 4 && t->tf.bits[k]; k++) {
+            out[k] = adreno_f(ldl_le_p(p + 4 * k));
+        }
+        return;
+    }
+    {
+        uint64_t v = 0;
+        int pos = 0;
+
+        memcpy(&v, p, MIN(t->tf.bpb, 8));
+        v = le64_to_cpu(v);
+        for (int k = 0; k < 4 && t->tf.bits[k]; k++) {
+            uint64_t mask = (1ull << t->tf.bits[k]) - 1;
+            uint64_t c = (v >> pos) & mask;
+            float f;
+
+            switch (t->sign[k]) {
+            case 1: {   /* signed */
+                int64_t sc = (int64_t)(c << (64 - t->tf.bits[k])) >>
+                             (64 - t->tf.bits[k]);
+                f = t->integer ? (float)sc : MAX(-1.0f, sc / (float)(mask >> 1));
+                break;
+            }
+            case 2:     /* unsigned, biased */
+                f = c / (float)mask * 2.0f - 1.0f;
+                break;
+            case 3:     /* gamma */
+                f = srgb_to_linear(c / (float)mask);
+                break;
+            default:
+                f = t->integer ? (float)c : c / (float)mask;
+                break;
+            }
+            out[k] = f;
+            pos += t->tf.bits[k];
+        }
+    }
+}
+
+static int wrap(int i, int size, unsigned mode, bool *border)
+{
+    switch (mode) {
+    case 0:     /* repeat */
+        i %= size;
+        return i < 0 ? i + size : i;
+    case 1:     /* mirrored repeat */
+    case 3:     /* mirror once to edge */
+    case 5:
+    case 7: {
+        int p = size * 2;
+
+        if (mode != 1) {
+            i = i < 0 ? -1 - i : i;
+            return MIN(i, size - 1);
+        }
+        i %= p;
+        if (i < 0) {
+            i += p;
+        }
+        return i < size ? i : p - 1 - i;
+    }
+    case 6:     /* border */
+        if (i < 0 || i >= size) {
+            *border = true;
+        }
+        return MIN(MAX(i, 0), size - 1);
+    default:    /* clamp to edge / half way */
+        return MIN(MAX(i, 0), size - 1);
+    }
+}
+
+/* the formats whose texels fit RGBA8 exactly: cached as decoded tiles */
+static bool tex_cacheable(const TexDesc *t)
+{
+    /* uncompressed texels decode faster than a cache miss costs */
+    return t->tf.kind == 3;
+}
+
+
+static const uint8_t *cached_texel(AdrenoLanes *L, const TexDesc *t,
+                                   const TexLevel *lv, int x, int y,
+                                   uint32_t face)
+{
+    uint32_t base = lv->base + face * t->face_size;
+    uint32_t key = t->fmt | (t->fc[0] & 0x3fc) << 8 | lv->ox << 18 |
+                   lv->oy << 25 | (uint32_t)t->tiled << 31;
+    uint32_t tx = x >> 5, ty = y >> 5;
+    unsigned slot = (base / 4096 * 7 + tx * 13 + ty * 31 + lv->ox) %
+                    ADRENO_TEXCACHE;
+    AdrenoTexTile *tile = &L->texcache[slot];
+
+    if (tile->gen != L->texgen || tile->base != base || tile->key != key ||
+        tile->pitch != lv->pitch || tile->tx != tx || tile->ty != ty) {
+        int w = MIN(32, (int)lv->w - (int)(tx << 5));
+        int h = MIN(32, (int)lv->h - (int)(ty << 5));
+
+        for (int j = 0; j < h; j++) {
+            for (int i = 0; i < w; i++) {
+                float c[4];
+                uint8_t *o = &tile->rgba[(j * 32 + i) * 4];
+
+                tex_texel(L->s, L->tlb, t, lv, (tx << 5) + i, (ty << 5) + j,
+                          face, c);
+                for (int k = 0; k < 4; k++) {
+                    o[k] = (uint8_t)lrintf(c[k] * 255.0f);
+                }
+            }
+        }
+        tile->gen = L->texgen;
+        tile->base = base;
+        tile->key = key;
+        tile->pitch = lv->pitch;
+        tile->tx = tx;
+        tile->ty = ty;
+    }
+    return &tile->rgba[((y & 31) * 32 + (x & 31)) * 4];
+}
+
+static inline void fetch_texel(AdrenoLanes *L, const TexDesc *t,
+                               const TexLevel *lv, int x, int y,
+                               uint32_t face, bool cache, float out[4])
+{
+    if (cache) {
+        const uint8_t *c = cached_texel(L, t, lv, x, y, face);
+
+        out[0] = u8f[c[0]];
+        out[1] = u8f[c[1]];
+        out[2] = u8f[c[2]];
+        out[3] = u8f[c[3]];
+    } else {
+        tex_texel(L->s, L->tlb, t, lv, x, y, face, out);
+    }
+}
+
+static void sample_level(AdrenoLanes *L, const TexDesc *t, int level,
+                         float u, float v, uint32_t face, bool linear,
+                         float out[4])
+{
+    TexLevel lv;
+    float x, y;
+    bool cache = tex_cacheable(t) && L->texcache;
+
+    tex_level(t, level, &lv);
+    x = u * lv.w;
+    y = v * lv.h;
+    if (linear) {
+        float fx = x - 0.5f, fy = y - 0.5f;
+        int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+        float ax = fx - x0, ay = fy - y0;
+        float c[4][4];
+
+        for (int i = 0; i < 4; i++) {
+            bool b = false;
+            int xi = wrap(x0 + (i & 1), lv.w, t->clamp[0], &b);
+            int yi = wrap(y0 + (i >> 1), lv.h, t->clamp[1], &b);
+
+            if (b) {
+                memcpy(c[i], t->border, sizeof(c[i]));
+            } else {
+                fetch_texel(L, t, &lv, xi, yi, face, cache, c[i]);
+            }
+        }
+        for (int k = 0; k < 4; k++) {
+            float top = c[0][k] + (c[1][k] - c[0][k]) * ax;
+            float bot = c[2][k] + (c[3][k] - c[2][k]) * ax;
+
+            out[k] = top + (bot - top) * ay;
+        }
+    } else {
+        bool b = false;
+        int xi = wrap((int)floorf(x), lv.w, t->clamp[0], &b);
+        int yi = wrap((int)floorf(y), lv.h, t->clamp[1], &b);
+
+        if (b) {
+            memcpy(out, t->border, sizeof(float) * 4);
+        } else {
+            fetch_texel(L, t, &lv, xi, yi, face, cache, out);
+        }
+    }
+}
+
+static bool tex_desc(MsmAdrenoState *s, unsigned idx, TexDesc *t)
+{
+    const uint32_t *fc = &s->regs[A2_SQ_FETCH_0 + idx * 6];
+    int maxl, minl;
+
+    memset(t, 0, sizeof(*t));
+    t->fc = fc;
+    t->fmt = fc[1] & 0x3f;
+    if (!tex_format(t->fmt, &t->tf)) {
+        return false;
+    }
+    t->tiled = fc[0] >> 31;
+    t->bpb_log2 = ctz32(t->tf.bpb);
+    if (!is_power_of_2(t->tf.bpb)) {
+        t->tiled = false;
+    }
+    t->dim = (fc[5] >> 9) & 3;
+    t->w0 = (fc[2] & 0x1fff) + 1;
+    t->h0 = t->dim == 0 ? 1 : ((fc[2] >> 13) & 0x1fff) + 1;
+    t->clamp[0] = (fc[0] >> 10) & 7;
+    t->clamp[1] = (fc[0] >> 13) & 7;
+    for (int k = 0; k < 4; k++) {
+        t->sign[k] = (fc[0] >> (2 + 2 * k)) & 3;
+    }
+    t->integer = fc[3] & 1;
+    t->fast = !t->integer && !(fc[0] & 0x3fc) && t->tf.kind == 0;
+    t->exp_adj = ((int32_t)(fc[3] << 13)) >> 26;
+    t->swz = (fc[3] >> 1) & 0xfff;
+    switch (fc[5] & 3) {
+    case 1:
+        t->border[0] = t->border[1] = t->border[2] = t->border[3] = 1.0f;
+        break;
+    default:
+        t->border[3] = (fc[5] & 3) ? 1.0f : 0.0f;
+        break;
+    }
+    /* levels: up to log2(max size), within the constant's min/max */
+    maxl = 31 - clz32(MAX(t->w0, t->h0));
+    minl = (fc[4] >> 2) & 0xf;
+    maxl = MIN(maxl, (int)((fc[4] >> 6) & 0xf));
+    if (!(fc[5] & 0xfffff000)) {
+        maxl = 0;
+    }
+    t->nlevels = MAX(maxl, minl) + 1;
+    t->packed_level = 99;
+    if (fc[5] & (1 << 11)) {
+        unsigned ls = log2_ceil(MIN(t->w0, t->h0));
+
+        t->packed_level = ls > 4 ? ls - 4 : 0;
+    }
+    if (t->dim == 3) {
+        TexLevel lv;
+
+        tex_level(t, 0, &lv);
+        t->face_size = ROUND_UP(lv.pitch *
+                                ROUND_UP(DIV_ROUND_UP(t->h0, t->tf.bw), 32)
+                                << t->bpb_log2, 4096);
+    }
+    return true;
+}
+
+void adreno_sample(AdrenoLanes *L, const AdrenoTexArgs *a,
+                   float coord[3][AL], uint32_t mask, float out[4][AL])
+{
+    MsmAdrenoState *s = L->s;
+    TexDesc t;
+    unsigned mag = a->mag, min = a->min, mip = a->mip;
+    float lod[AL];
+    float fc_bias;
+    int minl, maxl;
+    const uint32_t *fc;
+
+    if (!tex_desc(s, a->const_idx, &t)) {
+        for (int k = 0; k < 4; k++) {
+            for (int l = 0; l < AL; l++) {
+                out[k][l] = k == 3 ? 1.0f : 0.0f;
+            }
+        }
+        return;
+    }
+    fc = t.fc;
+    /* filters 3 = from the fetch constant */
+    if (mag == 3) {
+        mag = (fc[3] >> 19) & 3;
+    }
+    if (min == 3) {
+        min = (fc[3] >> 21) & 3;
+    }
+    if (mip == 3) {
+        mip = (fc[3] >> 23) & 3;
+    }
+    fc_bias = (((int32_t)(fc[4] << 10)) >> 22) / 32.0f;
+    minl = (fc[4] >> 2) & 0xf;
+    maxl = t.nlevels - 1;
+
+    /* the LOD of each quad, from its coordinate differences */
+    for (int q = 0; q < AL; q += 4) {
+        float l = 0.0f;
+
+        if (L->quads && mip != 2 && maxl > 0) {
+            float w = t.w0, h = t.h0;
+            float dux = (coord[0][q + 1] - coord[0][q]) * w;
+            float dvx = (coord[1][q + 1] - coord[1][q]) * h;
+            float duy = (coord[0][q + 2] - coord[0][q]) * w;
+            float dvy = (coord[1][q + 2] - coord[1][q]) * h;
+            float rho2 = MAX(dux * dux + dvx * dvx, duy * duy + dvy * dvy);
+
+            if (a->unnormalized) {
+                rho2 /= w * h;
+            }
+            l = rho2 > 0 ? 0.5f * log2f(rho2) : -100.0f;
+        }
+        l += fc_bias + a->lod_bias;
+        lod[q] = lod[q + 1] = lod[q + 2] = lod[q + 3] = l;
+    }
+
+    for (int l = 0; l < AL; l++) {
+        float u, v, raw[4];
+        uint32_t face = 0;
+
+        if (!(mask & (1u << l))) {
+            continue;
+        }
+        u = coord[0][l];
+        v = coord[1][l];
+        if (t.dim == 3) {
+            /* cube: (s, t) in 1..2 for the face in z (the CUBE op's) */
+            face = MIN(MAX((int)coord[2][l], 0), 5);
+            u -= 1.0f;
+            v -= 1.0f;
+        } else if (a->unnormalized) {
+            u /= t.w0;
+            v /= t.h0;
+        }
+        u += a->offset[0] / t.w0;
+        v += a->offset[1] / t.h0;
+
+        if (mip == 2 || maxl == 0 || lod[l] <= 0.0f) {
+            /* magnification or the base map only */
+            sample_level(L, &t, minl, u, v, face,
+                         (lod[l] <= 0.0f ? mag : min) == 1, raw);
+        } else {
+            float lf = MIN(lod[l] + minl, (float)maxl);
+            bool lin = min == 1;
+
+            if (mip == 1 && lf < maxl) {
+                int l0 = (int)floorf(lf);
+                float f = lf - l0;
+                float a0[4], a1[4];
+
+                sample_level(L, &t, l0, u, v, face, lin, a0);
+                sample_level(L, &t, l0 + 1, u, v, face, lin, a1);
+                for (int k = 0; k < 4; k++) {
+                    raw[k] = a0[k] + (a1[k] - a0[k]) * f;
+                }
+            } else {
+                sample_level(L, &t, (int)lrintf(lf), u, v, face, lin, raw);
+            }
+        }
+        if (t.exp_adj) {
+            for (int k = 0; k < 4; k++) {
+                raw[k] = ldexpf(raw[k], t.exp_adj);
+            }
+        }
+        for (int k = 0; k < 4; k++) {
+            unsigned sel = (t.swz >> (3 * k)) & 7;
+
+            out[k][l] = sel < 4 ? raw[sel] : (sel == 5 ? 1.0f : 0.0f);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Textures for the host GPU backend                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The host GPU samples a copy of the texture, decoded to RGBA8 (formats
+ * whose texels fit it exactly) or RGBA32F, with the fetch constant's
+ * swizzle and exponent left to the shader.  The copy is redone when the
+ * memory under the texture hashes differently.
+ */
+bool adreno_tex_image(MsmAdrenoState *s, unsigned idx, AdrenoTexImage *im)
+{
+    TexDesc t;
+    const uint32_t *fc;
+    unsigned maxbits = 0;
+
+    memset(im, 0, sizeof(*im));
+    if (!tex_desc(s, idx, &t)) {
+        return false;
+    }
+    fc = t.fc;
+    for (int k = 0; k < 4; k++) {
+        maxbits = MAX(maxbits, t.tf.bits[k]);
+    }
+    im->w = t.w0;
+    im->h = t.h0;
+    im->levels = t.nlevels;
+    im->layers = t.dim == 3 ? 6 : 1;
+    im->is_float = !(t.tf.kind == 3 || (t.fast && maxbits <= 8));
+    im->clamp[0] = t.clamp[0];
+    im->clamp[1] = t.clamp[1];
+    im->mag = (fc[3] >> 19) & 3;
+    im->min = (fc[3] >> 21) & 3;
+    im->mip = (fc[3] >> 23) & 3;
+    im->min_level = MIN((int)((fc[4] >> 2) & 0xf), t.nlevels - 1);
+    im->max_level = t.nlevels - 1;
+    im->lod_bias = (((int32_t)(fc[4] << 10)) >> 22) / 32.0f;
+    memcpy(im->border, t.border, sizeof(im->border));
+    for (int k = 0; k < 4; k++) {
+        im->swz[k] = (t.swz >> (3 * k)) & 7;
+    }
+    im->exp_adj = t.exp_adj;
+    return true;
+}
+
+static inline float clamp_unit(float f)
+{
+    return f > 1.0f ? 1.0f : (f >= 0.0f ? f : 0.0f);
+}
+
+/* a fast 64-bit hash of host memory, four lanes at a time */
+static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
+{
+    const uint64_t k1 = 0x9e3779b97f4a7c15ull, k2 = 0xc2b2ae3d27d4eb4full;
+    uint64_t a = h, b = h ^ k1, c = h ^ k2, d = h + k1;
+
+    while (n >= 32) {
+        a = rol64((a ^ ldq_le_p(p)) * k1, 31);
+        b = rol64((b ^ ldq_le_p(p + 8)) * k1, 31);
+        c = rol64((c ^ ldq_le_p(p + 16)) * k1, 31);
+        d = rol64((d ^ ldq_le_p(p + 24)) * k1, 31);
+        p += 32;
+        n -= 32;
+    }
+    while (n--) {
+        a = (a ^ *p++) * k2;
+    }
+    h = rol64(a, 1) + rol64(b, 7) + rol64(c, 12) + rol64(d, 18);
+    return (h ^ (h >> 29)) * k2;
+}
+
+static uint64_t hash_range(MsmAdrenoState *s, AdrenoTlb *tlb, uint32_t va,
+                           uint32_t len, uint64_t h)
+{
+    uint8_t buf[0x1000];
+
+    while (len) {
+        uint32_t chunk = MIN(len, 0x1000 - (va & 0xfff));
+        const uint8_t *p = adreno_host_ptr(s, tlb, va);
+
+        if (!p) {
+            adreno_tlb_read(s, tlb, va, buf, chunk);
+            p = buf;
+        }
+        h = hash_bytes(p, chunk, h);
+        va += chunk;
+        len -= chunk;
+    }
+    return h;
+}
+
+uint64_t adreno_tex_hash(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx,
+                         uint32_t *lo, uint32_t *hi)
+{
+    TexDesc t;
+    uint64_t h = 0x243f6a8885a308d3ull;
+    uint64_t l = UINT64_MAX, e = 0;
+    int layers;
+
+    *lo = *hi = 0;
+    if (!tex_desc(s, idx, &t)) {
+        return 0;
+    }
+    layers = t.dim == 3 ? 6 : 1;
+    for (int layer = 0; layer < layers; layer++) {
+        for (int level = 0; level < t.nlevels; level++) {
+            TexLevel lv;
+            uint32_t rows, bytes;
+
+            /* the levels of a packed mip tail share its tile */
+            if (level > t.packed_level) {
+                break;
+            }
+            tex_level(&t, level, &lv);
+            rows = DIV_ROUND_UP(lv.h, t.tf.bw) + lv.oy;
+            if (t.tiled) {
+                bytes = (ROUND_UP(lv.pitch, 32) * ROUND_UP(rows, 32)) <<
+                        t.bpb_log2;
+            } else {
+                bytes = (lv.pitch * rows) << t.bpb_log2;
+            }
+            bytes = MIN(bytes, 64u << 20);
+            h = hash_range(s, tlb, lv.base + layer * t.face_size, bytes, h);
+            s->st.hash_bytes += bytes;
+            l = MIN(l, lv.base + layer * t.face_size);
+            e = MAX(e, (uint64_t)lv.base + layer * t.face_size + bytes);
+        }
+    }
+    *lo = l;
+    *hi = MIN(e, UINT32_MAX);
+    return h;
+}
+
+/* the host pointer to a block, or a copy of it in buf */
+static const uint8_t *block_ptr(MsmAdrenoState *s, AdrenoTlb *tlb,
+                                const TexDesc *t, const TexLevel *lv,
+                                uint32_t bx, uint32_t by, int layer,
+                                uint8_t *buf)
+{
+    uint32_t off = t->tiled ? adreno_tiled_offset(bx, by,
+                                                  ROUND_UP(lv->pitch, 32),
+                                                  t->bpb_log2)
+                            : (by * lv->pitch + bx) << t->bpb_log2;
+    uint32_t addr = lv->base + layer * t->face_size + off;
+    const uint8_t *p = adreno_host_ptr(s, tlb, addr);
+
+    if (!p || (addr & 0xfff) + t->tf.bpb > 0x1000) {
+        adreno_tlb_read(s, tlb, addr, buf, t->tf.bpb);
+        p = buf;
+    }
+    return p;
+}
+
+/*
+ * RGBA8 straight from the common unsigned formats, and the compressed
+ * ones a block at a time: what tex_texel() and rounding give, faster.
+ */
+static bool decode_fast(MsmAdrenoState *s, AdrenoTlb *tlb, const TexDesc *t,
+                        const TexLevel *lv, int layer, uint8_t *out)
+{
+    static uint8_t lut4[16], lut5[32], lut6[64];
+    uint8_t buf[16];
+
+    if (!lut4[15]) {
+        for (int i = 0; i < 64; i++) {
+            lut6[i] = lrintf(i * (1.0f / 63) * 255.0f);
+            if (i < 32) {
+                lut5[i] = lrintf(i * (1.0f / 31) * 255.0f);
+            }
+            if (i < 16) {
+                lut4[i] = lrintf(i * (1.0f / 15) * 255.0f);
+            }
+        }
+    }
+    if (t->tf.kind == 3) {
+        for (uint32_t by = 0; by < DIV_ROUND_UP(lv->h, 4); by++) {
+            for (uint32_t bx = 0; bx < DIV_ROUND_UP(lv->w, 4); bx++) {
+                const uint8_t *p = block_ptr(s, tlb, t, lv, bx + lv->ox,
+                                             by + lv->oy, layer, buf);
+
+                for (uint32_t j = 0; j < 4 && by * 4 + j < lv->h; j++) {
+                    for (uint32_t i = 0; i < 4 && bx * 4 + i < lv->w; i++) {
+                        uint8_t *o = out + ((by * 4 + j) * lv->w +
+                                            bx * 4 + i) * 4;
+                        float c[4];
+
+                        block_texel(t->fmt, p, i, j, c);
+                        for (int k = 0; k < 4; k++) {
+                            o[k] = lrintf(clamp_unit(c[k]) * 255.0f);
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    if (!t->fast) {
+        return false;
+    }
+    switch (t->fmt) {
+    case 2: case 3: case 4: case 6: case 8: case 9: case 10: case 14: case 15:
+        break;
+    default:
+        return false;
+    }
+    for (uint32_t y = 0; y < lv->h; y++) {
+        for (uint32_t x = 0; x < lv->w; x++) {
+            const uint8_t *p = block_ptr(s, tlb, t, lv, x + lv->ox,
+                                         y + lv->oy, layer, buf);
+            uint8_t *o = out + (y * lv->w + x) * 4;
+            uint16_t h;
+
+            switch (t->fmt) {
+            case 6: case 14:
+                memcpy(o, p, 4);
+                break;
+            case 2: case 8: case 9:
+                o[0] = p[0];
+                o[1] = o[2] = 0;
+                o[3] = 255;
+                break;
+            case 10:
+                o[0] = p[0];
+                o[1] = p[1];
+                o[2] = 0;
+                o[3] = 255;
+                break;
+            case 4:
+                h = lduw_le_p(p);
+                o[0] = lut5[h & 31];
+                o[1] = lut6[(h >> 5) & 63];
+                o[2] = lut5[h >> 11];
+                o[3] = 255;
+                break;
+            case 15:
+                h = lduw_le_p(p);
+                o[0] = lut4[h & 15];
+                o[1] = lut4[(h >> 4) & 15];
+                o[2] = lut4[(h >> 8) & 15];
+                o[3] = lut4[h >> 12];
+                break;
+            case 3:
+                h = lduw_le_p(p);
+                o[0] = lut5[h & 31];
+                o[1] = lut5[(h >> 5) & 31];
+                o[2] = lut5[(h >> 10) & 31];
+                o[3] = (h >> 15) ? 255 : 0;
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+void adreno_tex_decode(MsmAdrenoState *s, AdrenoTlb *tlb, unsigned idx,
+                       int level, int layer, void *out)
+{
+    TexDesc t;
+    TexLevel lv;
+    bool fl;
+    unsigned maxbits = 0;
+
+    if (!tex_desc(s, idx, &t)) {
+        return;
+    }
+    for (int k = 0; k < 4; k++) {
+        maxbits = MAX(maxbits, t.tf.bits[k]);
+    }
+    fl = !(t.tf.kind == 3 || (t.fast && maxbits <= 8));
+    tex_level(&t, level, &lv);
+    if (!fl && decode_fast(s, tlb, &t, &lv, layer, out)) {
+        return;
+    }
+    for (uint32_t y = 0; y < lv.h; y++) {
+        for (uint32_t x = 0; x < lv.w; x++) {
+            float c[4];
+
+            tex_texel(s, tlb, &t, &lv, x, y, layer, c);
+            if (fl) {
+                memcpy((float *)out + (y * lv.w + x) * 4, c, sizeof(c));
+            } else {
+                uint8_t *o = (uint8_t *)out + (y * lv.w + x) * 4;
+
+                for (int k = 0; k < 4; k++) {
+                    o[k] = (uint8_t)lrintf(clamp_unit(c[k]) * 255.0f);
+                }
+            }
+        }
+    }
+}

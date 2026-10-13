@@ -1,6 +1,10 @@
-# Upstream clones with our work on local branches (see README):
-#   src/qemu (htcleo), src/kernel-ics (hd2-qemu), src/clk (hd2-qemu)
-/src/
+# The patched QEMU lives in src/qemu; its build directory, and the kernel
+# and cLK trees used during development, stay local
+/src/qemu/build/
+/src/qemu-gpu/
+/src/kernel/
+/src/kernel-ics/
+/src/clk/
 
 # Disk images, firmware downloads and dumps (the NAND dump holds an IMEI
 # and radio calibration: never commit it), toolchains, scratch output

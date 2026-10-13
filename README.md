@@ -8,7 +8,11 @@ A QEMU machine (`-M htcleo`) that boots the HTC HD2
 ## Build
 
 ```bash
-cd src/qemu/build && ninja qemu-system-arm
+mkdir -p src/qemu/build && cd src/qemu/build
+../configure --target-list=arm-softmmu,hexagon-softmmu --enable-sdl \
+    --disable-docs --disable-werror --disable-gtk --disable-xen --disable-kvm \
+    --disable-tools --disable-guest-agent
+ninja qemu-system-arm qemu-system-hexagon
 ```
 
 The machine lives in `src/qemu/hw/arm/htcleo/`.
@@ -186,7 +190,7 @@ tools/start.sh -nic user,model=bcm4329
 
 ### GPU (Adreno 200)
 
-The Adreno 200 is emulated (QEMU branch `adreno`, `src/qemu-gpu`), so Android can render with the ROM's own Qualcomm libraries instead of the PixelFlinger software renderer. Build a NAND image without the emulator's GPU properties:
+The Adreno 200 is emulated (`src/qemu/hw/arm/htcleo/msm_adreno*`), so Android can render with the ROM's own Qualcomm libraries instead of the PixelFlinger software renderer. Build a NAND image without the emulator's GPU properties:
 ```bash
 python3 ../tools/hd2_mknand.py --lk ../firmware/lk-user.bin --rom ../firmware/dl/NexusHD2-ICS-CM9-HWA_V2.8.zip --gpu -o nand-gpu.img
 ```
@@ -264,7 +268,7 @@ The QSD8250 (Snapdragon S1) has four processors. Here is how each one is emulate
 | FM radio | BCM4329 FM core via HCI `0xFC15` (tune, seek, RSSI, flags/interrupts, volume); audio through the codec aux loopback (DEX `0x51`) |
 | Audio | QDSP6 DAL playback → QEMU audio backend (verified bit-exact) |
 | Display | MDP 3.1 DMA_P scanout + PPP blitter; backlight via microP |
-| GPU | Adreno 200: command processor, MMU, a2xx shaders translated to GLSL and rendered on the host GPU (OpenGL 4.5), or interpreted with a threaded CPU rasterizer; GMEM bins and resolves, textures incl. ETC1/ATC (branch `adreno`; images built with `--gpu`). Otherwise the ICS software fallback (PixelFlinger). |
+| GPU | Adreno 200: command processor, MMU, a2xx shaders translated to GLSL and rendered on the host GPU (OpenGL 4.5), or interpreted with a threaded CPU rasterizer; GMEM bins and resolves, textures incl. ETC1/ATC (images built with `--gpu`). Otherwise the ICS software fallback (PixelFlinger). |
 | I2C | Touchscreen, microP (backlight, G-sensor, light sensor), battery gauge (charging and draining), PMIC, compass |
 | Buttons | GPIO key matrix + power key |
 | USB | HSUSB (ChipIdea) device controller with a built-in host. It enumerates the gadget and bridges adb to TCP. |
