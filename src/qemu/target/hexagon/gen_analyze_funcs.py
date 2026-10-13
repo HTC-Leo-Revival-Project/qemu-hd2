@@ -85,6 +85,31 @@ def gen_analyze_func(f, tag, regs, imms):
 
     f.write("    mark_implicit_writes(ctx);\n")
 
+    ## A destination the semantics write in pieces (fSETHALF and the like)
+    ## is written straight into the register when the packet needs no
+    ## commit; if it is also a source of this instruction, a later piece
+    ## would read the clobbered source (Rd = cmpy(Rd, Rt) on V2 code).
+    pieces = set(re.findall(
+        r"fSET(?:HALF|UHALF|BYTE|UBYTE|WORD)\(\s*[^,]+,\s*(R\w+V)\b",
+        hex_common.semdict[tag]))
+    for register in regs:
+        reg_type, reg_id = register
+        wreg = hex_common.get_register(tag, reg_type, reg_id)
+        if (reg_type != "R" or not wreg.is_written() or wreg.is_read() or
+                f"{reg_type}{reg_id}V" not in pieces):
+            continue
+        wlen = 2 if wreg.is_pair() else 1
+        for register2 in regs:
+            reg_type2, reg_id2 = register2
+            rreg = hex_common.get_register(tag, reg_type2, reg_id2)
+            if reg_type2 != "R" or not rreg.is_read() or rreg.is_written():
+                continue
+            rlen = 2 if rreg.is_pair() else 1
+            f.write(f"    if ({wreg.reg_num} < {rreg.reg_num} + {rlen} && "
+                    f"{rreg.reg_num} < {wreg.reg_num} + {wlen}) {{\n")
+            f.write("        ctx->read_after_write = true;\n")
+            f.write("    }\n")
+
     if hex_common.is_sysemu_tag(tag):
         f.write("#endif /* !CONFIG_USER_ONLY */\n")
 
