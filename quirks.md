@@ -22,8 +22,12 @@ command, the modem VIC and every DSP thread's interrupt state.
   dropped. On the phone the next proc_comm cannot ring that early; here
   the apps core runs on its own host thread and sometimes did.
 - Fix: the modem VIC holds apps doorbells (lines 56-63) that ring while
-  the line is masked and latches them 100 us after it is unmasked
-  (msm_vic.c "redeliver"). No hang in the boots tested since.
+  the line is masked, or that software clears while it is masked, and
+  latches them 100 us after it is unmasked (msm_vic.c "redeliver").
+  The first version held only the former; a doorbell that rang with the
+  line unmasked while its handler still ran was taken for a nested
+  interrupt, masked and cleared, and lost (2 of 3 boots with AMSS's debug
+  log on, which slows the modem).
 - If it ever comes back, `tools/boot-q6.sh` reports it within seconds;
   `-global msm-vic.watch=62` plus `qom-get /machine/unattached/device[0]
   watch-log` shows line 62's last 256 events with the accessing PCs.
@@ -74,3 +78,22 @@ What is reverse-engineered (hw/hexagon/htcleo_q6_venc.c):
   words 3-4: vectors as signed bytes in quarter pels;
 - the firmware takes the residual against the prediction stream (stream 2)
   and reads chroma from the reference picture itself.
+
+## GSM network (mDSP model)
+
+The cell and the network behind it are modelled in hw/arm/htcleo/msm_mdsp.c
+at the mDSP's command interface (AMSS's GSM L1 drives it as on the phone):
+
+- The cell is on every ARFCN: the RF synthesizer's tuning (SBI writes) is
+  not decoded, so power scans find it everywhere and AMSS may camp on any
+  ARFCN; channels are assigned on 133 (its cell allocation).
+- Registration: RACH, IMMEDIATE ASSIGNMENT (SDCCH/8 on timeslot 1), LAPDm
+  SAPI 0, LOCATION UPDATING ACCEPT without authentication or ciphering,
+  CHANNEL RELEASE. No TMSI is given.
+- Not yet: paging, calls (TCH), SMS (SAPI 3), GPRS. The modelled modem of
+  the default mode has all of these.
+- AMSS sometimes misses a GSM frame tick when the modem core is slow
+  ("Missed 1 GSM frames"); a RACH's request reference then names a frame
+  AMSS does not expect, and it retries the RACH.
+- The first network search can take minutes: AMSS tries WCDMA first, and
+  with `AMSSLOG=1` everything is several times slower.

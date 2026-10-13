@@ -104,7 +104,7 @@ The `qom-set` commands go through `python3 tools/qmon.py images/qmp.sock "..."`.
 <a name="real-baseband-firmware"></a>
 <h2><img src="docs/holo/h-real-baseband-firmware.png" width="247" height="40" alt="Real baseband firmware"></h2>
 
-`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it, the SIM works, and the radio finds no network (the modem DSP runs no code, so there is no RF):
+`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it and the SIM works. The modem DSP (mDSP) is modelled at its command interface, with a GSM cell and network behind it (MCC 310, MNC 260, ARFCN 133): AMSS scans, camps, and registers with a location update, and Android shows the network in service. Calls, SMS and data do not go over it yet (they use the modelled modem in the default mode):
 
 ```bash
 cd images
@@ -128,7 +128,7 @@ tools/start-q6.sh
 
 Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder codes P pictures without motion vectors by default). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers. `tools/boot-q6.sh` boots this mode for scripts and reports hangs.
 
-Known problems of the real-firmware modes (a rare boot hang, slow boots after an unclean stop, DSP speed, the experimental motion search) are in [quirks.md](quirks.md).
+Known problems of the real-firmware modes (boot hangs and their fix, slow boots after an unclean stop, DSP speed, the experimental motion search, the GSM network's limits) are in [quirks.md](quirks.md).
 
 <a name="gpu-adreno-200"></a>
 <h2><img src="docs/holo/h-gpu-adreno-200.png" width="196" height="40" alt="GPU (Adreno 200)"></h2>
