@@ -14,6 +14,7 @@
 <p align="center">
   <a href="#build"><img src="docs/holo/n-build.png" width="59" height="30" alt="Build"></a>
   <a href="#run"><img src="docs/holo/n-run.png" width="52" height="30" alt="Run"></a>
+  <a href="#known-booting"><img src="docs/holo/n-known-booting.png" width="121" height="30" alt="Known booting"></a>
   <a href="#what-works"><img src="docs/holo/n-what-works.png" width="101" height="30" alt="What works"></a>
   <a href="#real-baseband-firmware"><img src="docs/holo/n-real-baseband-firmware.png" width="90" height="30" alt="Baseband"></a>
   <a href="#gpu-adreno-200"><img src="docs/holo/n-gpu-adreno-200.png" width="55" height="30" alt="GPU"></a>
@@ -77,6 +78,15 @@ python3 tools/qmon.py images/qmp.sock quit  # stop
 | F12 or End | Power |
 
 The mouse is the touchscreen. Headless: `tools/keys.py` and `tools/touch.py` send keys, taps and swipes over QMP.
+
+<a name="known-booting"></a>
+<h2><img src="docs/holo/h-known-booting.png" width="170" height="40" alt="Known booting"></h2>
+
+| OS | Boots with | Guide |
+|---|---|---|
+| Android 4.0.4 (NexusHD2-ICS-CM9-HWA v2.8) | cLK 1.4 from NAND | [docs/android.md](docs/android.md) |
+| Windows Mobile 6.5 (HTC stock ROM 3.14.405.2) | the stock SPL, on the real baseband | [docs/windows-mobile.md](docs/windows-mobile.md) |
+| iOS 7 (HD2 port) | MAGLDR from the microSD | to come |
 
 <a name="what-works"></a>
 <h2><img src="docs/holo/h-what-works.png" width="143" height="40" alt="What works"></h2>
@@ -148,8 +158,8 @@ On an RTX 3080, `gl` draws 8 full-screen blended layers in ~5 ms (`soft`: ~150 m
 
 | Tool | Purpose |
 |---|---|
-| `hd2_mknand.py`, `hd2_setmac.py`, `mksdcard.sh` | NAND and SD images |
-| `start.sh`, `start-lle.sh`, `start-q6.sh` | Launch |
+| `hd2_mknand.py`, `hd2_wmnand.py`, `hd2_setmac.py`, `mksdcard.sh` | NAND and SD images |
+| `start.sh`, `start-lle.sh`, `start-q6.sh`, `start-wm.sh` | Launch |
 | `qmon.py`, `keys.py`, `touch.py` | Monitor commands, input |
 | `capture.py`, `waitscreen.py`, `waitlog.sh` | Screendumps, logs |
 | `yaffs_check.py`, `logcat.sh` | Read a NAND image's files, guest logs from RAM |
