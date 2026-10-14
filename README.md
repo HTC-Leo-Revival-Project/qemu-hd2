@@ -86,7 +86,7 @@ The mouse is the touchscreen. Headless: `tools/keys.py` and `tools/touch.py` sen
 |---|---|---|
 | Android 4.0.4 (NexusHD2-ICS-CM9-HWA v2.8) | cLK 1.4 from NAND | [docs/android.md](docs/android.md) |
 | Windows Mobile 6.5 (HTC stock ROM 3.14.405.2) | the stock SPL, on the real baseband | [docs/windows-mobile.md](docs/windows-mobile.md) |
-| iOS 7 (HD2 port) | MAGLDR from the microSD | to come |
+| iOS 7 (HD2 port) | MAGLDR from the microSD | [docs/ios.md](docs/ios.md) |
 
 <a name="what-works"></a>
 <h2><img src="docs/holo/h-what-works.png" width="143" height="40" alt="What works"></h2>
@@ -158,12 +158,13 @@ On an RTX 3080, `gl` draws 8 full-screen blended layers in ~5 ms (`soft`: ~150 m
 
 | Tool | Purpose |
 |---|---|
-| `hd2_mknand.py`, `hd2_wmnand.py`, `hd2_setmac.py`, `mksdcard.sh` | NAND and SD images |
-| `start.sh`, `start-lle.sh`, `start-q6.sh`, `start-wm.sh` | Launch |
-| `qmon.py`, `keys.py`, `touch.py` | Monitor commands, input |
+| `hd2_mknand.py`, `hd2_wmnand.py`, `hd2_mkmagldr.py`, `hd2_setmac.py`, `mksdcard.sh`, `fat_put.py` | NAND and SD images |
+| `start.sh`, `start-lle.sh`, `start-q6.sh`, `start-wm.sh`, `ios-boot.sh` | Launch |
+| `qmon.py`, `keys.py`, `touch.py`, `magnav.py` | Monitor commands, input, MAGLDR's menus |
 | `capture.py`, `waitscreen.py`, `waitlog.sh` | Screendumps, logs |
 | `yaffs_check.py`, `logcat.sh` | Read a NAND image's files, guest logs from RAM |
 | `hd2_radio.py`, `amss_*.py` | Radio firmware |
+| `ios7_initrd.py` | Put an XNU kernel into the iOS 7 package |
 | `gltri.c`, `gltest.c` | GPU tests |
 | `hd2bench/` | Benchmark app to compare a real HD2 with the emulator |
 

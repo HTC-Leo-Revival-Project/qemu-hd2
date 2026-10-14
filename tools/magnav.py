@@ -16,7 +16,6 @@ import time
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHOT = os.path.join(HERE, '../build-tmp/magnav.ppm')
 FIRST_Y, STEP = 98, 33
 
 
@@ -31,10 +30,11 @@ def row_span(px, w, y):
 def cursor(sock):
     """Menu row under the highlight bar: a block of rows whose white pixels
     all start and end on the same columns, with solid top and bottom."""
+    shot = os.path.join(os.path.dirname(os.path.abspath(sock)), 'magnav.ppm')
     subprocess.run([sys.executable, os.path.join(HERE, 'qmon.py'), sock,
-                    'screendump ' + os.path.abspath(SHOT)], check=True,
+                    'screendump ' + shot], check=True,
                    stdout=subprocess.DEVNULL)
-    im = Image.open(SHOT).convert('RGB')
+    im = Image.open(shot).convert('RGB')
     w, h = im.size
     px = im.load()
     run, edges = [], None
