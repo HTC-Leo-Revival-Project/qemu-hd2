@@ -1,8 +1,10 @@
 #!/bin/sh
-# Start the emulated HD2 headless in the background and pick BOOT FROM NAND.
-# usage: [AUDIODEV="-audiodev wav,id=snd0,path=out.wav"] start.sh [extra qemu args]
-#   CLK_KEYS="pgdn pgdn f2" picks RECOVERY in the cLK menu instead; CLK_KEYS=
-#   presses nothing (MAGLDR).  NAND=/SDCARD= pick other images.
+# Start the emulated HD2 headless in the background, booting RECOVERY, which is
+# where the UEFI payload lives.  usage: [AUDIODEV="-audiodev wav,id=snd0,path=out.wav"] start.sh [extra qemu args]
+#   CLK_KEYS= presses nothing (MAGLDR).  A bare f2 lands on the wrong cLK entry
+#   and boots Android instead of the firmware, which looks like a dead boot:
+#   no output on uart1.log at all, while ramcon.log shows the kernel coming up.
+#   NAND=/SDCARD= pick other images.
 #   BASEBAND=lle runs the real AMSS (amss.elf) on the modem core; TRACE=on
 #   logs its peripheral accesses to qemu.log, AMSSLOG=1 its debug messages
 #   (contrib/plugins/amsslog.c; AMSSLOG="hook=0x... ..." adds hooks).
@@ -22,10 +24,11 @@ if [ -n "$AMSSLOG" ]; then
   for h in $AMSSLOG; do [ "$h" = 1 ] || P="$P,$h"; done
   PLUGIN="-plugin $P" D="$D,plugin"
 fi
-../src/qemu/build/qemu-system-arm -M $M -drive if=mtd,format=raw,file=${NAND:-nand.img} \
+../src/qemu/build/qemu-system-arm -L ../src/qemu/pc-bios -L ../src/qemu/build/pc-bios \
+  -M $M -drive if=mtd,format=raw,file=${NAND:-nand.img} \
   -display none -serial file:uart1.log -serial file:ramcon.log \
   -qmp unix:qmp.sock,server,nowait -d $D -D qemu.log $PLUGIN \
   ${AUDIODEV:--audiodev none,id=snd0} -global msm-modem.audiodev=snd0 $SD $NET $ADB "$@" > qemu.out 2>&1 &
 for i in $(seq 20); do [ -S qmp.sock ] && break; sleep 0.3; done
 sleep 2.5
-[ -n "${CLK_KEYS-f2}" ] && python3 ../tools/keys.py qmp.sock ${CLK_KEYS-f2}
+[ -n "${CLK_KEYS-pgdn pgdn f2}" ] && python3 ../tools/keys.py qmp.sock ${CLK_KEYS-pgdn pgdn f2}
