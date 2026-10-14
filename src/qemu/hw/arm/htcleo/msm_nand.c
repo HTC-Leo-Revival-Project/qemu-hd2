@@ -171,6 +171,24 @@ static void nand_do_read(MsmNandState *s)
 
     nand_read_cw(s, s->op_page, s->op_cw, raw);
     memcpy(s->buf, raw, CW_RAW);
+    if (ecc_on(s)) {
+        /*
+         * With the ECC engine enabled the buffer holds the user data followed
+         * by the codeword's spare bytes, not the raw [data][parity][spare][bbf]
+         * the flash array stores.  Both drivers rely on this: cLK and
+         * msm_nand.c copy 516 bytes per codeword (512 + 4) and let the caller
+         * drop the spare again.  Raw mode (CFG1 bit0) keeps the array layout,
+         * which is what the bad block marker read wants.
+         */
+        uint32_t cfg0 = reg(s, NAND_DEV0_CFG0);
+        int ud = (cfg0 >> 9) & 0x3FF;
+        int ecc = (cfg0 >> 19) & 0xF;
+        int spare = (cfg0 >> 23) & 0xF;
+
+        if (ud + ecc + spare <= CW_RAW - 2 && ud + spare <= CW_RAW) {
+            memmove(s->buf + ud, s->buf + ud + ecc, spare);
+        }
+    }
     if (bb_relocated(s, s->op_cw)) {
         uint32_t bbs = 0xFFFF;
 
