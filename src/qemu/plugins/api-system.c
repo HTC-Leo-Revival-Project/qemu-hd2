@@ -17,6 +17,8 @@
 #include "hw/core/boards.h"
 #include "qemu/plugin-memory.h"
 #include "qemu/plugin.h"
+#include "exec/icount.h"
+#include "system/cpu-timers.h"
 
 /*
  * In system mode we cannot trace the binary being executed so the
@@ -80,6 +82,20 @@ uint64_t qemu_plugin_hwaddr_phys_addr(const struct qemu_plugin_hwaddr *haddr)
     return 0;
 }
 
+uint8_t qemu_plugin_hwaddr_memattr(const struct qemu_plugin_hwaddr *haddr)
+{
+    return haddr && !haddr->is_io ? haddr->memattr : 0;
+}
+
+/* DMA snooping (qemu_plugin_register_dma_snoop) */
+bool (*plugin_dma_snoop)(uint64_t addr, void *buf, uint64_t len,
+                         bool is_write);
+
+void qemu_plugin_register_dma_snoop(qemu_plugin_dma_snoop_cb_t cb)
+{
+    plugin_dma_snoop = cb;
+}
+
 const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
 {
     if (h && h->is_io) {
@@ -118,6 +134,36 @@ static void advance_virtual_time__async(CPUState *cpu, run_on_cpu_data data)
 {
     int64_t new_time = data.host_ulong;
     qemu_clock_advance_virtual_time(new_time);
+}
+
+static qemu_plugin_u64 cost_counter;
+
+static uint64_t cost_cpu(int cpu_index)
+{
+    /* a vCPU the plugins have not seen yet has no costs */
+    return cpu_index < qemu_plugin_num_vcpus() ?
+           qemu_plugin_u64_get(cost_counter, cpu_index) : 0;
+}
+
+bool qemu_plugin_icount_cost(qemu_plugin_u64 counter, unsigned units_per_ns,
+                             bool pace, int skip_vcpu, unsigned skip_mips)
+{
+    if (!icount_enabled() || icount_cost_cpu || !units_per_ns) {
+        return false;
+    }
+    cost_counter = counter;
+    icount_cost_skip = skip_vcpu;
+    icount_cost_skip_ipns = MAX(skip_mips, 1) / 1000.0;
+    icount_cost_units_per_ns = units_per_ns;
+    icount_cost_pace = pace;
+    icount_cost_cpu = cost_cpu;
+    icount_cost_request(true);
+    return true;
+}
+
+void qemu_plugin_icount_cost_enable(bool on)
+{
+    icount_cost_request(on);
 }
 
 void qemu_plugin_update_ns(const void *handle, int64_t new_time)

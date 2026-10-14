@@ -769,6 +769,13 @@ static void htcleo_init(MachineState *machine)
     object_property_add_child(OBJECT(&s->apps_cluster), "cpu", cpuobj);
     object_unref(cpuobj);
     object_property_set_int(cpuobj, "midr", 0x510F00F2, &error_fatal);
+    /*
+     * Scorpion's caches, not Cortex-A8's: 32-byte lines (CTR) and a 32 KiB
+     * 4-way L1 data cache (CCSIDR).  Linux strides its maintenance by the
+     * CTR line, and the htcleo kernel aligns DMA buffers to 32 bytes.
+     */
+    ARM_CPU(cpuobj)->ctr = 0x8003c003;
+    ARM_CPU(cpuobj)->ccsidr[0] = 0x701fe019;
     if (object_property_find(cpuobj, "has_el3")) {
         object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
     }

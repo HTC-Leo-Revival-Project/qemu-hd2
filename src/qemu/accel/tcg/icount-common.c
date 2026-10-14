@@ -36,6 +36,7 @@
 #include "system/runstate.h"
 #include "hw/core/cpu.h"
 #include "exec/icount.h"
+#include "exec/tb-flush.h"
 #include "system/cpu-timers-internal.h"
 
 /*
@@ -82,10 +83,25 @@ static int64_t icount_get_executed(CPUState *cpu)
  * account executed instructions. This is done by the TCG vCPU
  * thread so the main-loop can see time has moved forward.
  */
+int icount_cost_skip = -1;
+double icount_cost_skip_ipns;
+static int64_t cpu_insns[16];
+
+/* instructions a vCPU has executed (for the cost clock) */
+int64_t icount_cpu_insns(int cpu_index)
+{
+    return cpu_index >= 0 && cpu_index < ARRAY_SIZE(cpu_insns) ?
+           qatomic_read(&cpu_insns[cpu_index]) : 0;
+}
+
 static void icount_update_locked(CPUState *cpu)
 {
     int64_t executed = icount_get_executed(cpu);
     cpu->icount_budget -= executed;
+    if (cpu->cpu_index < ARRAY_SIZE(cpu_insns)) {
+        qatomic_set(&cpu_insns[cpu->cpu_index],
+                    cpu_insns[cpu->cpu_index] + executed);
+    }
 
     qatomic_set(&timers_state.qemu_icount,
                 timers_state.qemu_icount + executed);
@@ -121,9 +137,122 @@ static int64_t icount_get_raw_locked(void)
     return qatomic_read(&timers_state.qemu_icount);
 }
 
+uint64_t (*icount_cost_cpu)(int cpu_index);
+unsigned icount_cost_units_per_ns = 1;
+
+/*
+ * The cost clock runs on the main core's costs.  The other core
+ * (icount_cost_skip) runs alongside it on the real machine, so its
+ * instructions are free while the main core is awake; while the main core
+ * sleeps they move time at that core's own rate, so that its busy-waits
+ * still let time pass.
+ */
+bool icount_cost_active;
+static bool cost_want;
+static double cost_acc;                 /* ns of finished slices */
+static int cost_run = -1;               /* the vCPU in its slice */
+static bool cost_run_counts;
+static uint64_t cost_run_c0;
+static int64_t cost_run_i0;
+
+static double cost_partial(void)
+{
+    if (cost_run < 0 || !cost_run_counts) {
+        return 0;
+    }
+    if (cost_run == icount_cost_skip) {
+        return (icount_cpu_insns(cost_run) - cost_run_i0) /
+               icount_cost_skip_ipns;
+    }
+    return (double)(icount_cost_cpu(cost_run) - cost_run_c0) /
+           icount_cost_units_per_ns;
+}
+
+/* virtual time less the idle time (the bias) */
+static int64_t cost_time(void)
+{
+    return cost_acc + cost_partial();
+}
+
+static bool main_cores_asleep(void)
+{
+    CPUState *c;
+
+    CPU_FOREACH(c) {
+        if (c->cpu_index != icount_cost_skip && !c->halted) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int64_t icount_get_locked(void);
+
+void icount_cost_request(bool on)
+{
+    qatomic_set(&cost_want, on);
+}
+
+/*
+ * Switch clocks between slices, continuing from the same virtual time, and
+ * retranslate: the plugin instruments code only while the costs count.
+ */
+void icount_cost_sync(CPUState *cpu)
+{
+    bool want = qatomic_read(&cost_want);
+
+    if (!icount_cost_cpu || want == icount_cost_active) {
+        return;
+    }
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    {
+        int64_t vt = icount_get_locked();
+        int64_t bias = qatomic_read(&timers_state.qemu_icount_bias);
+
+        icount_cost_active = want;
+        if (want) {
+            cost_acc = vt - bias;
+        } else {
+            qatomic_set(&timers_state.qemu_icount_bias,
+                        vt - icount_to_ns(timers_state.qemu_icount));
+        }
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    queue_tb_flush(cpu);
+}
+
+void icount_cost_slice_start(CPUState *cpu)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    cost_run = cpu->cpu_index;
+    cost_run_counts = cpu->cpu_index != icount_cost_skip ||
+                      main_cores_asleep();
+    cost_run_c0 = icount_cost_cpu(cpu->cpu_index);
+    cost_run_i0 = icount_cpu_insns(cpu->cpu_index);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_cost_slice_end(CPUState *cpu)
+{
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    cost_acc += cost_partial();
+    cost_run = -1;
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
 static int64_t icount_get_locked(void)
 {
     int64_t icount = icount_get_raw_locked();
+
+    if (icount_cost_active) {
+        return qatomic_read(&timers_state.qemu_icount_bias) + cost_time();
+    }
     return qatomic_read(&timers_state.qemu_icount_bias) + icount_to_ns(icount);
 }
 

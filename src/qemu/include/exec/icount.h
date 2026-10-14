@@ -72,6 +72,37 @@ int64_t icount_to_ns(int64_t icount);
  */
 bool icount_configure(QemuOpts *opts, Error **errp);
 
+/*
+ * Cost clock: a plugin that models instruction timing keeps per-vCPU cost
+ * counters (in 1/units_per_ns ns) and virtual time follows the main core's
+ * costs (plus idle time) instead of the instruction count.  See
+ * icount_cost_skip for the other core.  icount_cost_cpu is NULL when no
+ * plugin does this.
+ */
+extern uint64_t (*icount_cost_cpu)(int cpu_index);
+extern unsigned icount_cost_units_per_ns;
+/*
+ * Whether virtual time follows the costs now; a request is applied between
+ * slices, without a jump in virtual time.
+ */
+extern bool icount_cost_active;
+void icount_cost_request(bool on);
+void icount_cost_sync(CPUState *cpu);
+/* a vCPU starts and ends a slice of execution */
+void icount_cost_slice_start(CPUState *cpu);
+void icount_cost_slice_end(CPUState *cpu);
+/*
+ * A vCPU that runs in parallel on the real machine (cost clock): it gets
+ * icount_cost_skip_ipns instructions per ns of virtual time, and moves time
+ * only while the main core sleeps.
+ */
+extern int icount_cost_skip;
+extern double icount_cost_skip_ipns;
+/* instructions a vCPU has executed so far */
+int64_t icount_cpu_insns(int cpu_index);
+/* keep the cost clock from running ahead of real time */
+extern bool icount_cost_pace;
+
 /* used by tcg vcpu thread to calc icount budget */
 int64_t icount_round(int64_t count);
 

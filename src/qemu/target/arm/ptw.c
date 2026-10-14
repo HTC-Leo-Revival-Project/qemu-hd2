@@ -1254,6 +1254,47 @@ do_fault:
     return false;
 }
 
+/*
+ * The memory type a short-descriptor entry gives (TEX, C, B), as a
+ * MAIR-format byte for CPUTLBEntryFull.extra.arm.pte_attrs: 0x00 device or
+ * strongly-ordered, 0x44 normal non-cacheable, 0xaa write-through, 0xff
+ * write-back.  With SCTLR.TRE the types come from PRRR and NMRR (which
+ * live in MAIR0 and MAIR1), and SCTLR.C off makes normal memory
+ * non-cacheable.  Only the inner (L1/L2) policy is described.
+ */
+static uint8_t v6_memattr(CPUARMState *env, ARMMMUIdx mmu_idx, bool secure,
+                          uint32_t tex, bool c, bool b)
+{
+    uint64_t sctlr = regime_sctlr(env, mmu_idx);
+    int inner = 0;              /* 0 NC, 1 WBWA, 2 WT, 3 WB */
+
+    if (sctlr & SCTLR_TRE) {
+        int n = ((tex & 1) << 2) | (c << 1) | b;
+        uint32_t prrr = secure ? env->cp15.mair0_s : env->cp15.mair0_ns;
+        uint32_t nmrr = secure ? env->cp15.mair1_s : env->cp15.mair1_ns;
+
+        if (((prrr >> (2 * n)) & 3) != 2) {
+            return 0x00;
+        }
+        inner = (nmrr >> (2 * n)) & 3;
+    } else if (tex & 4) {
+        inner = (c << 1) | b;
+    } else if ((tex & 3) == 0) {
+        if (!c) {
+            return 0x00;
+        }
+        inner = b ? 3 : 2;
+    } else if ((tex & 3) == 1) {
+        inner = c && b ? 1 : 0;
+    } else {
+        return 0x00;
+    }
+    if (!(sctlr & SCTLR_C)) {
+        return 0x44;
+    }
+    return inner == 0 ? 0x44 : inner == 2 ? 0xaa : 0xff;
+}
+
 static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
                              uint32_t address, MMUAccessType access_type,
                              GetPhysAddrResult *result, ARMMMUFaultInfo *fi)
@@ -1330,6 +1371,9 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
         xn = desc & (1 << 4);
         pxn = desc & 1;
         ns = extract32(desc, 19, 1);
+        result->cacheattrs.attrs =
+            v6_memattr(env, mmu_idx, arm_space_is_secure(ptw->in_space),
+                       extract32(desc, 12, 3), desc & 8, desc & 4);
     } else {
         if (cpu_isar_feature(aa32_pxn, cpu)) {
             pxn = (desc >> 2) & 1;
@@ -1353,11 +1397,17 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
             phys_addr = (desc & 0xffff0000) | (address & 0xffff);
             xn = desc & (1 << 15);
             result->f.lg_page_size = 16;
+            result->cacheattrs.attrs =
+                v6_memattr(env, mmu_idx, arm_space_is_secure(ptw->in_space),
+                           extract32(desc, 12, 3), desc & 8, desc & 4);
             break;
         case 2: case 3: /* 4k page.  */
             phys_addr = (desc & 0xfffff000) | (address & 0xfff);
             xn = desc & 1;
             result->f.lg_page_size = 12;
+            result->cacheattrs.attrs =
+                v6_memattr(env, mmu_idx, arm_space_is_secure(ptw->in_space),
+                           extract32(desc, 6, 3), desc & 8, desc & 4);
             break;
         default:
             /* Never happens, but compiler isn't smart enough to tell.  */
