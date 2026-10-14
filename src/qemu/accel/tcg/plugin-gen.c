@@ -100,14 +100,10 @@ static void gen_disable_mem_helper(void)
 static TCGv_i32 gen_cpu_index(void)
 {
     /*
-     * Optimize when we run with a single vcpu. All values using cpu_index,
-     * including scoreboard index, will be optimized out.
-     * User-mode flushes all TBs when setting this flag.
-     * In system-mode, all vcpus are created before generating code.
+     * Always read it: without CF_PARALLEL (icount, or -accel tcg,thread=
+     * single) several vCPUs still run one after another and share TBs, so
+     * a TB cannot carry the index of the vCPU it was translated for.
      */
-    if (!tcg_cflags_has(current_cpu, CF_PARALLEL)) {
-        return tcg_constant_i32(current_cpu->cpu_index);
-    }
     TCGv_i32 cpu_index = tcg_temp_ebb_new_i32();
     tcg_gen_ld_i32(cpu_index, tcg_env,
                    offsetof(CPUState, cpu_index) - sizeof(CPUState));
@@ -142,8 +138,12 @@ static TCGv_ptr gen_plugin_u64_ptr(qemu_plugin_u64 entry)
     size_t entry_size = g_array_get_element_size(arr);
 
     TCGv_i32 cpu_index = gen_cpu_index();
-    tcg_gen_muli_i32(cpu_index, cpu_index, entry_size);
-    tcg_gen_ext_i32_ptr(ptr, cpu_index);
+    TCGv_i32 offset = tcg_temp_ebb_new_i32();
+
+    /* never into cpu_index itself, which may be a shared constant */
+    tcg_gen_muli_i32(offset, cpu_index, entry_size);
+    tcg_gen_ext_i32_ptr(ptr, offset);
+    tcg_temp_free_i32(offset);
     tcg_temp_free_i32(cpu_index);
     tcg_gen_addi_ptr(ptr, ptr, (intptr_t) base_ptr);
 
