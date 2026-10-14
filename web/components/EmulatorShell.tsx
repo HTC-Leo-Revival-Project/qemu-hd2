@@ -40,7 +40,7 @@ const ADB_KEYS: Record<string, number> = {
 };
 
 const RESTART_FIELDS: (keyof EmulatorConfig)[] = [
-  "baseband", "dsp", "nand", "sdcard", "boot", "gpu", "audio", "wifi", "mobileData", "adbPort", "amssLog", "dspShift", "extraArgs",
+  "baseband", "dsp", "usb", "nand", "sdcard", "boot", "gpu", "audio", "wifi", "mobileData", "adbPort", "amssLog", "dspShift", "extraArgs",
 ];
 
 const AppIcon = () => (

@@ -236,6 +236,7 @@ export const EditTextPref = ({
   placeholder,
   icon,
   inputMode,
+  disabled,
 }: {
   title: string;
   value: string;
@@ -244,6 +245,7 @@ export const EditTextPref = ({
   placeholder?: string;
   icon?: ReactNode;
   inputMode?: "text" | "numeric";
+  disabled?: boolean;
 }) => {
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -258,6 +260,7 @@ export const EditTextPref = ({
         title={title}
         summary={summary ?? (value || placeholder)}
         icon={icon}
+        disabled={disabled}
         onClick={() => {
           setDraft(value);
           setOpen(true);

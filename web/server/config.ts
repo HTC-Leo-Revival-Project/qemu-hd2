@@ -15,6 +15,7 @@ export const sanitize = (raw: Partial<EmulatorConfig>, base: EmulatorConfig = DE
   const c: EmulatorConfig = {
     baseband: oneOf(raw.baseband, ["hle", "lle"], base.baseband),
     dsp: oneOf(raw.dsp, ["hle", "lle"], base.dsp),
+    usb: oneOf(raw.usb, ["hle", "lle"], base.usb),
     nand: imageName(raw.nand, base.nand) || base.nand,
     sdcard: imageName(raw.sdcard, base.sdcard),
     boot: oneOf(raw.boot, ["nand", "recovery", "menu"], base.boot),
@@ -71,9 +72,27 @@ const exists = (p: string) => {
   }
 };
 
+/*
+ * Can this process hand a device to the host's own USB stack?  That needs
+ * vhci_hcd loaded, and the attach attribute is writable only by root -- and
+ * it has to be root, not sudo, because the kernel looks the socket fd up in
+ * the writing process's fd table.  Checking the attribute is the same test
+ * QEMU itself makes when it opens the link.
+ */
+const VHCI_ATTACH = "/sys/bus/platform/devices/vhci_hcd.0/attach";
+const canClaimVhciPort = () => {
+  try {
+    fs.accessSync(VHCI_ATTACH, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export const firmware = (): Firmware => ({
   amss: exists(path.join(IMAGES, "amss.elf")),
   dsp1: exists(path.join(IMAGES, "dsp1.elf")),
   arm: exists(QEMU_ARM),
   hexagon: exists(QEMU_HEXAGON),
+  vhci: canClaimVhciPort(),
 });

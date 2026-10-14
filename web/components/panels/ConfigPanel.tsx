@@ -38,6 +38,17 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
       disabled: !firmware.amss,
     },
   ];
+  const usbChoices: Choice<EmulatorConfig["usb"]>[] = [
+    { value: "hle", label: "Emulated host (HLE)", summary: "Built in: it enumerates the phone and bridges adb to TCP." },
+    {
+      value: "lle",
+      label: "This machine's own USB stack (LLE)",
+      summary: firmware.vhci
+        ? "Plugged into vhci_hcd, so the host enumerates it: lsusb, and this machine's adb and fastboot."
+        : "Needs root (QEMU must own the socket) and vhci_hcd: sudo modprobe vhci_hcd",
+      disabled: !firmware.vhci,
+    },
+  ];
   const dspChoices: Choice<EmulatorConfig["dsp"]>[] = [
     { value: "hle", label: "Not running", summary: "Codecs and audio fall back to software" },
     {
@@ -80,6 +91,15 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
             onChange={(v) => onChange({ dspShift: Number(v) })}
           />
         </>
+      )}
+
+      <Divider />
+      <ListPref title="USB host" icon={<Usb {...I} />} value={config.usb} choices={usbChoices} onChange={(usb) => onChange({ usb })} />
+      {config.usb === "lle" && (
+        <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">
+          The host enumerates it as a real device. One port at a time, so only one emulator can hold it; a killed run leaves the port
+          busy until <span className="whitespace-nowrap">vhci_hcd</span> is reloaded.
+        </p>
       )}
 
       <Category>Images</Category>
@@ -150,8 +170,13 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
         title="adb port"
         icon={<Usb {...I} />}
         value={String(config.adbPort)}
-        summary={`adb connect 127.0.0.1:${config.adbPort}`}
+        summary={
+          config.usb === "lle"
+            ? "Unused: with the host's own USB stack the phone is already on this machine's adb"
+            : `adb connect 127.0.0.1:${config.adbPort}`
+        }
         inputMode="numeric"
+        disabled={config.usb === "lle"}
         onChange={(v) => onChange({ adbPort: Number(v) || 5555 })}
       />
 
