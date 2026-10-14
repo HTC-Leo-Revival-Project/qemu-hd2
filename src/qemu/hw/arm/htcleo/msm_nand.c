@@ -409,8 +409,13 @@ static void nand_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case NAND_FLASH_STATUS:
     case NAND_READ_STATUS:
-        /* the drivers write these to clear them */
-        s->regs[off >> 2] = (off == NAND_FLASH_STATUS) ? FLASH_STATUS_OK : 0;
+        /*
+         * The drivers write these to clear them, and clearing means clearing:
+         * leaving the ready bit set would make every "kick it and wait for
+         * ready" sequence pass before the controller has done anything, which is
+         * exactly what MAGLDR and cLK do.
+         */
+        s->regs[off >> 2] = 0;
         break;
     case NAND_READ_ID:
         break;
