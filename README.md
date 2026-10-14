@@ -128,6 +128,23 @@ tools/start-q6.sh
 
 Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder's motion search is not modelled). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers.
 
+<a name="usb-on-the-host-stack"></a>
+<h3>USB on the host's own stack</h3>
+
+By default the USB gadget is joined to a **built-in** host inside the emulator: it enumerates the phone itself and pipes adb to `127.0.0.1:5555`. With **LLE** the host is this machine instead — the gadget is plugged into `vhci_hcd`, the kernel's virtual host controller, and the host's real USB stack enumerates it, so the emulated HD2 turns up in `lsusb` and `dmesg` and the host's own `adb` and `fastboot` talk to it with nothing in between:
+
+```bash
+sudo modprobe vhci_hcd
+tools/start-usb-lle.sh          # comes back through sudo itself
+fastboot devices                # ????????????  fastboot
+fastboot -s usb:5-2 getvar product
+fastboot -s usb:5-2 flash recovery recovery.img
+```
+
+It needs **root**: `vhci_hcd`'s `attach` attribute is root-only *and* the kernel resolves the socket fd against the process that writes it, so QEMU has to own the socket and write the file itself — `sudo sh -c 'echo ... > attach'` cannot work, which is why the wrapper re-executes itself instead. Only one emulated phone can hold a port; if a killed run still owns it, `sudo rmmod vhci_hcd && sudo modprobe vhci_hcd` releases it.
+
+From QEMU it is the same switch as everything else, `usb-host=lle`, and `USB=lle tools/start.sh` is what the wrapper runs. `QEMU_D=unimp,guest_errors,trace tools/start.sh` logs the USB/IP traffic to `images/qemu.log` under `msm-usbip:` — every setup packet in, every URB out, which is the quickest way to see what the host and the gadget each think is going on.
+
 <a name="gpu-adreno-200"></a>
 <h2><img src="docs/holo/h-gpu-adreno-200.png" width="196" height="40" alt="GPU (Adreno 200)"></h2>
 

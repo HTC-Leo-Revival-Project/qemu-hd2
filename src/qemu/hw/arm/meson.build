@@ -128,6 +128,7 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/msm_qdsp6.c',
   'htcleo/msm_sdcc.c',
   'htcleo/msm_hsusb.c',
+  'htcleo/htcleo_usbip.c',
   'htcleo/bcm4329.c',
   'htcleo/msm_atmodem.c',
   'htcleo/msm_gps.c',
