@@ -27,5 +27,12 @@ fi
   -qmp unix:qmp.sock,server,nowait -d $D -D qemu.log $PLUGIN \
   ${AUDIODEV:--audiodev none,id=snd0} -global msm-modem.audiodev=snd0 $SD $NET $ADB "$@" > qemu.out 2>&1 &
 for i in $(seq 20); do [ -S qmp.sock ] && break; sleep 0.3; done
-sleep 2.5
-[ -n "${CLK_KEYS-f2}" ] && python3 ../tools/keys.py qmp.sock ${CLK_KEYS-f2}
+# wait for LK's menu (a slow -icount guest takes longer than real time)
+for i in $(seq 200); do grep -q "fastboot: processing" uart1.log 2>/dev/null && break; sleep 0.3; done
+# press it until the kernel starts (LK may not be reading keys yet)
+if [ -n "${CLK_KEYS-f2}" ]; then
+  for i in $(seq 20); do
+    sleep 0.5; python3 ../tools/keys.py qmp.sock $(for k in ${CLK_KEYS-f2}; do printf "%s:%s " "${k%%:*}" "$((i == 1 ? 200 : 3000))"; done)
+    for j in $(seq 6); do [ -s ramcon.log ] && break 2; sleep 0.5; done
+  done
+fi
