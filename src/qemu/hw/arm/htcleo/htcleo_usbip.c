@@ -200,6 +200,16 @@ static void usbip_pop(UsbipLink *l)
     l->nurb--;
 }
 
+/* drop the URB at offset `i` from the queue, keeping the rest in order */
+static void usbip_pop_at(UsbipLink *l, int i)
+{
+    for (int j = i; j + 1 < l->nurb; j++) {
+        l->urbs[(l->head + j) % USBIP_MAX_URBS] =
+            l->urbs[(l->head + j + 1) % USBIP_MAX_URBS];
+    }
+    l->nurb--;
+}
+
 /*
  * Queue the status stage of a control transfer we have just answered: the
  * zero-length packet in the direction opposite the data stage.
@@ -237,91 +247,150 @@ static void usbip_status_stage(UsbipLink *l, bool data_in)
     l->nurb++;
 }
 
+/*
+ * Is the URB at offset `i` the one at the head of its own endpoint?
+ *
+ * Endpoints are independent queues, so a read adbd has not answered yet must
+ * not hold up the mass storage endpoint behind it -- they are polled in
+ * lockstep and either one can be waiting at any moment.  Order only matters
+ * within a single endpoint, where the host sends one transfer at a time.
+ */
+static bool usbip_is_head(UsbipLink *l, int i)
+{
+    UsbipUrb *u = &l->urbs[(l->head + i) % USBIP_MAX_URBS];
+
+    for (int j = 0; j < i; j++) {
+        UsbipUrb *q = &l->urbs[(l->head + j) % USBIP_MAX_URBS];
+
+        if (q->ep == u->ep && q->dir_in == u->dir_in) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Give the URB at offset `i` one round on the bus.  Returns true when it has
+ * left the queue, false when it is still waiting for the gadget.
+ */
+static bool usbip_serve_one(UsbipLink *l, int i)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    UsbipUrb *u = &l->urbs[(l->head + i) % USBIP_MAX_URBS];
+    bool control = u->control;
+    bool dir_in = u->dir_in;
+    uint32_t seq = u->seq;
+    int n;
+
+    /*
+     * A control transfer with no data stage -- SET_CONFIGURATION and most
+     * class requests -- is the SETUP packet and nothing else, and the
+     * gadget has been given the packet already.
+     */
+    if (control && (dir_in ? !u->want : !u->len)) {
+        n = 0;
+    } else {
+        /*
+         * A control *read* comes as a single URB carrying both the SETUP
+         * packet and the data stage: vudc_transfer.c handles ep0's setup
+         * packet and then "treat_control_like_bulk" the same URB, so the
+         * descriptor bytes the gadget queues have to come back here as
+         * this URB's answer rather than as one of their own.
+         */
+        n = l->ops->poll(l->opaque, u->ep, dir_in,
+                         u->data + u->done, u->len - u->done,
+                         l->scratch + u->done,
+                         dir_in ? u->want - u->done : 0);
+        if (n == USBIP_NOPE) {
+            /*
+             * NAK is not an error.  A bulk endpoint the gadget has not primed
+             * yet is simply not ready, and a real controller keeps the URB
+             * pending and retries until the gadget queues something -- telling
+             * the host ETIMEDOUT instead makes it fail the transfer, which is
+             * what drops adb to "offline" whenever adbd is a moment late.
+             *
+             * Only ep0 has a deadline: the host gives up on a control transfer
+             * nobody answers, and a status stage the gadget never takes would
+             * otherwise sit on the pipe forever.
+             */
+            if (u->ep != 0 || now - u->since <= TIMEOUT_NS) {
+                return false;
+            }
+            if (u->synth) {
+                qemu_log_mask(LOG_UNIMP,
+                              "msm-usbip: the gadget never took the "
+                              "status stage\n");
+            } else {
+                usbip_ret_submit(l, seq, u->ep, dir_in, NULL, 0,
+                                 ETIMEDOUT_);
+                l->n_drop++;
+            }
+            usbip_pop_at(l, i);
+            return true;
+        }
+        if (n == USBIP_STALL) {
+            /*
+             * A gadget that does not implement a request stalls ep0
+             * rather than queueing anything, so the bus has no data to
+             * give and the only right answer is a stalled URB: the host
+             * stack reads a silent ep0 as a dead device.
+             */
+            if (!u->synth) {
+                usbip_ret_submit(l, seq, u->ep, dir_in, NULL, 0, EPIPE_);
+                l->n_stall++;
+            }
+            usbip_pop_at(l, i);
+            return true;
+        }
+        u->done += n;
+        if (!dir_in && u->done < u->len) {
+            /*
+             * An OUT transfer is as long as the host said it is: fastboot
+             * hands over 16 KB where the gadget queues 4096 at a time, and
+             * a real controller keeps pulling packets until the URB is
+             * full.  Answering with what it has so far is a short write,
+             * which fastboot refuses outright ("SendBuffer() (Invalid
+             * argument)"), so wait for the rest.
+             *
+             * An IN is the other way round: the gadget chooses how much it
+             * sends, and a short packet is how it says "that is all".
+             */
+            return false;
+        }
+    }
+
+    if (!u->synth) {
+        usbip_ret_submit(l, seq, u->ep, dir_in,
+                         dir_in ? l->scratch : NULL, u->done, 0);
+        l->n_done++;
+    }
+    usbip_pop_at(l, i);
+    if (control) {
+        usbip_status_stage(l, dir_in);
+    }
+    return true;
+}
+
 static void usbip_service(UsbipLink *l)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool popped = true;
 
-    while (l->nurb) {
-        UsbipUrb *u = &l->urbs[l->head];
-        bool control = u->control;
-        bool dir_in = u->dir_in;
-        uint32_t seq = u->seq;
-        int n;
-
-        /*
-         * A control transfer with no data stage -- SET_CONFIGURATION and most
-         * class requests -- is the SETUP packet and nothing else, and the
-         * gadget has been given the packet already.
-         */
-        if (control && (dir_in ? !u->want : !u->len)) {
-            n = 0;
-        } else {
-            /*
-             * A control *read* comes as a single URB carrying both the SETUP
-             * packet and the data stage: vudc_transfer.c handles ep0's setup
-             * packet and then "treat_control_like_bulk" the same URB, so the
-             * descriptor bytes the gadget queues have to come back here as
-             * this URB's answer rather than as one of their own.
-             */
-            n = l->ops->poll(l->opaque, u->ep, dir_in,
-                             u->data + u->done, u->len - u->done,
-                             l->scratch + u->done,
-                             dir_in ? u->want - u->done : 0);
-            if (n == USBIP_NOPE) {
-                if (now - u->since > TIMEOUT_NS) {
-                    if (u->synth) {
-                        qemu_log_mask(LOG_UNIMP,
-                                      "msm-usbip: the gadget never took the "
-                                      "status stage\n");
-                    } else {
-                        usbip_ret_submit(l, seq, u->ep, dir_in, NULL, 0,
-                                         ETIMEDOUT_);
-                        l->n_drop++;
-                    }
-                    usbip_pop(l);
-                    continue;
-                }
-                break;              /* wait for the gadget */
-            }
-            if (n == USBIP_STALL) {
-                /*
-                 * A gadget that does not implement a request stalls ep0
-                 * rather than queueing anything, so the bus has no data to
-                 * give and the only right answer is a stalled URB: the host
-                 * stack reads a silent ep0 as a dead device.
-                 */
-                if (!u->synth) {
-                    usbip_ret_submit(l, seq, u->ep, dir_in, NULL, 0, EPIPE_);
-                    l->n_stall++;
-                }
-                usbip_pop(l);
+    /*
+     * Give every endpoint a turn.  A pass that retires a URB has moved
+     * everything behind it, so start over; a pass that retires nothing means
+     * the whole queue is waiting on the gadget and the timer will wake us.
+     */
+    while (popped && l->nurb) {
+        popped = false;
+        for (int i = 0; i < l->nurb; i++) {
+            if (!usbip_is_head(l, i)) {
                 continue;
             }
-            u->done += n;
-            if (!dir_in && u->done < u->len) {
-                /*
-                 * An OUT transfer is as long as the host said it is: fastboot
-                 * hands over 16 KB where the gadget queues 4096 at a time, and
-                 * a real controller keeps pulling packets until the URB is
-                 * full.  Answering with what it has so far is a short write,
-                 * which fastboot refuses outright ("SendBuffer() (Invalid
-                 * argument)"), so wait for the rest.
-                 *
-                 * An IN is the other way round: the gadget chooses how much it
-                 * sends, and a short packet is how it says "that is all".
-                 */
+            if (usbip_serve_one(l, i)) {
+                popped = true;
                 break;
             }
-        }
-
-        if (!u->synth) {
-            usbip_ret_submit(l, seq, u->ep, dir_in,
-                             dir_in ? l->scratch : NULL, u->done, 0);
-            l->n_done++;
-        }
-        usbip_pop(l);
-        if (control) {
-            usbip_status_stage(l, dir_in);
         }
     }
 
@@ -382,13 +451,24 @@ static void usbip_decode(UsbipLink *l)
             u->since = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             memcpy(u->setup, p + 40, 8);
             /*
-             * A URB with a SETUP packet is a whole control transfer, in
-             * whichever direction it reads or writes.  A bulk URB leaves the
-             * setup field zeroed, and so does the status stage of a control
-             * transfer, which is what tells the two apart on the wire.
+             * A control transfer is a whole URB carrying the SETUP packet and
+             * its data stage, in whichever direction it reads or writes, and
+             * it only ever runs on endpoint 0.
+             *
+             * The setup field must NOT be used to tell control from bulk:
+             * alloc_urb_from_cmd() copies the eight bytes out of every packet
+             * (vudc_rx.c) and usbip_pack_pdu() puts back whatever the recycled
+             * URB still holds, so a bulk URB that got a URB previously used by
+             * a control transfer still carries those bytes.  Android's MSC
+             * CBWs and adb's bulk reads both arrive that way.
+             *
+             * Believing them costs a synthesised status stage per bogus
+             * transfer, queued on the head where it blocks everything behind it
+             * until it times out: the adb IN endpoint then never gets serviced
+             * and adb flaps offline, and the MSC data phase never runs so the
+             * host sees a zero-capacity disk.
              */
-            static const uint8_t nosetup[8] = { 0 };
-            u->control = memcmp(u->setup, nosetup, 8) != 0;
+            u->control = ep == 0;
             if (dir == DIR_OUT && total > USBIP_HDR_SIZE) {
                 u->len = MIN(want, USBIP_XFER_MAX);
                 memcpy(u->data, p + USBIP_HDR_SIZE, u->len);
@@ -633,14 +713,20 @@ void usbip_link_init(UsbipLink *l, const UsbipOps *ops, void *opaque,
     l->speed = speed;
     l->devid = 1;
     l->fd = l->peer = -1;
-
-    if (usbip_link_open(l, errp) < 0) {
-        return;
-    }
     l->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, usbip_retry, l);
 
-    /* the host finds a device already attached and resets the bus */
-    l->ops->reset(l->opaque);
+    /*
+     * Do NOT attach yet.  The host starts enumerating the instant a device
+     * appears, and a gadget that has not started cannot answer: the first
+     * device descriptor read times out, the host parks the port as inactive,
+     * and it never enumerates again ("vhci_device speed not set").  That is
+     * what happens when cLK shares its ARM9 core with the AMSS and USB does
+     * not come up until several seconds in.
+     *
+     * So wait for the gadget to tell us it is ready -- it resets its
+     * controller once udc_start() has primed the endpoint list, which is
+     * exactly the moment a real cable would see the device appear.
+     */
 }
 
 /*
@@ -655,8 +741,12 @@ void usbip_link_init(UsbipLink *l, const UsbipOps *ops, void *opaque,
  */
 void usbip_link_reset(UsbipLink *l)
 {
-    if (!l->attached || !l->seen_setup) {
-        /* the host never got as far as asking us anything */
+    if (l->attached && !l->seen_setup) {
+        /*
+         * Attached but the host has not asked us anything yet: it has already
+         * started enumerating, so leave it alone.  Tearing the port down here
+         * is what parks it as inactive for good.
+         */
         return;
     }
     qemu_log_mask(LOG_TRACE, "msm-usbip: the gadget reset, re-attaching\n");
