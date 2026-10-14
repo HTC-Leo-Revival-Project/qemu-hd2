@@ -20,11 +20,17 @@ typedef struct UsbipLink UsbipLink;
 /*
  * A bulk packet on the wire is 4096 bytes for adb but 16 KB for fastboot,
  * which asks for as much as the endpoint's max packet size allows, so allow
- * a whole 64 KB transfer.  Getting this wrong is not a short read but a
+ * a whole large transfer.  Getting this wrong is not a short read but a
  * desynchronised stream: the URB header says how many bytes follow, so a
  * frame cut short leaves its tail to be read as the next header.
+ *
+ * It also has to be at least as large as the largest URB the host submits,
+ * because a transfer is capped to this and finishing one short of what was
+ * asked for is a short packet, which ends a bulk IN: usb-storage asks for
+ * 120 KB in a single URB, and clipping it to 64 KB left every such read
+ * with residue, a DID_ERROR and a device reset.
  */
-#define USBIP_XFER_MAX  65536
+#define USBIP_XFER_MAX  262144
 #define USBIP_HDR_SIZE  48     /* sizeof(struct usbip_header), always */
 /*
  * Room for one whole frame plus slack.  Frames are taken out of the buffer
@@ -68,10 +74,15 @@ typedef struct UsbipOps {
      * nothing queued yet, or USBIP_STALL when it holds a hardware STALL on
      * the endpoint.  `max` is the host's wLength: the answer must never be
      * longer, because the kernel refuses a longer one outright.
+     *
+     * Bytes moved with *more set means the gadget has not finished: it is
+     * part-way through the transfer and will queue the rest when it can.  The
+     * caller keeps the URB and comes back, so the bytes are added up rather
+     * than the transfer being completed short.
      */
     int  (*poll)(void *opaque, int ep, bool in,
                  const uint8_t *out, uint32_t out_len,
-                 uint8_t *buf, uint32_t max);
+                 uint8_t *buf, uint32_t max, bool *more);
 } UsbipOps;
 
 struct UsbipLink {

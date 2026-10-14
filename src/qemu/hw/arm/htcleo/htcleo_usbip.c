@@ -280,6 +280,7 @@ static bool usbip_serve_one(UsbipLink *l, int i)
     bool control = u->control;
     bool dir_in = u->dir_in;
     uint32_t seq = u->seq;
+    bool more = false;
     int n;
 
     /*
@@ -300,7 +301,7 @@ static bool usbip_serve_one(UsbipLink *l, int i)
         n = l->ops->poll(l->opaque, u->ep, dir_in,
                          u->data + u->done, u->len - u->done,
                          l->scratch + u->done,
-                         dir_in ? u->want - u->done : 0);
+                         dir_in ? u->want - u->done : 0, &more);
         if (n == USBIP_NOPE) {
             /*
              * NAK is not an error.  A bulk endpoint the gadget has not primed
@@ -343,6 +344,17 @@ static bool usbip_serve_one(UsbipLink *l, int i)
             return true;
         }
         u->done += n;
+        if (more) {
+            /*
+             * The gadget is part-way through: it has queued some of what the
+             * host asked for and will queue the rest when it can.  Completing
+             * the URB now would send a short packet, and a bulk IN ends at
+             * the first short packet -- so mass storage would see residue on
+             * every read and reset the device.  Keep the URB and let the
+             * next round add to what is already in the scratch buffer.
+             */
+            return false;
+        }
         if (!dir_in && u->done < u->len) {
             /*
              * An OUT transfer is as long as the host said it is: fastboot

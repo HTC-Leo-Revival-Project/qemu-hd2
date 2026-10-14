@@ -140,6 +140,10 @@ struct MsmHsusbState {
     uint32_t portsc, otgsc, usbmode, ulpi_vp;
     uint32_t setupstat, stat, complete;
     uint32_t epctrl[NUM_EP];
+    /* max packet size per endpoint, from the descriptors the gadget sent */
+    uint16_t mps[NUM_EP];
+    /* how far through the configuration descriptor we have walked */
+    uint32_t desc_at;
     uint8_t ulpi[256];
     uint32_t ahb[0x40];             /* 0x000..0x0FC misc readback */
 
@@ -407,17 +411,70 @@ static void hsusb_lle_setup(void *opaque, const uint8_t *pkt)
      * knows it.
      */
     hsusb_setup_packet(s, pkt);
+    /*
+     * A fresh GET_DESCRIPTOR(CONFIGURATION) starts the descriptor walk over;
+     * anything else leaves it, since the host reads the configuration in
+     * 9-byte pieces and each one is its own request.
+     */
+    if (pkt[1] == 0x06 && pkt[2] == 0x00 && pkt[3] == 0x02) {
+        s->desc_at = 0;
+        s->desc_at = 9;             /* past the configuration header */
+    }
+}
+
+/*
+ * Pick the endpoints' max packet sizes out of the configuration descriptor as
+ * the host reads it, so the transfer code can tell a short packet from a
+ * whole one.  The stream is a 9 byte configuration header followed by, for
+ * each interface, a 9 byte header and then zero or more 7 byte endpoint
+ * descriptors -- so the walk only has to know whether it is at an interface
+ * boundary (a multiple of 16 from the start of the interface).
+ */
+static void hsusb_scan_config(MsmHsusbState *s, const uint8_t *buf,
+                              uint32_t len)
+{
+    uint32_t at = s->desc_at;
+
+    while (len) {
+        bool boundary = (at % 16) == 0;
+        uint32_t need = boundary ? 9 : 7;
+
+        if (len < need) {
+            break;
+        }
+        if (boundary) {
+            if (buf[1] != 0x04) {        /* not an interface descriptor */
+                break;
+            }
+        } else {
+            uint32_t epn, m;
+
+            if (buf[1] != 0x05) {        /* not an endpoint descriptor */
+                break;
+            }
+            epn = buf[2] & 0x0f;
+            m = buf[4] | buf[5] << 8;
+            if (epn < NUM_EP) {
+                s->mps[epn] = m & 0x7ff;
+            }
+        }
+        at += need;
+        buf += need;
+        len -= need;
+    }
+    s->desc_at = at;
 }
 
 static int hsusb_lle_poll(void *opaque, int ep, bool in,
                           const uint8_t *out, uint32_t out_len,
-                          uint8_t *buf, uint32_t max)
+                          uint8_t *buf, uint32_t max, bool *more)
 {
     MsmHsusbState *s = opaque;
 
     if (ep < 0 || ep >= NUM_EP) {
         return USBIP_NOPE;
     }
+    *more = false;
     /*
      * LK rejects a request it does not implement by writing TXS|RXS into
      * ENDPTCTRL (hsusb.c:476) instead of queueing anything, so the bus has
@@ -475,10 +532,40 @@ static int hsusb_lle_poll(void *opaque, int ep, bool in,
             if (n < 0) {
                 break;
             }
+            /*
+             * A primed transfer descriptor of zero length is the gadget
+             * saying "that was the last packet": a zero-length packet ends
+             * the transfer just as a short one does.
+             */
+            if (!n) {
+                break;
+            }
             done += n;
             left -= n;
             if (!left) {
                 break;
+            }
+        }
+        /*
+         * Running out of primed descriptors with `left` to go is not the end
+         * of the transfer: the gadget simply has not queued the rest yet.  A
+         * bulk IN ends at the first packet shorter than the endpoint's max
+         * packet size, so as long as what we have moved is a whole number of
+         * packets the host has seen nothing that would end it, and finishing
+         * here would strand the transfer short.
+         *
+         * Control reads are the exception: a descriptor that is shorter than
+         * wLength ends the data stage, and that is how the host is told a
+         * descriptor ran out.
+         */
+        if (in && ep == 0 && done) {
+            hsusb_scan_config(s, buf, done);
+        }
+        if (in && left && done) {
+            uint32_t mps = s->mps[ep] ? s->mps[ep] : 64;
+
+            if (ep && !(done % mps)) {
+                *more = true;
             }
         }
         return done;
