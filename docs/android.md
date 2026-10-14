@@ -17,7 +17,7 @@ python3 tools/hd2_mknand.py --lk lk.bin \
 tools/mksdcard.sh images/sdcard.img 1024     # optional microSD (FAT32)
 ```
 
-The modelled baseband also needs `images/smem.bin`: a 1 MiB dump of the shared memory (SMEM) that a real HD2's boot loaders leave for the OS. The modem model takes its SMEM heap from it, and without it the kernel hangs in `smd_core_init()`. It holds one phone's serial numbers, so it is not distributed.
+The modelled baseband also needs `images/smem.bin`: a 1 MiB dump of the shared memory (SMEM) that a real HD2's boot loaders leave for the OS. The modem model takes its SMEM heap from it, and without it the kernel hangs in `smd_core_init()`. The repository has one, dumped from a real HD2 with its IMEI zeroed.
 
 The README's [Images](../README.md#images) section has `hd2_mknand.py`'s other options (recovery, partition sizes, MAC addresses, `--gpu`).
 

@@ -30,7 +30,7 @@ python3 tools/fat_put.py images/sdcard-ios7.img ios7 firmware/dl/ios7/zImage fir
 
 `fat_put.py` gives each file an 8.3 name and a long name. The kernel looks for `IOS7/ROOTFS.HFS`, and MAGLDR matches the long names. The card's FAT32 hidden-sectors field must be the partition start, and `mksdcard.sh` sets it.
 
-The emulator also needs `images/smem.bin`: the shared memory a real HD2's boot loaders leave for the OS. Without it MAGLDR stops at "FAILED". It holds one phone's serial numbers, so it is not distributed.
+The emulator also needs `images/smem.bin`: the shared memory a real HD2's boot loaders leave for the OS. Without it MAGLDR stops at "FAILED". The repository has one, dumped from a real HD2 with its IMEI zeroed.
 
 ## Run
 
