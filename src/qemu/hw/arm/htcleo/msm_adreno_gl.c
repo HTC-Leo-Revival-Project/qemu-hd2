@@ -489,12 +489,12 @@ typedef struct GlSampler {
     GLuint smp;
 } GlSampler;
 
-/* the Draw uniform block (std140) */
-typedef struct TexU {
-    float size[4];          /* w, h, 1/w, 1/h of level 0 */
-    float scale[4];         /* 2^exp_adj, LOD bias */
-    int32_t swz[4];
-} TexU;
+typedef struct GlProg {
+    GlProgKey key;
+    GLuint prog;
+    bool exports_depth;
+    AdrenoGlslInfo info, vinfo;
+} GlProg;
 
 
 typedef struct AdrenoGl {
@@ -524,7 +524,7 @@ typedef struct AdrenoGl {
     int nsnap, snap_used;
     int cur_geom;
     int barriers;
-    const struct GlProg *last_prog;
+    const GlProg *last_prog;
     bool stream_wrapped;
     GLuint dummy2d, dummy_arr;
     GHashTable *progs, *texes, *samplers;
