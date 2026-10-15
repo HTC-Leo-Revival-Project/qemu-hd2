@@ -11,6 +11,7 @@
 #include "cpu_helper.h"
 #include "exec/cpu-interrupt.h"
 #include "hex_interrupts.h"
+#include "qemu/qemu-print.h"
 #include "macros.h"
 #include "sys_macros.h"
 #include "system/cpus.h"
@@ -439,4 +440,27 @@ void hex_interrupt_update(CPUHexagonState *env)
             }
         }
     }
+}
+
+/* "info registers": the thread's interrupt state, for hang debugging */
+void hex_dump_int_state(CPUHexagonState *env, FILE *f)
+{
+    HexagonCPU *cpu = env_archcpu(env);
+
+    if (!cpu->globalregs) {
+        return;
+    }
+    qemu_fprintf(f, "  ssr = 0x%08x (ie %d ex %d) elr = 0x%08x imask = 0x%08x"
+                 " exe_mode %d\n", env->t_sreg[HEX_SREG_SSR],
+                 get_ssr_ie(env), get_ssr_ex(env), env->t_sreg[HEX_SREG_ELR],
+                 env->t_sreg[HEX_SREG_IMASK], get_exe_mode(env));
+    qemu_fprintf(f, "  ipend = 0x%08x iad = 0x%08x syscfg = 0x%08x"
+                 " modectl = 0x%08x (V2 bit 31 - n is interrupt n)\n",
+                 get_ipend(env), is_v2(env) ? v2_greg(env, V2_IAD) :
+                 hexagon_globalreg_read(cpu->globalregs, HEX_SREG_IPENDAD,
+                                        env->threadId),
+                 hexagon_globalreg_read(cpu->globalregs, HEX_SREG_SYSCFG,
+                                        env->threadId),
+                 hexagon_globalreg_read(cpu->globalregs, HEX_SREG_MODECTL,
+                                        env->threadId));
 }

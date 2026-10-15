@@ -10,6 +10,7 @@ contrib_plugins = [
 'hotpages.c',
 'howvec.c',
 'hwprofile.c',
+'hd2perf.c',
 'ips.c',
 'stoptrigger.c',
 'traps.c',

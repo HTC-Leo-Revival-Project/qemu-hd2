@@ -1591,6 +1591,7 @@ bool tlb_plugin_lookup(CPUState *cpu, vaddr addr, int mmu_idx,
 
     full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
     data->phys_addr = full->phys_addr | (addr & ~TARGET_PAGE_MASK);
+    data->memattr = full->extra.arm.pte_attrs;
 
     /* We must have an iotlb entry for MMIO */
     if (tlb_addr & TLB_MMIO) {

@@ -578,10 +578,13 @@ static void cp_trace_packet(MsmAdrenoState *s, uint32_t hdr,
         p++;
         n--;
     }
-    for (uint32_t i = 0; i < n && i < 24; i++) {
+    /* shaders in full, so the trace can be disassembled */
+    uint32_t max = op == CP_IM_LOAD_IMMEDIATE ? n : 24;
+
+    for (uint32_t i = 0; i < n && i < max; i++) {
         fprintf(s->trace, " %08x", p[i]);
     }
-    fprintf(s->trace, n > 24 ? " ...\n" : "\n");
+    fprintf(s->trace, n > max ? " ...\n" : "\n");
 }
 
 /* Returns the number of dwords after this packet to skip (COND_EXEC) */

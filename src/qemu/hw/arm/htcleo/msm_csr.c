@@ -10,7 +10,12 @@
  *   A2M doorbells at +0x400 + 4*n (dex_comm n=4, smd n=0, smsm n=5,
  *   proc_comm n=6, qdsp n=8)
  *
- * The counters only advance while enabled; CLEAR resets them to zero.
+ * The DGT advances only while enabled.  The GPT (the 32 kHz sleep clock's
+ * timer) counts whether enabled or not; ENABLE gates its match (the
+ * interrupt and clear-on-match): cLK's udelay()/mdelay() leave GPT_ENABLE
+ * 0 when they hand over, and firmware started from cLK (HtcLeoPkg's UEFI,
+ * whose first MicroSecondDelay() spins on GPT_COUNT_VAL) runs on the
+ * phone without enabling it.  CLEAR resets a counter to zero.
  * Time is taken from QEMU_CLOCK_VIRTUAL so the guest sees real rates.
  *
  * This code is licensed under the GNU GPL v2 or later.
@@ -33,7 +38,8 @@ typedef struct MsmTimer {
     uint32_t enable;
     uint32_t count_base;    /* count at base_ns */
     int64_t base_ns;
-    bool is_dgt;
+    bool is_dgt;            /* else the GPT, which always counts */
+    bool cleared;           /* CLEAR written, the count not read since */
 } MsmTimer;
 
 struct MsmCsrState {
@@ -59,13 +65,13 @@ static uint32_t timer_count(MsmTimer *t)
     uint64_t ticks;
     uint32_t c;
 
-    if (!(t->enable & 1)) {
+    if (!(t->enable & 1) && t->is_dgt) {
         return t->count_base;
     }
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     ticks = muldiv64(now - t->base_ns, timer_freq(t), NANOSECONDS_PER_SECOND);
     c = t->count_base + (uint32_t)ticks;
-    if ((t->enable & 2) && t->match) {
+    if ((t->enable & 3) == 3 && t->match) {
         /* periodic mode: counter wraps back to 0 after reaching match */
         uint64_t period = (uint64_t)t->match + 1;
         c = (uint32_t)(((uint64_t)t->count_base + ticks) % period);
@@ -129,7 +135,20 @@ static uint64_t timer_read(MsmTimer *t, hwaddr off)
 {
     switch (off) {
     case 0x0: return t->match;
-    case 0x4: return timer_count(t);
+    case 0x4:
+        /*
+         * The CPU reads the count right after a CLEAR as 0 on the phone
+         * (it is much faster than the counter); here the vCPU can stall
+         * for more than a tick in between, and cLK's udelay(), which
+         * clears and polls for 0, would then spin until the wrap.
+         */
+        if (t->cleared) {
+            t->cleared = false;
+            t->count_base = 0;
+            t->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            timer_schedule(t);
+        }
+        return timer_count(t);
     case 0x8: return t->enable;
     case 0xC: return 0;
     }
@@ -154,6 +173,7 @@ static void timer_write(MsmTimer *t, hwaddr off, uint32_t val)
         timer_schedule(t);
         break;
     case 0xC:
+        t->cleared = true;
         t->count_base = 0;
         t->base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         timer_schedule(t);

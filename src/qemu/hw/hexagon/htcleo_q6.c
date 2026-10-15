@@ -702,6 +702,22 @@ static void htcleo_q6_set_venc_pattern(Object *obj, bool v, Error **errp)
     htcleo_venc_test_pattern = v;
 }
 
+static void htcleo_q6_get_venc_me(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    visit_type_uint32(v, name, &htcleo_venc_me, errp);
+}
+
+static void htcleo_q6_set_venc_me(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    uint32_t me;
+
+    if (visit_type_uint32(v, name, &me, errp)) {
+        htcleo_venc_me = MIN(me, 2);
+    }
+}
+
 static char *htcleo_q6_get_vdc_dump(Object *obj, Error **errp)
 {
     return g_strdup(HTCLEO_Q6_MACHINE(obj)->vdc_dump);
@@ -793,6 +809,12 @@ static void htcleo_q6_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "venc-test-pattern",
                                    htcleo_q6_get_venc_pattern,
                                    htcleo_q6_set_venc_pattern);
+    object_class_property_add(oc, "venc-me", "uint32",
+                              htcleo_q6_get_venc_me, htcleo_q6_set_venc_me,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "venc-me",
+        "Encoder motion search: 0 none (zero vectors), 1 full pel, "
+        "2 half pel (default)");
 }
 
 static const TypeInfo htcleo_q6_info = {

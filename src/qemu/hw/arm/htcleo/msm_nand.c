@@ -165,29 +165,38 @@ static bool bb_relocated(MsmNandState *s, int cw)
            bb_pos(s) >= 0 && bb_pos(s) < CW_RAW - 2;
 }
 
+/*
+ * The image keeps each codeword the way an ECC-mode read presents it:
+ * [user data][parity][spare][2 bytes].  On the chip the last two (the bytes
+ * displaced by the bad-block marker) sit between the parity and the spare:
+ * [user][parity][2 bytes][spare].  Raw (ECC off) transfers see the chip
+ * order; Windows Mobile's FMD reads and writes each codeword's 4 spare bytes
+ * raw at column 524 and the same bytes at offset 522 of ECC-mode reads.
+ */
+#define CW_SPARE_AT     522
+static void cw_image_to_chip(const uint8_t *img, uint8_t *chip)
+{
+    memcpy(chip, img, CW_SPARE_AT);
+    memcpy(chip + CW_SPARE_AT, img + CW_RAW - 2, 2);
+    memcpy(chip + CW_SPARE_AT + 2, img + CW_SPARE_AT, 4);
+}
+
+static void cw_chip_to_image(const uint8_t *chip, uint8_t *img)
+{
+    memcpy(img, chip, CW_SPARE_AT);
+    memcpy(img + CW_SPARE_AT, chip + CW_SPARE_AT + 2, 4);
+    memcpy(img + CW_RAW - 2, chip + CW_SPARE_AT, 2);
+}
+
 static void nand_do_read(MsmNandState *s)
 {
     uint8_t raw[CW_RAW];
 
     nand_read_cw(s, s->op_page, s->op_cw, raw);
-    memcpy(s->buf, raw, CW_RAW);
     if (ecc_on(s)) {
-        /*
-         * With the ECC engine enabled the buffer holds the user data followed
-         * by the codeword's spare bytes, not the raw [data][parity][spare][bbf]
-         * the flash array stores.  Both drivers rely on this: cLK and
-         * msm_nand.c copy 516 bytes per codeword (512 + 4) and let the caller
-         * drop the spare again.  Raw mode (CFG1 bit0) keeps the array layout,
-         * which is what the bad block marker read wants.
-         */
-        uint32_t cfg0 = reg(s, NAND_DEV0_CFG0);
-        int ud = (cfg0 >> 9) & 0x3FF;
-        int ecc = (cfg0 >> 19) & 0xF;
-        int spare = (cfg0 >> 23) & 0xF;
-
-        if (ud + ecc + spare <= CW_RAW - 2 && ud + spare <= CW_RAW) {
-            memmove(s->buf + ud, s->buf + ud + ecc, spare);
-        }
+        memcpy(s->buf, raw, CW_RAW);
+    } else {
+        cw_image_to_chip(raw, s->buf);
     }
     if (bb_relocated(s, s->op_cw)) {
         uint32_t bbs = 0xFFFF;
@@ -199,6 +208,10 @@ static void nand_do_read(MsmNandState *s)
         /* BUFFER_STATUS[31:16] BAD_BLOCK_STATUS: the marker it found */
         s->regs[NAND_BUFFER_STATUS >> 2] =
             deposit32(s->regs[NAND_BUFFER_STATUS >> 2], 16, 16, bbs);
+    }
+    if (s->trace && s->op_off) {
+        qemu_log("msm-nand: read page 0x%x cw %d at +%d\n", s->op_page,
+                 s->op_cw, s->op_off);
     }
     if (s->op_off) {
         /*
@@ -224,15 +237,32 @@ static void nand_do_program(MsmNandState *s)
     uint8_t raw[CW_RAW], img[CW_RAW];
 
     if (s->trace) {
-        qemu_log("msm-nand: program page 0x%x cw %d cfg0 %08x cfg1 %08x "
+        qemu_log("msm-nand: program page 0x%x cw %d +%d cfg0 %08x cfg1 %08x "
                  "data %02x%02x%02x%02x spare %02x%02x%02x%02x\n",
-                 s->op_page, s->op_cw, reg(s, NAND_DEV0_CFG0),
+                 s->op_page, s->op_cw, s->op_off, reg(s, NAND_DEV0_CFG0),
                  reg(s, NAND_DEV0_CFG1), s->buf[0], s->buf[1], s->buf[2],
                  s->buf[3], s->buf[522], s->buf[523], s->buf[524],
                  s->buf[525]);
     }
 
     memcpy(img, s->buf, CW_RAW);
+    if (!ecc_on(s)) {
+        /*
+         * Raw mode moves UD_SIZE + ECC_PARITY + SPARE bytes from the column
+         * address on: Windows Mobile's FAL rewrites a page's 8-byte
+         * SectorInfo as 4-byte raw programs into the spare area.
+         */
+        uint32_t cfg0 = reg(s, NAND_DEV0_CFG0);
+        int len = ((cfg0 >> 9) & 0x3FF) + ((cfg0 >> 19) & 0xF) +
+                  ((cfg0 >> 23) & 0xF);
+
+        if (len && (s->op_off || len < CW_RAW)) {
+            len = MIN(len, CW_RAW - s->op_off);
+            memset(img, 0xFF, CW_RAW);
+            memcpy(img + s->op_off, s->buf, len);
+        }
+        s->op_off = 0;
+    }
     if (ecc_on(s)) {
         uint32_t cfg0 = reg(s, NAND_DEV0_CFG0);
         int ud = (cfg0 >> 9) & 0x3FF;
@@ -255,6 +285,12 @@ static void nand_do_program(MsmNandState *s)
                 img[bb_pos(s) + i] = 0xFF;
             }
         }
+    }
+    if (!ecc_on(s)) {
+        uint8_t chip[CW_RAW];
+
+        memcpy(chip, img, CW_RAW);
+        cw_chip_to_image(chip, img);
     }
     nand_read_cw(s, s->op_page, s->op_cw, raw);
     for (int i = 0; i < CW_RAW; i++) {

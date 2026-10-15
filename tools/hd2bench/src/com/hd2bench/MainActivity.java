@@ -195,6 +195,13 @@ public class MainActivity extends Activity {
                          full(10));
         }
         setContentView(scroll);
+        /* scripted runs: am start -n com.hd2bench/.MainActivity -e run cpu,gpu,storage|all */
+        String run = getIntent().getStringExtra("run");
+        if (run != null) {
+            boolean all = run.contains("all");
+            start(all || run.contains("cpu"), all || run.contains("gpu"),
+                  all || run.contains("storage"));
+        }
         refresh();
     }
 
@@ -341,6 +348,7 @@ public class MainActivity extends Activity {
 
     private void finished() {
         setRunning(false);
+        android.util.Log.i("hd2bench", "done");
         Results.save(this);
         refresh();
         Toast.makeText(this, "Done. Tap \"Copy results\" to share them.",

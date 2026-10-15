@@ -47,7 +47,9 @@ export const DEFAULT_CONFIG: EmulatorConfig = {
 
 export type PowerState = "stopped" | "starting" | "running" | "stopping" | "crashed";
 
-export type ImageFile = { name: string; size: number; kind: "nand" | "sdcard" | "firmware" };
+/* os: what a NAND image boots (a stock Windows Mobile ROM, or Android etc. through cLK/MAGLDR) */
+export type NandOs = "winmo" | "other";
+export type ImageFile = { name: string; size: number; kind: "nand" | "sdcard" | "firmware"; os?: NandOs };
 
 /*
  * What the machine can actually do.  `vhci` is not firmware: it says the
@@ -61,6 +63,8 @@ export type Firmware = { amss: boolean; dsp1: boolean; arm: boolean; hexagon: bo
 export type EmulatorStatus = {
   state: PowerState;
   since: number;
+  /* the server's clock when it sent this (since is on that clock) */
+  now: number;
   message: string;
   external: boolean;
   running: EmulatorConfig | null;

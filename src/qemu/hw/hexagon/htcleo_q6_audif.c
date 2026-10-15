@@ -19,6 +19,10 @@
  * The block interrupts on DSP interrupt 12.  Channel 0 feeds the codec's
  * playback path; one word is a stereo frame of two 16-bit samples, at
  * 48 kHz.  Playback goes to the QEMU audio backend (audiodev property).
+ * On the speaker path the firmware leaves the right sample zero: the HD2's
+ * one loudspeaker plays the codec's left channel, so with "speaker" (the
+ * default; no headset is ever plugged in) the host hears that on both
+ * channels.  The dump file keeps the interface's own samples.
  *
  * This code is licensed under the GNU GPL v2 or later.
  */
@@ -67,6 +71,7 @@ struct Q6AudifState {
     AudioBackend *audio_be;
     SWVoiceOut *voice;
     bool trace;
+    bool speaker;               /* the host hears the mono loudspeaker */
     char *dump;                 /* raw 48 kHz S16 stereo of DMA channel 0 */
     FILE *dump_f;
 };
@@ -150,12 +155,17 @@ static void audif_period_k(Q6AudifState *s, int k)
             physical_memory_read(base, buf + first * 4,
                                  (period - first) * 4);
         }
-        if (s->voice && s->audio_be) {
-            audio_be_write(s->audio_be, s->voice, buf, period * 4);
-        }
         if (s->dump_f) {
             fwrite(buf, 4, period, s->dump_f);
             fflush(s->dump_f);
+        }
+        if (s->voice && s->audio_be) {
+            if (s->speaker) {
+                for (uint32_t i = 0; i < period; i++) {
+                    memcpy(buf + 4 * i + 2, buf + 4 * i, 2);
+                }
+            }
+            audio_be_write(s->audio_be, s->voice, buf, period * 4);
         }
     }
     d->pos = (d->pos + period) % len;
@@ -268,6 +278,7 @@ static void audif_init(Object *obj)
 static const Property audif_props[] = {
     DEFINE_AUDIO_PROPERTIES(Q6AudifState, audio_be),
     DEFINE_PROP_BOOL("trace", Q6AudifState, trace, false),
+    DEFINE_PROP_BOOL("speaker", Q6AudifState, speaker, true),
     DEFINE_PROP_STRING("dump", Q6AudifState, dump),
 };
 

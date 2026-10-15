@@ -30,6 +30,15 @@ bool qemu_plugin_hwaddr_is_io(const struct qemu_plugin_hwaddr *haddr)
     return false;
 }
 
+uint8_t qemu_plugin_hwaddr_memattr(const struct qemu_plugin_hwaddr *haddr)
+{
+    return 0;
+}
+
+void qemu_plugin_register_dma_snoop(qemu_plugin_dma_snoop_cb_t cb)
+{
+}
+
 uint64_t qemu_plugin_hwaddr_phys_addr(const struct qemu_plugin_hwaddr *haddr)
 {
     return 0;
@@ -49,6 +58,16 @@ const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
 const void *qemu_plugin_request_time_control(void)
 {
     return NULL;
+}
+
+bool qemu_plugin_icount_cost(qemu_plugin_u64 counter, unsigned units_per_ns,
+                             bool pace, int skip_vcpu, unsigned skip_mips)
+{
+    return false;
+}
+
+void qemu_plugin_icount_cost_enable(bool on)
+{
 }
 
 void qemu_plugin_update_ns(const void *handle, int64_t new_time)

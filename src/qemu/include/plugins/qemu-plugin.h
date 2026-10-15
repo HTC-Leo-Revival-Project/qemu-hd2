@@ -734,6 +734,43 @@ bool qemu_plugin_hwaddr_is_io(const struct qemu_plugin_hwaddr *haddr);
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_hwaddr_phys_addr(const struct qemu_plugin_hwaddr *haddr);
 
+/**
+ * qemu_plugin_hwaddr_memattr() - the memory type of a memory operation
+ * @haddr: address handle from qemu_plugin_get_hwaddr()
+ *
+ * Arm only: the attributes of the mapping in the MAIR format (0x00 device,
+ * 0x44 normal non-cacheable, 0xaa write-through, 0xff write-back; the low
+ * nibble is the inner, L1/L2, policy).  0 for I/O and other targets.
+ */
+QEMU_PLUGIN_API
+uint8_t qemu_plugin_hwaddr_memattr(const struct qemu_plugin_hwaddr *haddr);
+
+/**
+ * typedef qemu_plugin_dma_snoop_cb_t - a device's DMA meets the caches
+ * @addr: physical address
+ * @buf: the data
+ * @len: its length
+ * @is_write: the device writes @buf to memory (else it read it into @buf)
+ *
+ * For a read, @buf holds what memory holds as the CPU sees it, and the
+ * callback may change it to what the device really reads (a cache model
+ * whose dirty lines are not in DRAM yet).  For a write, the callback may
+ * store the data itself (returning true), and the device then does not.
+ */
+typedef bool (*qemu_plugin_dma_snoop_cb_t)(uint64_t addr, void *buf,
+                                           uint64_t len, bool is_write);
+
+/**
+ * qemu_plugin_register_dma_snoop() - see the DMA of devices that support it
+ * @cb: the callback, or NULL to stop
+ *
+ * Device models that bus-master (the Qualcomm data mover) offer their
+ * memory traffic to @cb, so a plugin modelling the CPU's caches can give
+ * them what DRAM really holds.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_dma_snoop(qemu_plugin_dma_snoop_cb_t cb);
+
 /*
  * Returns a string representing the device. The string is valid for
  * the lifetime of the plugin.
@@ -825,6 +862,39 @@ const void *qemu_plugin_request_time_control(void);
  */
 QEMU_PLUGIN_API
 void qemu_plugin_update_ns(const void *handle, int64_t time);
+
+/**
+ * qemu_plugin_icount_cost() - drive virtual time from per-vCPU costs
+ * @counter: per-vCPU scoreboard entry the plugin adds instruction costs to
+ * @units_per_ns: cost units per nanosecond of virtual time
+ * @pace: keep virtual time from running ahead of real time
+ * @skip_vcpu: a vCPU whose costs do not count (another core that runs in
+ *             parallel on the real machine), or -1
+ * @skip_mips: @skip_vcpu's instruction rate (million per second): it gets
+ *             that many instructions per second of virtual time, and they
+ *             move time only while the other vCPUs sleep
+ *
+ * With -icount, virtual time then follows the sum of @counter over the
+ * vCPUs (plus the time the CPUs spend idle) instead of the instruction
+ * count, so a plugin can model how long instructions take.  Only one
+ * plugin can do this.
+ *
+ * Returns true on success (icount is enabled and no other plugin did).
+ * Costs drive time from then on, until qemu_plugin_icount_cost_enable().
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_icount_cost(qemu_plugin_u64 counter, unsigned units_per_ns,
+                             bool pace, int skip_vcpu, unsigned skip_mips);
+
+/**
+ * qemu_plugin_icount_cost_enable() - switch between cost and icount time
+ * @on: whether virtual time follows the costs (else the instruction count)
+ *
+ * Takes effect between execution slices; virtual time carries on from
+ * where it was.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_icount_cost_enable(bool on);
 
 /**
  * typedef qemu_plugin_vcpu_syscall_cb_t - vCPU syscall callback function type

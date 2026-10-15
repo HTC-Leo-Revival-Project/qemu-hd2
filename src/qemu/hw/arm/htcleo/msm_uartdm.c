@@ -339,7 +339,9 @@ static const MemoryRegionOps uartdm_ops = {
     .read = uartdm_read,
     .write = uartdm_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    /* Windows Mobile's Bluetooth driver reads MISR with a byte load */
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
 static void uartdm_reset(DeviceState *dev)

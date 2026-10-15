@@ -173,6 +173,7 @@
 #define TYPE_MSM_UARTDM     "msm-uartdm"
 #define TYPE_MSM_MTMR       "msm-mtmr"
 #define TYPE_MSM_MDSP       "msm-mdsp"
+#define TYPE_MSM_HDLC       "msm-hdlc"
 #define TYPE_MSM_GSTMR      "msm-gstmr"
 #define TYPE_MSM_Q6_LINK    "msm-q6-link"
 void msm_q6_link_boot(DeviceState *dev);

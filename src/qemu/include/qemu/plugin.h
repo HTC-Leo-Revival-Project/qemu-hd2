@@ -44,6 +44,10 @@ get_plugin_meminfo_rw(qemu_plugin_meminfo_t i)
 }
 
 #ifdef CONFIG_PLUGIN
+
+/* a plugin that models the caches sees a device's DMA (plugins/api-system.c) */
+extern bool (*plugin_dma_snoop)(uint64_t addr, void *buf, uint64_t len,
+                                bool is_write);
 extern QemuOptsList qemu_plugin_opts;
 
 static inline void qemu_plugin_add_opts(void)
