@@ -54,6 +54,8 @@ final class Results {
 
     static synchronized void putText(String section, String name, String value,
                                      String unit, boolean higherBetter) {
+        android.util.Log.i("hd2bench", section + ": " + name + " = " + value
+                           + " " + unit);
         items.put(section + "\u0001" + name,
                   new Item(section, name, value, unit, higherBetter));
     }

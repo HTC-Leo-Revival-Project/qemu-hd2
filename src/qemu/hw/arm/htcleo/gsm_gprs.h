@@ -1,0 +1,42 @@
+/*
+ * The GPRS side of the modelled GSM network (gsm_net.c): RLC/MAC on one
+ * PDCH, LLC, GMM, SM, SNDCP, and the MS's IP packets to and from the host
+ *
+ * This code is licensed under the GNU GPL v2 or later.
+ */
+#ifndef HW_ARM_HTCLEO_GSM_GPRS_H
+#define HW_ARM_HTCLEO_GSM_GPRS_H
+
+#include "gsm_net.h"
+
+typedef struct Gprs Gprs;
+typedef void GprsToHost(void *opaque, const uint8_t *ip, size_t len);
+
+Gprs *gprs_new(GprsToHost *to_host, void *opaque);
+void gprs_reset(Gprs *g);
+void gprs_set_trace(Gprs *g, bool on);
+
+/* the MS got an uplink TBF from an IMMEDIATE ASSIGNMENT */
+void gprs_ul_assigned(Gprs *g);
+/* an IMMEDIATE ASSIGNMENT of a downlink TBF to send on the CCCH */
+bool gprs_ccch_assignment(Gprs *g, uint32_t fn, uint8_t b[GSM_BLOCK]);
+/*
+ * the downlink block on timeslot tn that starts at frame fn (the PDCH,
+ * GSM_PDCH_TN, or another of a multislot downlink), returning its coding
+ * scheme (0-3: CS-1 to CS-4); an uplink one, in coding scheme cs
+ */
+int gprs_pdch_dl(Gprs *g, uint32_t fn, unsigned tn, uint8_t b[GSM_PDCH_BLOCK]);
+void gprs_pdch_ul(Gprs *g, uint32_t fn, const uint8_t *b, int cs);
+/* the coding scheme for data blocks, both ways */
+void gprs_set_cs(Gprs *g, int cs);
+int gprs_cs(Gprs *g);
+/* the timeslots of downlink TBFs (1-4) */
+void gprs_set_slots(Gprs *g, unsigned n);
+/* the timeslot of a slot of the MS's downlink allocation (of slots) */
+unsigned gprs_slot_tn(Gprs *g, unsigned slot, unsigned slots);
+/* an IP packet from the host for the MS */
+void gprs_from_host(Gprs *g, const uint8_t *ip, size_t len);
+/* the MS's address, 0 while no PDP context is active */
+uint32_t gprs_ms_ip(Gprs *g);
+
+#endif

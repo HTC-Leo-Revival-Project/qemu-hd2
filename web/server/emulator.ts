@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { IMAGES, QEMU_ARM, QEMU_BUILD, QEMU_HEXAGON, SOCK } from "./paths.ts";
+import { nandOs } from "./config.ts";
 import { Qmp } from "./qmp.ts";
 import { VncClient } from "./vnc.ts";
 import { StreamHub } from "./stream.ts";
@@ -94,6 +95,7 @@ export class Emulator extends EventEmitter {
     return {
       state: this.state,
       since: this.since,
+      now: Date.now(),
       message: this.message,
       external: this.external,
       running: this.running,
@@ -174,6 +176,11 @@ export class Emulator extends EventEmitter {
   }
 
   private async launch(cfg: EmulatorConfig) {
+    /*
+     * Windows Mobile boots straight from NAND (the machine finds the ROM's
+     * XIP partition) and needs the real baseband; no cLK menu to drive
+     */
+    if (nandOs(cfg.nand) === "winmo") cfg = { ...cfg, baseband: "lle", boot: "menu" };
     const dsp = cfg.baseband === "lle" && cfg.dsp === "lle";
     for (const f of ["qmp.sock", "webqmp.sock", "vnc.sock", "q6vnc.sock", "q6webqmp.sock", "ramcon.log", "qemu.log"]) fs.rmSync(path.join(IMAGES, f), { force: true });
     if (!fs.existsSync(path.join(IMAGES, cfg.nand))) throw new Error(`NAND image ${cfg.nand} not found in images/`);

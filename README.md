@@ -14,6 +14,7 @@
 <p align="center">
   <a href="#build"><img src="docs/holo/n-build.png" width="59" height="30" alt="Build"></a>
   <a href="#run"><img src="docs/holo/n-run.png" width="52" height="30" alt="Run"></a>
+  <a href="#known-booting"><img src="docs/holo/n-known-booting.png" width="121" height="30" alt="Known booting"></a>
   <a href="#what-works"><img src="docs/holo/n-what-works.png" width="101" height="30" alt="What works"></a>
   <a href="#real-baseband-firmware"><img src="docs/holo/n-real-baseband-firmware.png" width="90" height="30" alt="Baseband"></a>
   <a href="#gpu-adreno-200"><img src="docs/holo/n-gpu-adreno-200.png" width="55" height="30" alt="GPU"></a>
@@ -78,6 +79,15 @@ python3 tools/qmon.py images/qmp.sock quit  # stop
 
 The mouse is the touchscreen. Headless: `tools/keys.py` and `tools/touch.py` send keys, taps and swipes over QMP.
 
+<a name="known-booting"></a>
+<h2><img src="docs/holo/h-known-booting.png" width="170" height="40" alt="Known booting"></h2>
+
+| OS | Boots with | Guide |
+|---|---|---|
+| Android 4.0.4 (NexusHD2-ICS-CM9-HWA v2.8) | cLK 1.4 from NAND | [docs/android.md](docs/android.md) |
+| Windows Mobile 6.5 (HTC stock ROM 3.14.405.2) | the stock SPL, on the real baseband | [docs/windows-mobile.md](docs/windows-mobile.md) |
+| iOS 7 (HD2 port) | MAGLDR from the microSD | [docs/ios.md](docs/ios.md) |
+
 <a name="what-works"></a>
 <h2><img src="docs/holo/h-what-works.png" width="143" height="40" alt="What works"></h2>
 
@@ -104,7 +114,7 @@ The `qom-set` commands go through `python3 tools/qmon.py images/qmp.sock "..."`.
 <a name="real-baseband-firmware"></a>
 <h2><img src="docs/holo/h-real-baseband-firmware.png" width="247" height="40" alt="Real baseband firmware"></h2>
 
-`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it, the SIM works, and the radio finds no network (the modem DSP runs no code, so there is no RF):
+`baseband=lle` runs the radio ROM's AMSS on an emulated ARM926 next to the apps core. The apps side boots on it and the SIM works. The modem DSP (mDSP) is modelled at its command interface, with a GSM cell and network behind it (MCC 310, MNC 260, ARFCN 133; `hw/arm/htcleo/gsm_net.c`): AMSS scans, camps and registers, calls and texts work both ways, and mobile data runs over GPRS (Android's data connection, to the host's user-mode network as with `-nic user`). Calls have no speech yet. GPRS uses CS-2 on 4 downlink timeslots by default, about 40 kbit/s down as on a typical network; `-global msm-mdsp.gprs-cs=4` (CS-1 to CS-4) and `gprs-slots=1` to `4` change it, also at run time with `qom-set`. The network's other side is driven over QMP: `qom-set /machine/modem-lle/mdsp sms "+15551234:text"`, `... call +15551234` (reads back the call's state), `... hangup on`, and `qom-get ... events` lists what the phone sent:
 
 ```bash
 cd images
@@ -126,7 +136,9 @@ python3 tools/hd2_radio.py images/RUU_signed.nbh --dsp images/dsp1.elf
 tools/start-q6.sh
 ```
 
-Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder's motion search is not modelled). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers.
+Audio and the hardware H.264 decoder / MPEG-4 encoder then run on the DSP (the encoder codes P pictures without motion vectors by default). `Q6_AUDIO=none` mutes it; `Q6_MACH=vdc-dump=DIR` saves codec command buffers. `tools/boot-q6.sh` boots this mode for scripts and reports hangs.
+
+Known problems of the real-firmware modes (boot hangs and their fix, slow boots after an unclean stop, DSP speed, the experimental motion search, the GSM network's limits) are in [quirks.md](quirks.md).
 
 <a name="gpu-adreno-200"></a>
 <h2><img src="docs/holo/h-gpu-adreno-200.png" width="196" height="40" alt="GPU (Adreno 200)"></h2>
@@ -146,12 +158,13 @@ On an RTX 3080, `gl` draws 8 full-screen blended layers in ~5 ms (`soft`: ~150 m
 
 | Tool | Purpose |
 |---|---|
-| `hd2_mknand.py`, `hd2_setmac.py`, `mksdcard.sh` | NAND and SD images |
-| `start.sh`, `start-lle.sh`, `start-q6.sh` | Launch |
-| `qmon.py`, `keys.py`, `touch.py` | Monitor commands, input |
+| `hd2_mknand.py`, `hd2_wmnand.py`, `hd2_mkmagldr.py`, `hd2_setmac.py`, `mksdcard.sh`, `fat_put.py` | NAND and SD images |
+| `start.sh`, `start-lle.sh`, `start-q6.sh`, `start-wm.sh`, `ios-boot.sh` | Launch |
+| `qmon.py`, `keys.py`, `touch.py`, `magnav.py` | Monitor commands, input, MAGLDR's menus |
 | `capture.py`, `waitscreen.py`, `waitlog.sh` | Screendumps, logs |
 | `yaffs_check.py`, `logcat.sh` | Read a NAND image's files, guest logs from RAM |
 | `hd2_radio.py`, `amss_*.py` | Radio firmware |
+| `ios7_initrd.py` | Put an XNU kernel into the iOS 7 package |
 | `gltri.c`, `gltest.c` | GPU tests |
 | `hd2bench/` | Benchmark app to compare a real HD2 with the emulator |
 

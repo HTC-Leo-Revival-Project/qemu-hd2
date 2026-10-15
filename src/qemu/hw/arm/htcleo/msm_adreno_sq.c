@@ -142,7 +142,8 @@ static void decode_fetch(SqFetch *f, const uint32_t *w)
          * previous fetch's constant and address.  The Adreno 200 blob sets
          * that bit on fetches that name their own constant, stride and
          * index, and freedreno documents it as reserved: every fetch is a
-         * full one.  Strides and offsets are bytes, not dwords.
+         * full one.  Strides and offsets are bytes, unless the fetch
+         * constant says dwords (exec_vfetch).
          */
         f->vconst = ((w[0] >> 20) & 0x1f) * 3 + ((w[0] >> 25) & 3);
         f->scomp = (w[0] >> 30) & 3;
@@ -961,8 +962,8 @@ static void decode_vertex(const SqFetch *f, uint32_t *dw, float *v)
         v[2] = adreno_half_to_float(dw[1]);
         v[3] = adreno_half_to_float(dw[1] >> 16);
         break;
-    case 33: case 34: case 35:  /* FMT_32[_32[_32_32]] */
-        for (int k = 0; k < f->fmt - 32; k++) {
+    case 33: case 34: case 35:  /* FMT_32, FMT_32_32, FMT_32_32_32_32 */
+        for (int k = 0; k < vfetch_dwords(f->fmt); k++) {
             v[k] = f->sign ? (float)(int32_t)dw[k] : (float)dw[k];
             if (f->norm) {
                 v[k] /= f->sign ? 2147483647.0f : 4294967295.0f;
@@ -995,8 +996,8 @@ static void exec_vfetch(SqExec *X, const SqFetch *f, int al, uint32_t mask)
             continue;
         }
         idx = src[f->scomp][l] + (f->round ? 0.5f : 0.0f);
-        adreno_tlb_read(L->s, L->tlb, (fc0 & ~3u) +
-                        f->stride * (uint32_t)(int)floorf(idx) + f->offset,
+        adreno_tlb_read(L->s, L->tlb, (fc0 & ~3u) + ADRENO_VFETCH_UNIT(fc1) *
+                        (f->stride * (uint32_t)(int)floorf(idx) + f->offset),
                         dw, ndw * 4);
         for (int k = 0; k < ndw; k++) {
             dw[k] = le32_to_cpu(dw[k]);

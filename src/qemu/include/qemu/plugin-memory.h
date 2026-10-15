@@ -16,6 +16,7 @@ struct qemu_plugin_hwaddr {
     bool is_store;
     hwaddr phys_addr;
     MemoryRegion *mr;
+    uint8_t memattr;            /* Arm: MAIR-format memory type */
 };
 
 /**

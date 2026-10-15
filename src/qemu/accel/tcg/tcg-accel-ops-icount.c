@@ -33,6 +33,76 @@
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-icount.h"
 #include "tcg-accel-ops-rr.h"
+#include "qemu/timer.h"
+
+/*
+ * Cost clock (icount_cost_active): a vCPU's budget is still counted in
+ * instructions, so the time to the next deadline is turned into
+ * instructions with the cost per instruction each vCPU has been running
+ * at.  A slice is capped so a run of expensive instructions cannot
+ * overshoot a timer by much.
+ */
+#define COST_CPUS       16
+#define COST_SLICE_NS   (200 * SCALE_US)
+#define COST_SLICE_MAX  2000000
+
+bool icount_cost_pace;
+#define COST_SLICE_MIN  2000
+#define COST_SAMPLE     20000           /* instructions per ratio update */
+#define COST_RATIO_MAX  64.0
+
+static double cost_ratio[COST_CPUS];    /* cost units per instruction */
+static uint64_t cost_slice0[COST_CPUS];
+static uint64_t cost_acc_units[COST_CPUS], cost_acc_insns[COST_CPUS];
+static int64_t cost_insns0[COST_CPUS];
+static int64_t cost_pace_offset = INT64_MIN;
+
+static int64_t icount_cost_limit(CPUState *cpu, int64_t deadline)
+{
+    int i = cpu->cpu_index % COST_CPUS;
+    double r = cost_ratio[i] ? cost_ratio[i] : icount_cost_units_per_ns;
+    int64_t n;
+
+    deadline = MIN(deadline, COST_SLICE_NS);
+    if (cpu->cpu_index == icount_cost_skip) {
+        /* a core of its own on the real machine: its instruction rate */
+        n = deadline * icount_cost_skip_ipns;
+        return MAX(MIN(n, COST_SLICE_MAX), deadline ? 1 : 0);
+    }
+    n = deadline * (double)icount_cost_units_per_ns / r;
+    return deadline ? MAX(MIN(n, COST_SLICE_MAX), COST_SLICE_MIN) : 0;
+}
+
+/* the slice ran: learn its cost per instruction, and keep to real time */
+static void icount_cost_account(CPUState *cpu, int64_t executed)
+{
+    int i = cpu->cpu_index % COST_CPUS;
+    uint64_t dc = icount_cost_cpu(cpu->cpu_index) - cost_slice0[i];
+
+    /* learn over enough instructions, however short the slices */
+    cost_acc_units[i] += dc;
+    cost_acc_insns[i] += executed;
+    if (cost_acc_insns[i] >= COST_SAMPLE) {
+        double r = (double)cost_acc_units[i] / cost_acc_insns[i];
+
+        r = MIN(MAX(r, 0.05), COST_RATIO_MAX);
+        cost_ratio[i] = cost_ratio[i] ? 0.5 * cost_ratio[i] + 0.5 * r : r;
+        cost_acc_units[i] = cost_acc_insns[i] = 0;
+    }
+    if (icount_cost_pace) {
+        int64_t vt = icount_get();
+        int64_t rt = get_clock();
+
+        /* never run ahead of real time; never rush to make up for lag */
+        if (cost_pace_offset == INT64_MIN || rt > vt + cost_pace_offset +
+                                                    100 * SCALE_MS) {
+            cost_pace_offset = rt - vt;
+        } else if (vt + cost_pace_offset > rt + SCALE_MS) {
+            g_usleep((vt + cost_pace_offset - rt) / SCALE_US);
+        }
+    }
+}
+
 
 static int64_t icount_get_limit(void)
 {
@@ -119,7 +189,17 @@ void icount_prepare_for_run(CPUState *cpu, int64_t cpu_budget)
 
     replay_mutex_lock();
 
+    icount_cost_sync(cpu);
     cpu->icount_budget = MIN(icount_get_limit(), cpu_budget);
+    if (icount_cost_active) {
+        icount_cost_slice_start(cpu);
+        cost_slice0[cpu->cpu_index % COST_CPUS] =
+            icount_cost_cpu(cpu->cpu_index);
+        cost_insns0[cpu->cpu_index % COST_CPUS] =
+            icount_cpu_insns(cpu->cpu_index);
+        cpu->icount_budget = icount_cost_limit(cpu,
+                                               icount_to_ns(cpu->icount_budget));
+    }
     insns_left = MIN(0xffff, cpu->icount_budget);
     cpu->neg.icount_decr.u16.low = insns_left;
     cpu->icount_extra = cpu->icount_budget - insns_left;
@@ -139,6 +219,12 @@ void icount_process_data(CPUState *cpu)
 {
     /* Account for executed instructions */
     icount_update(cpu);
+    if (icount_cost_active) {
+        icount_cost_slice_end(cpu);
+        /* reading the clock in the slice accounted some of them already */
+        icount_cost_account(cpu, icount_cpu_insns(cpu->cpu_index) -
+                                 cost_insns0[cpu->cpu_index % COST_CPUS]);
+    }
 
     /* Reset the counters */
     cpu->neg.icount_decr.u16.low = 0;

@@ -139,7 +139,12 @@ static void build_fs(SimCard *c)
     for (int i = 0; i < 10; i++) {
         f->data[176 * i] = 0x00;                    /* free */
     }
-    add_file(c, 0x6F42, 0x7F10, T_EF, EF_LINEAR, 40, 40);          /* SMSP */
+    f = add_file(c, 0x6F42, 0x7F10, T_EF, EF_LINEAR, 40, 40);      /* SMSP */
+    /* 12 octets of alpha tag, then only the service centre's address */
+    f->data[12] = 0xFD;
+    f->data[25] = 1 + (strlen(SIM_SMSC + 1) + 1) / 2;
+    f->data[26] = 0x91;
+    bcd(SIM_SMSC + 1, f->data + 27, 10);
     f = add_file(c, 0x6F43, 0x7F10, T_EF, EF_TRANSPARENT, 0, 2);   /* SMSS */
     memcpy(f->data, "\x00\xFF", 2);
     add_file(c, 0x6F44, 0x7F10, T_EF, EF_CYCLIC, 28, 28 * 5);      /* LND */

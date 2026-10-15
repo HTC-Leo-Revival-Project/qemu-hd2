@@ -468,7 +468,8 @@ static bool nand_read_page_data(BlockBackend *blk, uint32_t page, uint8_t *out)
  * ("OEMLaunchImage 80000000 / Jump to Physical Address 11800000" in a real
  * SPL log).  A WinCE image (MAGLDR) carries an "ECEC" record at +0x40 whose
  * second word is its ROMHDR's file offset; the ROMHDR's physfirst is where
- * the image is linked to run (MAGLDR 1.13: 0x28000000).
+ * the image is linked to run (MAGLDR 1.13: 0x28000000; Windows Mobile:
+ * virtual 0x80000000).
  */
 static uint32_t htcleo_os_load_address(BlockBackend *blk, uint32_t first_page,
                                        const uint8_t *first)
@@ -485,6 +486,14 @@ static uint32_t htcleo_os_load_address(BlockBackend *blk, uint32_t first_page,
         return HTCLEO_KERNEL_BASE;
     }
     pa = ldl_le_p(page + (off & 2047) + 8);         /* ROMHDR.physfirst */
+    if ((pa & 0xE0000000) == 0x80000000 && !(pa & 0xFFF)) {
+        /*
+         * A stock Windows Mobile kernel is linked at cached virtual
+         * addresses; its OEMAddressTable maps 0x80000000 to the start of
+         * EBI1 bank 0, where the SPL copies it.
+         */
+        return HTCLEO_KERNEL_BASE + (pa - 0x80000000);
+    }
     if (pa >= HTCLEO_RAM_SIZE || pa & 0xFFF) {
         warn_report("htcleo: WinCE OS image physfirst 0x%08x is not in "
                     "RAM; loading it at 0x%x", pa, HTCLEO_KERNEL_BASE);
@@ -498,17 +507,26 @@ static bool htcleo_load_os_from_nand(BlockBackend *blk, uint32_t *entry)
     uint8_t page[2048];
     uint32_t base = NAND_ROM_BLOCK * 64;
     uint32_t start, count, load = HTCLEO_KERNEL_BASE;
+    int p;
 
     if (!blk || !nand_read_page_data(blk, base, page)) {
         return false;
     }
-    /* WinCE MBR: partition 0 type 0x23 holds the OS image (cLK) */
+    /*
+     * WinCE MBR: the XIP partition (type 0x23) holds the OS image.  It is
+     * partition 0 for cLK/MAGLDR; a stock ROM puts ULDR (0x20) first.
+     */
     if (page[0] != 0xE9 || page[1] != 0xFD || page[2] != 0xFF ||
-        page[510] != 0x55 || page[511] != 0xAA || page[0x1BE + 4] != 0x23) {
+        page[510] != 0x55 || page[511] != 0xAA) {
         return false;
     }
-    start = ldl_le_p(page + 0x1BE + 8);
-    count = ldl_le_p(page + 0x1BE + 12);
+    for (p = 0; p < 4 && page[0x1BE + 16 * p + 4] != 0x23; p++) {
+    }
+    if (p == 4) {
+        return false;
+    }
+    start = ldl_le_p(page + 0x1BE + 16 * p + 8);
+    count = ldl_le_p(page + 0x1BE + 16 * p + 12);
     if (!count || count > 0x4000) {
         return false;
     }
@@ -525,6 +543,15 @@ static bool htcleo_load_os_from_nand(BlockBackend *blk, uint32_t *entry)
                 "(%u pages) to 0x%x", count, load);
     *entry = load;
     return true;
+}
+
+static void htcleo_sd_detect(void *opaque, int n, int level)
+{
+    HtcleoMachineState *s = opaque;
+
+    if (s->gpio) {
+        msm_gpio_set_input(s->gpio, HTCLEO_GPIO_SD_STATUS, level);
+    }
 }
 
 static void htcleo_reset(MachineState *machine, ResetType type)
@@ -588,14 +615,26 @@ static void htcleo_reset(MachineState *machine, ResetType type)
         physical_memory_write(0x80000 + 0x1030, &v, 4);
         v = cpu_to_le32(s->panel_type);
         physical_memory_write(0x80000 + 0x1034, &v, 4);
+        /*
+         * Windows Mobile reads these as its driver globals (0x81000).  The
+         * SPL also records why the phone powered on at +0x5c: "BUTT"
+         * (power button) or "REST" (reset).  Anything else makes the
+         * kernel treat the boot as off-mode charging and, with no charger
+         * and the power key up, power off again.
+         */
+        v = cpu_to_le32(0x42555454);        /* 'TTUB' */
+        physical_memory_write(0x80000 + 0x105c, &v, 4);
     }
 
     /* what the SPL leaves configured */
     msm_mdp_setup_scanout(s->mdp, HTCLEO_SPL_FB_BASE, 480, 800, 480 * 2,
                           true);
-    msm_gpio_set_input(s->gpio, HTCLEO_GPIO_SD_STATUS,
-                       drive_get(IF_SD, 0, 0) ? 0 : 1);
     htcleo_update_keys(s);
+    /*
+     * The SPL grants full access to cp10/cp11 (VFP) before it jumps:
+     * Windows Mobile writes FPEXC right away and expects that to work.
+     */
+    env->cp15.cpacr_el1 |= 0xF00000;
 
     /* SVC mode, IRQ/FIQ masked, MMU off: jump to the OS image */
     env->regs[15] = entry;
@@ -730,6 +769,13 @@ static void htcleo_init(MachineState *machine)
     object_property_add_child(OBJECT(&s->apps_cluster), "cpu", cpuobj);
     object_unref(cpuobj);
     object_property_set_int(cpuobj, "midr", 0x510F00F2, &error_fatal);
+    /*
+     * Scorpion's caches, not Cortex-A8's: 32-byte lines (CTR) and a 32 KiB
+     * 4-way L1 data cache (CCSIDR).  Linux strides its maintenance by the
+     * CTR line, and the htcleo kernel aligns DMA buffers to 32 bytes.
+     */
+    ARM_CPU(cpuobj)->ctr = 0x8003c003;
+    ARM_CPU(cpuobj)->ccsidr[0] = 0x701fe019;
     if (object_property_find(cpuobj, "has_el3")) {
         object_property_set_bool(cpuobj, "has_el3", false, &error_fatal);
     }
@@ -958,6 +1004,12 @@ static void htcleo_init(MachineState *machine)
         sysbus_connect_irq(sbd, 0, vic_in[irq[i][0]]);
         sysbus_connect_irq(sbd, 1, vic_in[irq[i][1]]);
         msm_sdcc_connect_adm(dev, s->adm, base[i]);
+        if (i == 1) {
+            /* the microSD slot's card switch, GPIO 153, low with a card */
+            qdev_connect_gpio_out_named(dev, "card-detect", 0,
+                                        qemu_allocate_irq(htcleo_sd_detect,
+                                                          s, 0));
+        }
         dinfo = i == 1 ? drive_get(IF_SD, 0, 0) : NULL;
         if (dinfo) {
             DeviceState *card = qdev_new(TYPE_SD_CARD);

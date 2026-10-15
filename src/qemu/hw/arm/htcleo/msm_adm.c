@@ -11,7 +11,13 @@
  * data mover talks to (NAND, SDCC, ...) complete their side synchronously,
  * so CRCI flow control never has to stall.  One result (0x80000002) is
  * queued per command and INT_ADM_AARM is raised while any domain ISR bit
- * is pending.
+ * is pending.  A channel whose result FIFO is full takes no more commands
+ * until the driver reads results, as on hardware: they wait in its command
+ * queue (STATUS CMD_COUNT, CMD_PTR_RDY clear when it is full).
+ *
+ * The mover reads and writes DRAM, below the CPU's caches: with the
+ * hd2perf plugin's cache model, a list or buffer the CPU has not cleaned
+ * from its cache reads as what DRAM still holds (plugin_dma_snoop).
  *
  * The exceptions are paced peripherals.  A paced receive (UART DM RX FIFO
  * -> memory) stays on its channel until the peripheral pushes bytes with
@@ -36,6 +42,7 @@
 #include "qemu/module.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "qemu/plugin.h"
 #include "htcleo.h"
 #include "../trace.h"
 
@@ -44,6 +51,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmAdmState, MSM_ADM)
 #define ADM_CHANNELS    16
 #define ADM_DOMAINS     4
 #define RSLT_FIFO       8
+#define CMD_QUEUE       3       /* STATUS CMD_COUNT is two bits */
 
 #define CMD_PTR_LP      (1u << 31)
 #define CMD_LC          (1u << 31)
@@ -69,6 +77,8 @@ typedef struct AdmChannel {
     int rslt_head, rslt_count;
     uint32_t config;
     bool stalled;               /* waiting on its CRCI */
+    uint32_t queued[CMD_QUEUE]; /* commands waiting for room for results */
+    int nqueued;
     uint32_t stall_desc;        /* the descriptor it waits on */
     hwaddr stall_list;          /* its pointer list, 0 for a plain array */
     int stall_idx;              /* and the entry being run */
@@ -179,10 +189,38 @@ static void adm_update(MsmAdmState *s)
     qemu_set_irq(s->irq, level);
 }
 
+/*
+ * The data mover reads and writes DRAM, not the CPU's caches: a plugin
+ * that models them (hd2perf) gets to say what it really sees.
+ */
+static void dma_read(hwaddr a, void *buf, uint32_t len)
+{
+    address_space_read(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED,
+                       buf, len);
+#ifdef CONFIG_PLUGIN
+    if (plugin_dma_snoop) {
+        plugin_dma_snoop(a, buf, len, false);
+    }
+#endif
+}
+
+static void dma_write(hwaddr a, const void *buf, uint32_t len)
+{
+#ifdef CONFIG_PLUGIN
+    if (plugin_dma_snoop && plugin_dma_snoop(a, (void *)buf, len, true)) {
+        return;
+    }
+#endif
+    address_space_write(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED,
+                        buf, len);
+}
+
 static uint32_t ld32(hwaddr a)
 {
-    return address_space_ldl_le(&address_space_memory, a,
-                                MEMTXATTRS_UNSPECIFIED, NULL);
+    uint32_t v;
+
+    dma_read(a, &v, 4);
+    return le32_to_cpu(v);
 }
 
 static void swap_buf(uint8_t *b, uint32_t len, uint32_t cmd, bool src)
@@ -222,12 +260,10 @@ static void adm_copy(uint32_t cmd, hwaddr src, hwaddr dst, uint32_t len)
         return;
     }
     buf = g_malloc(len);
-    address_space_read(&address_space_memory, src, MEMTXATTRS_UNSPECIFIED,
-                       buf, len);
+    dma_read(src, buf, len);
     swap_buf(buf, len, cmd, true);
     swap_buf(buf, len, cmd, false);
-    address_space_write(&address_space_memory, dst, MEMTXATTRS_UNSPECIFIED,
-                        buf, len);
+    dma_write(dst, buf, len);
 }
 
 /*
@@ -356,6 +392,20 @@ static void adm_execute(MsmAdmState *s, int dom, int chn, uint32_t cmdptr)
     }
 }
 
+/* results were read: run the commands that waited for room */
+static void adm_run_queued(MsmAdmState *s, int dom, int chn)
+{
+    AdmChannel *c = &s->ch[dom][chn];
+
+    while (c->nqueued && c->rslt_count < RSLT_FIFO && !c->stalled) {
+        uint32_t cmd = c->queued[0];
+
+        c->nqueued--;
+        memmove(c->queued, c->queued + 1, c->nqueued * sizeof(c->queued[0]));
+        adm_execute(s, dom, chn, cmd);
+    }
+}
+
 void msm_adm_add_crci(DeviceState *dev, hwaddr base, hwaddr size,
                       MsmAdmCrciReady ready, void *opaque)
 {
@@ -447,9 +497,7 @@ int msm_adm_rx_push(DeviceState *dev, hwaddr base, hwaddr size,
                 uint32_t r = (c->fill + done) / row_len;
                 uint32_t col = (c->fill + done) % row_len;
                 uint32_t chunk = MIN(take - done, row_len - col);
-                address_space_write(&address_space_memory,
-                                    dst + r * dst_off + col,
-                                    MEMTXATTRS_UNSPECIFIED, buf + done, chunk);
+                dma_write(dst + r * dst_off + col, buf + done, chunk);
                 done += chunk;
             }
             c->fill += take;
@@ -481,11 +529,13 @@ static uint64_t adm_read(void *opaque, hwaddr off, unsigned size)
         v = c->rslt[c->rslt_head];
         c->rslt_head = (c->rslt_head + 1) % RSLT_FIFO;
         c->rslt_count--;
+        adm_run_queued(s, dom, chn);
         return v;
     } else if (r < 0x200) {
         return 0;                               /* FLUSH0..5 */
     } else if (r < 0x240) {                     /* STATUS */
-        v = c->stalled ? 0 : STATUS_CMD_PTR_RDY;
+        v = c->stalled || c->nqueued == CMD_QUEUE ? 0 : STATUS_CMD_PTR_RDY;
+        v |= (uint32_t)c->nqueued << 27;
         if (c->rslt_count) {
             v |= STATUS_RSLT_VALID | ((uint32_t)MIN(c->rslt_count, 7) << 29);
         }
@@ -509,6 +559,22 @@ static void adm_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     int chn = (r >> 2) & 0xF;
 
     if (r < 0x40) {
+        AdmChannel *c = &s->ch[dom][chn];
+
+        /*
+         * A channel whose result FIFO is full takes no more commands: they
+         * wait (up to CMD_QUEUE of them) until the driver reads results.
+         */
+        if (c->rslt_count >= RSLT_FIFO || c->nqueued) {
+            if (c->nqueued < CMD_QUEUE) {
+                c->queued[c->nqueued++] = val;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, "msm-adm: domain %d channel %d:"
+                              " command 0x%08" PRIx64 " lost, its result FIFO"
+                              " and command queue are full\n", dom, chn, val);
+            }
+            return;
+        }
         adm_execute(s, dom, chn, val);
     } else if (r >= 0x80 && r < 0x200) {
         /* FLUSH0..5: abort a command stalled on its CRCI */

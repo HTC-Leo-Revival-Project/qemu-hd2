@@ -13,6 +13,9 @@
  *     vcpu=N    the vCPU index to watch (default 1: the -M htcleo modem)
  *     msg=VA    a msg_send entry point (any number of them)
  *     hook=VA   print r0-r3 and lr whenever VA runs
+ *     wstr=VA   print the UTF-16 string at r0 (r1 bytes long, or up to
+ *               its NUL if r1 is 0) whenever VA runs: Windows CE's debug
+ *               output (vcpu=0)
  *     mem=LO-HI log the device (non-DRAM) accesses of the code between
  *               LO and HI: pc, virtual and physical address, value (the
  *               first 4 per pc and address)
@@ -30,7 +33,7 @@
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
-enum { KIND_MSG, KIND_HOOK };
+enum { KIND_MSG, KIND_HOOK, KIND_WSTR };
 
 typedef struct {
     uint64_t va;
@@ -157,6 +160,28 @@ static void on_exec(unsigned int vcpu, void *udata)
         g_string_printf(o, "amss: %6.3f %s:%u: ", now(), file, d[0] & 0xffff);
         format(o, fmt, &r[1]);
         g_string_append_printf(o, "  [lr %08x]\n", lr);
+    } else if (w->kind == KIND_WSTR) {
+        uint16_t ws[512];
+        uint32_t n = r[1] ? MIN(r[1] / 2, 512) : 512;
+
+        g_string_printf(o, "wce: %6.3f ", now());
+        for (uint32_t i = 0; i < n; i += 16) {
+            uint32_t k = MIN(16, n - i);
+
+            if (!rd_mem(r[0] + i * 2, &ws[i], k * 2)) {
+                n = i;
+                break;
+            }
+        }
+        for (uint32_t i = 0; i < n && ws[i]; i++) {
+            if (ws[i] == '\r') {
+                continue;
+            }
+            g_string_append_c(o, ws[i] < 0x80 ? ws[i] : '?');
+        }
+        if (o->str[o->len - 1] != '\n') {
+            g_string_append_c(o, '\n');
+        }
     } else {
         g_string_printf(o, "amss: %6.3f hit %08" PRIx64 " r0 %08x r1 %08x "
                         "r2 %08x r3 %08x lr %08x\n", now(), w->va, r[0], r[1],
@@ -289,6 +314,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             w.kind = KIND_MSG;
         } else if (!strcmp(kv[0], "hook")) {
             w.kind = KIND_HOOK;
+        } else if (!strcmp(kv[0], "wstr")) {
+            w.kind = KIND_WSTR;
         } else {
             fprintf(stderr, "amsslog: unknown option %s\n", kv[0]);
             return -1;

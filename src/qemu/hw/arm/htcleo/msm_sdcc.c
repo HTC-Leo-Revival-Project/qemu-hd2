@@ -15,6 +15,17 @@
  * FIFO that is always ready.  Both IRQ lines are levels:
  * STATUS & MASK0 and STATUS & MASK1.
  *
+ * An SDIO card's interrupt (DAT1, in-band) shows in STATUS bit 22 (SDIOINTR)
+ * and bit 25 (SDIOINTOPER, the one Linux's msm_sdcc unmasks) for as long as
+ * the card holds it; Windows Mobile's SDIO stack takes the WLAN chip's
+ * interrupts this way (Android's driver uses the chip's separate pin).
+ *
+ * accurate=on (with the hd2perf plugin's accurate mode) paces an SD card
+ * like a real one: a read's data starts read-latency-us after the command
+ * and flows at read-kbps, a write's at write-kbps, and the card is busy
+ * programming for write-latency-us after the data before a busy-waiting
+ * command (PROGENA) completes.  The data mover and the FIFO flags wait.
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
@@ -22,6 +33,8 @@
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "qemu/timer.h"
 #include "hw/sd/sd.h"
 #include "htcleo.h"
 #include "msm_sdcc.h"
@@ -73,17 +86,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmSdccState, MSM_SDCC)
 #define ST_RXFIFOEMPTY      (1u << 19)
 #define ST_TXDATAAVLBL      (1u << 20)
 #define ST_RXDATAAVLBL      (1u << 21)
+#define ST_SDIOINTR         (1u << 22)
 #define ST_PROGDONE         (1u << 23)
+#define ST_SDIOINTOPER      (1u << 25)
 /* bits the CLEAR register acknowledges; the rest describe live state */
 #define ST_LATCHED          0x07C007FFu
 
 #define FIFO_BYTES          64
+
+#define TYPE_MSM_SDCC_BUS "msm-sdcc-bus"
 
 struct MsmSdccState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     SDBus sdbus;
     qemu_irq irq[2];            /* cmd_irq, pio_irq */
+    qemu_irq card_detect;       /* the slot's switch: low with a card in */
 
     uint32_t power, clock, arg, cmd, respcmd;
     uint32_t resp[4];
@@ -93,13 +111,57 @@ struct MsmSdccState {
     uint32_t remain;            /* bytes left in the data phase */
     DeviceState *adm;           /* data mover serving the FIFO */
     bool data_active;
+    bool sdio_irq;              /* the SDIO card's interrupt */
 
     const MsmSdioCardOps *sdio;
     void *sdio_opaque;
+
+    /* accurate mode: the card's speed */
+    bool accurate;
+    uint32_t read_kbps, write_kbps, read_latency_us, write_latency_us;
+    int64_t xfer_t0;            /* when this data phase's bytes start */
+    uint32_t xfer_bytes;        /* moved so far in it */
+    int64_t prog_until;         /* the card programs the last write */
+    bool prog_pending;          /* PROGDONE waits for it */
+    QEMUTimer *timer;
 };
+
+#define PACE_CHUNK          512     /* the card delivers whole blocks */
+
+static bool sdcc_paced(MsmSdccState *s)
+{
+    return s->accurate && !s->sdio;
+}
+
+/*
+ * The card has not caught up with the bytes already moved: hold the data
+ * mover and the FIFO, and come back when the next block is due.
+ */
+static bool sdcc_throttled(MsmSdccState *s)
+{
+    int64_t now, due;
+    uint32_t kbps;
+
+    if (!sdcc_paced(s) || !s->data_active) {
+        return false;
+    }
+    kbps = MAX(s->datactrl & DC_READ ? s->read_kbps : s->write_kbps, 1);
+    due = s->xfer_t0 + (int64_t)(s->xfer_bytes / PACE_CHUNK * PACE_CHUNK +
+                                 PACE_CHUNK) * 1000000 / kbps;
+    /* the first block arrives whole too */
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now >= due || s->xfer_bytes % PACE_CHUNK) {
+        return false;
+    }
+    timer_mod(s->timer, due);
+    return true;
+}
 
 static bool sdcc_card_ready(MsmSdccState *s)
 {
+    if (sdcc_throttled(s)) {
+        return false;
+    }
     return s->sdio ? s->sdio->data_ready(s->sdio_opaque)
                    : sdbus_data_ready(&s->sdbus);
 }
@@ -108,6 +170,9 @@ static uint32_t sdcc_status(MsmSdccState *s)
 {
     uint32_t st = s->latched;
 
+    if (s->sdio_irq) {
+        st |= ST_SDIOINTR | ST_SDIOINTOPER;
+    }
     if (s->data_active && s->remain) {
         if (s->datactrl & DC_READ) {
             st |= ST_RXACTIVE;
@@ -123,7 +188,10 @@ static uint32_t sdcc_status(MsmSdccState *s)
                 st |= ST_RXFIFOEMPTY;
             }
         } else {
-            st |= ST_TXACTIVE | ST_TXFIFOHALFEMPTY | ST_TXFIFOEMPTY;
+            st |= ST_TXACTIVE;
+            if (!sdcc_throttled(s)) {
+                st |= ST_TXFIFOHALFEMPTY | ST_TXFIFOEMPTY;
+            }
         }
     } else {
         st |= ST_RXFIFOEMPTY | ST_TXFIFOEMPTY;
@@ -143,7 +211,7 @@ static bool sdcc_crci_ready(void *opaque, bool to_card)
     if (!to_card) {
         return sdcc_card_ready(s);
     }
-    return s->sdio || sdbus_receive_ready(&s->sdbus);
+    return !sdcc_throttled(s) && (s->sdio || sdbus_receive_ready(&s->sdbus));
 }
 
 static void sdcc_crci_kick(MsmSdccState *s)
@@ -163,6 +231,10 @@ static void sdcc_update(MsmSdccState *s)
 
 static void sdcc_data_done(MsmSdccState *s)
 {
+    if (sdcc_paced(s) && !(s->datactrl & DC_READ)) {
+        s->prog_until = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                        (int64_t)s->write_latency_us * SCALE_US;
+    }
     s->data_active = false;
     s->latched |= ST_DATAEND | ST_DATABLOCKEND;
     if (s->sdio) {
@@ -206,8 +278,14 @@ static void sdcc_do_command(MsmSdccState *s)
     }
     s->latched |= ST_CMDRESPEND;
     if (s->cmd & CMD_PROGENA) {
-        /* the card finishes programming at once */
-        s->latched |= ST_PROGDONE;
+        /* the card is busy until it has programmed the last write */
+        if (sdcc_paced(s) &&
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->prog_until) {
+            s->prog_pending = true;
+            timer_mod(s->timer, s->prog_until);
+        } else {
+            s->latched |= ST_PROGDONE;
+        }
     }
 }
 
@@ -227,6 +305,7 @@ static uint32_t sdcc_fifo_read(MsmSdccState *s)
         sdbus_read_data(&s->sdbus, b, n);
     }
     s->remain -= n;
+    s->xfer_bytes += n;
     if (!s->remain) {
         sdcc_data_done(s);
     }
@@ -249,6 +328,7 @@ static void sdcc_fifo_write(MsmSdccState *s, uint32_t val)
         sdbus_write_data(&s->sdbus, b, n);
     }
     s->remain -= n;
+    s->xfer_bytes += n;
     if (!s->remain) {
         sdcc_data_done(s);
     }
@@ -340,6 +420,10 @@ static void sdcc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (val & DC_ENABLE) {
             s->remain = s->datalength;
             s->data_active = s->remain != 0;
+            s->xfer_bytes = 0;
+            s->xfer_t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         (val & DC_READ ? (int64_t)s->read_latency_us *
+                                          SCALE_US : 0);
         } else {
             s->data_active = false;
             s->remain = 0;
@@ -364,6 +448,16 @@ static void sdcc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     sdcc_update(s);
 }
 
+void msm_sdcc_sdio_irq(DeviceState *dev, bool level)
+{
+    MsmSdccState *s = MSM_SDCC(dev);
+
+    if (s->sdio_irq != level) {
+        s->sdio_irq = level;
+        sdcc_update(s);
+    }
+}
+
 void msm_sdcc_attach_sdio(DeviceState *dev, const MsmSdioCardOps *ops,
                           void *opaque)
 {
@@ -380,6 +474,20 @@ void msm_sdcc_connect_adm(DeviceState *dev, DeviceState *adm, hwaddr base)
     s->adm = adm;
     msm_adm_add_crci(adm, base + SDCC_FIFO, SDCC_FIFO_END - SDCC_FIFO,
                      sdcc_crci_ready, s);
+}
+
+/* the card caught up, or finished programming */
+static void sdcc_timer(void *opaque)
+{
+    MsmSdccState *s = opaque;
+
+    if (s->prog_pending &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->prog_until) {
+        s->prog_pending = false;
+        s->latched |= ST_PROGDONE;
+    }
+    sdcc_update(s);
+    sdcc_crci_kick(s);
 }
 
 static const MemoryRegionOps sdcc_ops = {
@@ -400,7 +508,17 @@ static void msm_sdcc_reset(DeviceState *dev)
     s->latched = 0;
     s->remain = 0;
     s->data_active = false;
+    s->prog_pending = false;
+    s->prog_until = 0;
+    timer_del(s->timer);
     sdcc_update(s);
+    qemu_set_irq(s->card_detect, !sdbus_get_inserted(&s->sdbus));
+}
+
+/* a card inserted or removed (or a drive given media): the slot's switch */
+static void msm_sdcc_set_inserted(DeviceState *dev, bool inserted)
+{
+    qemu_set_irq(MSM_SDCC(dev)->card_detect, !inserted);
 }
 
 static void msm_sdcc_init(Object *obj)
@@ -417,16 +535,44 @@ static void msm_sdcc_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq[0]);
     sysbus_init_irq(sbd, &s->irq[1]);
-    qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_SD_BUS, DEVICE(obj),
+    qdev_init_gpio_out_named(DEVICE(obj), &s->card_detect, "card-detect", 1);
+    qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_MSM_SDCC_BUS, DEVICE(obj),
               "sd-bus");
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sdcc_timer, s);
 }
+
+/*
+ * The card's speed in accurate mode (KB/s, us); the defaults are a typical
+ * class 4 microSD in the HD2's 4-bit slot.
+ */
+static const Property msm_sdcc_props[] = {
+    DEFINE_PROP_BOOL("accurate", MsmSdccState, accurate, false),
+    DEFINE_PROP_UINT32("read-kbps", MsmSdccState, read_kbps, 10000),
+    DEFINE_PROP_UINT32("write-kbps", MsmSdccState, write_kbps, 5000),
+    DEFINE_PROP_UINT32("read-latency-us", MsmSdccState, read_latency_us, 500),
+    DEFINE_PROP_UINT32("write-latency-us", MsmSdccState, write_latency_us,
+                       15000),
+};
 
 static void msm_sdcc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, msm_sdcc_reset);
+    device_class_set_props(dc, msm_sdcc_props);
 }
+
+static void msm_sdcc_bus_class_init(ObjectClass *oc, const void *data)
+{
+    SD_BUS_CLASS(oc)->set_inserted = msm_sdcc_set_inserted;
+}
+
+static const TypeInfo msm_sdcc_bus_info = {
+    .name = TYPE_MSM_SDCC_BUS,
+    .parent = TYPE_SD_BUS,
+    .instance_size = sizeof(SDBus),
+    .class_init = msm_sdcc_bus_class_init,
+};
 
 static const TypeInfo msm_sdcc_info = {
     .name = TYPE_MSM_SDCC,
@@ -438,6 +584,7 @@ static const TypeInfo msm_sdcc_info = {
 
 static void msm_sdcc_register(void)
 {
+    type_register_static(&msm_sdcc_bus_info);
     type_register_static(&msm_sdcc_info);
 }
 type_init(msm_sdcc_register)

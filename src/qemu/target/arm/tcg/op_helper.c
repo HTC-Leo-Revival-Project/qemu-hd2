@@ -794,6 +794,13 @@ void HELPER(cpsr_write)(CPUARMState *env, uint32_t val, uint32_t mask)
 /* Write the CPSR for a 32-bit exception return */
 void HELPER(cpsr_write_eret)(CPUARMState *env, uint32_t val)
 {
+    /*
+     * An exception return sets the Event Register (ARM ARM: "The Event
+     * Register"): a WFE after it does not wait.  Firmware that runs a
+     * stray WFE (a multicore startup barrier on one core, say) gets
+     * through on hardware because its interrupt handlers have returned.
+     */
+    qatomic_set(&env->event_register, true);
     uint32_t mask;
 
     bql_lock();

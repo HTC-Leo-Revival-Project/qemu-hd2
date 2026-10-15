@@ -32,6 +32,7 @@
 #include "system/memory.h"
 #include "system/physmem.h"
 #include "msm_adreno_gl.h"
+#include "msm_adreno_sq.h"
 
 #ifdef CONFIG_OPENGL
 #include <epoxy/gl.h>
@@ -239,8 +240,11 @@ static const char glsl_vfetch[] =
     "    uint i = uint(b.x) + uint(a >> 2), sh = uint(a & 3) * 8u;\n"
     "    return sh == 0u ? vd[i] : (vd[i] >> sh) | (vd[i + 1u] << (32u - sh));\n"
     "}\n"
+    "int vunit(int s) {\n"
+    "    return (u_vb[s].z & 4) != 0 ? 4 : 1;\n"
+    "}\n"
     "uint vswap(uint w, int s) {\n"
-    "    switch (u_vb[s].z) {\n"
+    "    switch (u_vb[s].z & 3) {\n"
     "    case 1: return ((w & 0x00ff00ffu) << 8) | ((w >> 8) & 0x00ff00ffu);\n"
     "    case 2: return (w >> 24) | ((w >> 8) & 0xff00u) |\n"
     "                   ((w << 8) & 0xff0000u) | (w << 24);\n"
@@ -1415,9 +1419,11 @@ static void upload_vertices(AdrenoGl *gl, MsmAdrenoState *s, const GlProg *p,
 
     for (int i = 0; i < vi->nvtx; i++) {
         uint32_t stride = vi->vtx_stride[i];
+        uint32_t unit = ADRENO_VFETCH_UNIT(s->regs[A2_SQ_FETCH_0 +
+                                                  vi->vtx[i] * 2 + 1]);
 
-        lo[i] = (int64_t)g->min_idx * stride + vi->vtx_lo[i];
-        hi[i] = (int64_t)g->max_idx * stride + vi->vtx_hi[i];
+        lo[i] = ((int64_t)g->min_idx * stride + vi->vtx_lo[i]) * unit;
+        hi[i] = ((int64_t)g->max_idx * stride + vi->vtx_hi[i]) * unit;
         hi[i] = MIN(hi[i], lo[i] + (16 << 20));
         total += ROUND_UP(hi[i] - lo[i], 16);
     }
@@ -1436,7 +1442,7 @@ static void upload_vertices(AdrenoGl *gl, MsmAdrenoState *s, const GlProg *p,
                         gl->stream_map + base + at, len);
         du->vb[i][0] = at / 4;
         du->vb[i][1] = lo[i];
-        du->vb[i][2] = fc1 & 3;
+        du->vb[i][2] = (fc1 & 3) | (ADRENO_VFETCH_UNIT(fc1) == 4 ? 4 : 0);
         du->vb[i][3] = len;
         at += ROUND_UP(len, 16);
     }

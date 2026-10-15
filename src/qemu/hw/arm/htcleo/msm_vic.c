@@ -12,16 +12,30 @@
  * L4/AMSS reads VIC_IRQ_VEC_RD alone and takes NO_PEND_VAL (reset value
  * 0xFFFFFFFF) to mean "nothing pending"; set the "l4" property for that.
  *
- * This code is licensed under the GNU GPL v2 or later.
+ * "redeliver-lo/-hi" mark lines whose edges, when they come while software
+ * has the line masked or when software clears them while it is masked, are
+ * held and latched 100 us after it unmasks the line.  AMSS's interrupt glue
+ * (tramp_l4.c) takes an interrupt that comes while the line's handler runs
+ * for a nested one: it masks the line, clears it and drops it, and the
+ * handler's exit only unmasks the line.  The proc_comm handler is done once
+ * it writes its answer, so on the phone the next command cannot ring that
+ * early; here the apps core, on another host thread, can, and the command
+ * was never answered (the LLE boot hang).  The handler also masks and
+ * clears the edge it handles, which is then delivered once more; such an
+ * edge is not held again.
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
 #include "qemu/module.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "htcleo.h"
 
 #define VIC_NUM_IRQS 64
+#define VIC_HELD_NS  100000      /* after an unmask, see "redeliver" */
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmVicState, MSM_VIC)
 
@@ -46,7 +60,16 @@ struct MsmVicState {
     uint32_t security[2];
     int32_t last_irq;
     bool l4;
-    bool trace;             /* log the lines software enables */                /* VEC_RD returns NO_PEND_VAL when idle */
+    bool trace;             /* log the lines software enables */
+    /* "redeliver" lines: edges that came while masked, latched later */
+    uint32_t redeliver[2];
+    uint32_t held[2];
+    uint32_t relatched[2];      /* latched from held[], not by an edge */
+    QEMUTimer *held_timer;
+    /* the last events of one line, kept quietly for "watch-log" */
+    int32_t watch;
+    struct { int64_t ns; char kind; uint32_t arg, pc, rep; } wlog[256];
+    unsigned wlog_n;                /* VEC_RD returns NO_PEND_VAL when idle */
 };
 
 static void vic_pending(MsmVicState *s, uint32_t pend[2])
@@ -91,6 +114,28 @@ static int vic_first_pending(MsmVicState *s, bool want_fiq)
     return -1;
 }
 
+static void vic_wlog(MsmVicState *s, char kind, uint32_t arg)
+{
+    unsigned i;
+
+    /* a run of the same event is one entry with a count */
+    if (s->wlog_n) {
+        i = (s->wlog_n - 1) % ARRAY_SIZE(s->wlog);
+        if (s->wlog[i].kind == kind && s->wlog[i].arg == arg) {
+            s->wlog[i].rep++;
+            s->wlog[i].ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            return;
+        }
+    }
+    i = s->wlog_n++ % ARRAY_SIZE(s->wlog);
+    s->wlog[i].rep = 1;
+    s->wlog[i].ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    s->wlog[i].kind = kind;
+    s->wlog[i].arg = arg;
+    s->wlog[i].pc = current_cpu ?
+        ((CPUARMState *)cpu_env(current_cpu))->regs[15] : 0;
+}
+
 static void vic_set_irq(void *opaque, int n, int level)
 {
     MsmVicState *s = opaque;
@@ -104,7 +149,15 @@ static void vic_set_irq(void *opaque, int n, int level)
         s->level[b] &= ~bit;
     }
     if (((s->level[b] ^ s->polarity[b]) & bit) && !old) {
-        s->latch[b] |= bit;
+        if (n == s->watch) {
+            vic_wlog(s, 'E', !!(s->latch[b] & bit));  /* edge (was latched) */
+        }
+        if (s->redeliver[b] & bit & ~s->enable[b]) {
+            s->held[b] |= bit;
+        } else {
+            s->latch[b] |= bit;
+            s->relatched[b] &= ~bit;
+        }
     }
     vic_update(s);
 }
@@ -137,6 +190,9 @@ static uint64_t vic_read(void *opaque, hwaddr off, unsigned size)
     case 0xC0: case 0xC4: return s->soft[b];
     case 0xD0:              /* IRQ_VEC_RD */
         n = vic_first_pending(s, false);
+        if (n >= 0 && n == s->watch) {
+            vic_wlog(s, 'R', n);
+        }
         if (n >= 0) {
             s->last_irq = n;
         } else if (s->l4) {
@@ -180,13 +236,37 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                 }
             }
         }
+        if (s->watch >= 0 && (s->watch >> 5) == b) {
+            uint32_t wb = 1u << (s->watch & 31);
+
+            /* N: this line alone; n: with others (the kernel's) */
+            if (val == wb) {
+                vic_wlog(s, 'N', !!(s->latch[b] & wb));  /* enable */
+            } else if (val & wb) {
+                vic_wlog(s, 'n', !!(s->latch[b] & wb));
+            } else if (!(off & 0x20) && (s->enable[b] & wb)) {
+                vic_wlog(s, 'd', !!(s->latch[b] & wb));  /* by a full write */
+            }
+        }
         if (off & 0x20) {
             s->enable[b] |= val;
         } else {
             s->enable[b] = val;
         }
+        /* unmasked: edges held while masked are latched a little later */
+        if (s->held[b] & s->enable[b]) {
+            timer_mod(s->held_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + VIC_HELD_NS);
+        }
         break;
-    case 0x20: case 0x24: s->enable[b] &= ~val; break;
+    case 0x20: case 0x24:
+        if (s->watch >= 0 && (s->watch >> 5) == b &&
+            (val & (1u << (s->watch & 31)))) {
+            vic_wlog(s, val == 1u << (s->watch & 31) ? 'D' : 'd',
+                     !!(s->latch[b] & (1u << (s->watch & 31))));
+        }
+        s->enable[b] &= ~val;
+        break;
     case 0x40: case 0x44: s->type[b] = val; break;
     case 0x50: case 0x54: s->polarity[b] = val; break;
     case 0x60: s->no_pend_val = val; break;
@@ -195,11 +275,26 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     case 0x6C: s->config = val; break;
     case 0x70: case 0x74: s->security[b] = val; break;
     case 0xB0: case 0xB4:   /* INT_CLEAR */
+        if (s->watch >= 0 && (s->watch >> 5) == b &&
+            (val & (1u << (s->watch & 31)))) {
+            vic_wlog(s, 'C', !!(s->latch[b] & (1u << (s->watch & 31))));
+        }
+        /*
+         * a redeliver line's edge cleared while masked is held as well
+         * (once: not one latched from held, or every delivery would repeat)
+         */
+        s->held[b] |= s->latch[b] & val & s->redeliver[b] & ~s->enable[b] &
+                      ~s->relatched[b];
+        s->relatched[b] &= ~val;
         s->latch[b] &= ~val;
         s->soft[b] &= ~val;
         break;
     case 0xC0: case 0xC4: s->soft[b] |= val; break;
-    case 0xD8: case 0xE4: break;        /* VEC_WR: end of interrupt */
+    case 0xD8: case 0xE4:               /* VEC_WR: end of interrupt */
+        if (s->watch >= 0 && s->last_irq == s->watch) {
+            vic_wlog(s, 'W', val);
+        }
+        break;
     case 0xE8: case 0xEC: case 0xF0: case 0xF4: case 0xF8: case 0xFC:
         break;
     default:
@@ -231,11 +326,49 @@ static void vic_reset(DeviceState *dev)
     memset(s->type, 0, sizeof(s->type));
     memset(s->polarity, 0, sizeof(s->polarity));
     memset(s->latch, 0, sizeof(s->latch));
+    memset(s->held, 0, sizeof(s->held));
+    memset(s->relatched, 0, sizeof(s->relatched));
+    timer_del(s->held_timer);
     memset(s->soft, 0, sizeof(s->soft));
     s->masteren = s->l4 ? 3 : 0;
     s->no_pend_val = s->l4 ? 0xFFFFFFFF : 0;
     s->last_irq = 0;
     vic_update(s);
+}
+
+static void vic_held_latch(void *opaque)
+{
+    MsmVicState *s = opaque;
+
+    for (int b = 0; b < 2; b++) {
+        s->latch[b] |= s->held[b] & s->enable[b];
+        s->relatched[b] |= s->held[b] & s->enable[b];
+        s->held[b] &= ~s->enable[b];
+    }
+    vic_update(s);
+}
+
+/* qom-get .../watch-log: the watched line's recent events, oldest first */
+static char *vic_get_wlog(Object *obj, Error **errp)
+{
+    MsmVicState *s = MSM_VIC(obj);
+    GString *g = g_string_new(NULL);
+    unsigned n = MIN(s->wlog_n, ARRAY_SIZE(s->wlog));
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    for (unsigned k = s->wlog_n - n; k != s->wlog_n; k++) {
+        unsigned i = k % ARRAY_SIZE(s->wlog);
+
+        g_string_append_printf(g, "%c%u@-%.6f/%x", s->wlog[i].kind,
+                               s->wlog[i].arg,
+                               (now - s->wlog[i].ns) / 1e9, s->wlog[i].pc);
+        if (s->wlog[i].rep > 1) {
+            g_string_append_printf(g, "x%u", s->wlog[i].rep);
+        }
+        g_string_append_c(g, ' ');
+    }
+    g_string_append_printf(g, "(%u events)", s->wlog_n);
+    return g_string_free(g, false);
 }
 
 static void vic_init(Object *obj)
@@ -244,6 +377,8 @@ static void vic_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     memory_region_init_io(&s->iomem, obj, &vic_ops, s, "msm-vic", 0x1000);
+    object_property_add_str(obj, "watch-log", vic_get_wlog, NULL);
+    s->held_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vic_held_latch, s);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->fiq);
@@ -253,6 +388,9 @@ static void vic_init(Object *obj)
 static const Property vic_props[] = {
     DEFINE_PROP_BOOL("l4", MsmVicState, l4, false),
     DEFINE_PROP_BOOL("trace", MsmVicState, trace, false),
+    DEFINE_PROP_INT32("watch", MsmVicState, watch, -1),
+    DEFINE_PROP_UINT32("redeliver-lo", MsmVicState, redeliver[0], 0),
+    DEFINE_PROP_UINT32("redeliver-hi", MsmVicState, redeliver[1], 0),
 };
 
 static void vic_class_init(ObjectClass *oc, const void *data)

@@ -2,6 +2,7 @@
 """PSNR of decoded encoder output (yuv420p 176x144) against the venc-test-pattern picture."""
 import sys, math
 w, h = 176, 144
+OFF = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 d = open(sys.argv[1], 'rb').read()
 fs = w * h * 3 // 2
 n = len(d) // fs
@@ -18,5 +19,5 @@ def psnr(a, b):
     return 99 if m == 0 else 10 * math.log10(255 * 255 / m)
 for k in range(n):
     Y = d[k * fs:k * fs + w * h]
-    best = max(range(0, 40), key=lambda f: psnr(Y, pat(f)) if abs(f - k) < 6 else -1)
+    best = max(range(0, 400), key=lambda f: psnr(Y, pat(f)) if abs(f - k - OFF) < 6 else -1)
     print(k, 'best pattern frame', best, 'PSNR %.1f' % psnr(Y, pat(best)))

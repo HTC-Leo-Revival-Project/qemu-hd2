@@ -88,7 +88,7 @@ static uint64_t mdp_read(void *opaque, hwaddr off, unsigned size)
     case MDP_INTR_STATUS:
         return s->intr_status;
     case MDP_HW_VERSION:
-        return 0x03010000;
+        return 0x03010301;     /* MDP 3.1, what qdi.dll requires */
     case MDP_PPP_SCALE_STATUS:
     case MDP_PPP_BLEND_STATUS:
         return 0;

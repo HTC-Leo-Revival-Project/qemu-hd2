@@ -36,6 +36,7 @@
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
+#include "net/net.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
@@ -469,6 +470,8 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->vic = qdev_new(TYPE_MSM_VIC);
     qdev_prop_set_bit(s->vic, "l4", true);
     qdev_prop_set_bit(s->vic, "trace", s->trace);
+    /* the apps doorbells, lines 56-63 (msm_vic.c) */
+    qdev_prop_set_uint32(s->vic, "redeliver-hi", 0xff000000);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->vic), &error_fatal);
     memory_region_add_subregion(&s->mem, MODEM_VIC_PHYS,
                     sysbus_mmio_get_region(SYS_BUS_DEVICE(s->vic), 0));
@@ -521,15 +524,25 @@ static void lle_realize(DeviceState *dev, Error **errp)
 
     s->mdsp = qdev_new(TYPE_MSM_MDSP);
     object_property_add_child(OBJECT(dev), "mdsp", OBJECT(s->mdsp));
+    /* GPRS data goes to -nic ...,model=msm-modem (the HLE modem's) */
+    qemu_configure_nic_device(s->mdsp, false, "msm-modem");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mdsp), &error_fatal);
     memory_region_add_subregion(&s->mem, MODEM_MDSP_PHYS,
                     sysbus_mmio_get_region(SYS_BUS_DEVICE(s->mdsp), 0));
     sysbus_connect_irq(SYS_BUS_DEVICE(s->mdsp), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_MDSP));
 
+    /* the HDLC accelerator, for PPP over packet data calls */
+    lle_private_device(s, TYPE_MSM_HDLC, 0xB8100000);
+
     s->gstmr = lle_private_device(s, TYPE_MSM_GSTMR, MODEM_GSTMR_PHYS);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->gstmr), 0,
                        qdev_get_gpio_in(s->vic, MIRQ_GSTMR));
+    for (int i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(s->gstmr, "frame", i,
+                                    qdev_get_gpio_in_named(s->mdsp, "frame",
+                                                           i));
+    }
 
     s->wstmr = lle_private_device(s, TYPE_MSM_WSTMR, MODEM_WSTMR_PHYS);
     for (int i = 0; i < 3; i++) {

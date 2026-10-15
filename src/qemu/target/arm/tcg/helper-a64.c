@@ -632,6 +632,8 @@ void HELPER(exception_return)(CPUARMState *env, uint64_t new_pc)
     aarch64_save_sp(env, cur_el);
 
     arm_clear_exclusive(env);
+    /* an exception return sets the Event Register (see cpsr_write_eret) */
+    qatomic_set(&env->event_register, true);
 
     /* We must squash the PSTATE.SS bit to zero unless both of the
      * following hold:
