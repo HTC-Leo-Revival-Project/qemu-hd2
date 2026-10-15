@@ -3,7 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { IMAGES, QEMU_ARM, QEMU_BUILD, QEMU_HEXAGON, SOCK } from "./paths.ts";
+import { IMAGES, QEMU_ARM, QEMU_BUILD, QEMU_HEXAGON, QEMU_PCBIOS, QEMU_PCBIOS_BUILD, SOCK } from "./paths.ts";
 import { nandOs } from "./config.ts";
 import { Qmp } from "./qmp.ts";
 import { VncClient } from "./vnc.ts";
@@ -192,7 +192,9 @@ export class Emulator extends EventEmitter {
 
     let machine = "htcleo";
     if (cfg.baseband === "lle") machine += ",baseband=lle,baseband-firmware=amss.elf,baseband-trace=off";
+    if (cfg.usb === "lle") machine += ",usb-host=lle";
     const args = [
+      "-L", QEMU_PCBIOS, "-L", QEMU_PCBIOS_BUILD,
       "-M", machine,
       "-drive", `if=mtd,format=raw,file=${cfg.nand}`,
       "-display", "none",
@@ -202,8 +204,13 @@ export class Emulator extends EventEmitter {
       "-qmp", `unix:${SOCK.webqmp},server,nowait`,
       "-audiodev", `${backend},id=snd0`, "-global", "msm-modem.audiodev=snd0",
       "-global", `msm-adreno.backend=${cfg.gpu}`,
-      "-chardev", `socket,id=adb,host=127.0.0.1,port=${cfg.adbPort},server=on,wait=off`, "-global", "msm-hsusb.adb=adb",
     ];
+    // usb=lle puts the gadget on the host's own stack, so the phone reaches
+    // this machine's adb directly; the TCP bridge would be a second, private
+    // host for the same endpoint and the two cannot both drive it.
+    if (cfg.usb !== "lle") {
+      args.push("-chardev", `socket,id=adb,host=127.0.0.1,port=${cfg.adbPort},server=on,wait=off`, "-global", "msm-hsusb.adb=adb");
+    }
     let debug = "unimp,guest_errors";
     if (cfg.baseband === "lle" && cfg.amssLog) {
       args.push("-plugin", `${QEMU_BUILD}/contrib/plugins/libamsslog.so,msg=0x526604,msg=0xc55d88,msg=0xc57028`);
@@ -234,6 +241,7 @@ export class Emulator extends EventEmitter {
     if (dsp) {
       if (!(await waitFor(SOCK.q6link, 6000))) throw new Error("The DSP link socket did not appear");
       const q6 = [
+        "-L", QEMU_PCBIOS, "-L", QEMU_PCBIOS_BUILD,
         "-M", `htcleo-q6,link=q6link,apps-irq=11,modem-irq=2,trace=off`,
         "-kernel", "dsp1.elf",
         "-icount", `shift=${cfg.dspShift < 0 ? "auto" : cfg.dspShift}`,

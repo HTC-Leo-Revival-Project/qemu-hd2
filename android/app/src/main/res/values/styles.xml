@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Holo, not Material.  @android:style/Theme.Holo has been in the platform
+      since Android 4.0 (API 14) and still renders the old action bar, its
+      overflow menu and the Holo spinner on Android 16/17.  The widgets that
+      changed under it over the years (switch, dialog, text field) are drawn
+      by Holo.java instead, so they look like 4.0 everywhere.
+    -->
+    <style name="Holo" parent="@android:style/Theme.Holo">
+        <item name="android:windowBackground">@drawable/holo_window_bg</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:colorAccent">@color/holo_blue</item>
+        <item name="android:textColorHighlight">@color/holo_blue_glow</item>
+        <item name="android:actionBarStyle">@style/HoloActionBar</item>
+        <item name="android:actionBarSize">52dp</item>
+        <item name="android:actionBarTabTextStyle">@style/HoloTabText</item>
+        <item name="android:alertDialogTheme">@style/HoloAlertDialog</item>
+    </style>
+
+    <style name="HoloActionBar" parent="@android:style/Widget.Holo.ActionBar.Solid">
+        <item name="android:background">@drawable/holo_actionbar</item>
+        <item name="android:backgroundStacked">@drawable/holo_actionbar_plain</item>
+        <item name="android:backgroundSplit">@drawable/holo_keybar</item>
+        <item name="android:titleTextStyle">@style/HoloTitle</item>
+        <item name="android:subtitleTextStyle">@style/HoloSubtitle</item>
+    </style>
+
+    <style name="HoloTitle" parent="@android:style/TextAppearance.Holo.Widget.ActionBar.Title">
+        <item name="android:textColor">@color/holo_text</item>
+        <item name="android:textSize">18sp</item>
+    </style>
+
+    <style name="HoloSubtitle" parent="@android:style/TextAppearance.Holo.Widget.ActionBar.Subtitle">
+        <item name="android:textColor">@color/holo_text_2</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+
+    <style name="HoloTabText" parent="@android:style/Widget.Holo.ActionBar.TabText">
+        <item name="android:textColor">@color/holo_text</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textAllCaps">true</item>
+    </style>
+
+    <style name="HoloAlertDialog" parent="@android:style/Theme.Holo.Dialog">
+        <item name="android:windowBackground">@drawable/holo_dialog_bg</item>
+    </style>
+</resources>

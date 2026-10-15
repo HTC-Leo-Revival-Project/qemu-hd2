@@ -1010,6 +1010,33 @@ int qemu_shm_alloc(size_t size, Error **errp)
     g_string_printf(shm_name, "/qemu-" FMT_pid "-shm-%d", getpid(),
                     cur_sequence);
 
+#ifdef __ANDROID__
+    /*
+     * Android's libc has no POSIX shared memory at all, and the memfd
+     * syscall is one an app is not allowed to make, so there we open a file
+     * of our own and unlink it right away: same anonymous file, on the
+     * filesystem the app already owns.
+     */
+    {
+        const char *dir = getenv("XDG_RUNTIME_DIR");
+
+        if (!dir) {
+            dir = getenv("TMPDIR");
+        }
+        if (!dir || !*dir) {
+            dir = "/data/local/tmp";
+        }
+        g_string_printf(shm_name, "%s/qemu-" FMT_pid "-shm-%d", dir, getpid(),
+                        cur_sequence);
+        fd = open(shm_name->str, oflag, mode);
+        if (fd < 0) {
+            error_setg_errno(errp, errno,
+                             "failed to create shared memory in %s", dir);
+            return -1;
+        }
+        unlink(shm_name->str);
+    }
+#else
     fd = shm_open(shm_name->str, oflag, mode);
     if (fd < 0) {
         error_setg_errno(errp, errno,
@@ -1023,6 +1050,7 @@ int qemu_shm_alloc(size_t size, Error **errp)
      * there are file descriptors pointing to it.
      */
     shm_unlink(shm_name->str);
+#endif
 
     if (ftruncate(fd, size) == -1) {
         error_setg_errno(errp, errno,

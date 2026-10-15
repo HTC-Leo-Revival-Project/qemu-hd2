@@ -8,16 +8,23 @@
 #   BASEBAND=lle runs the real AMSS (amss.elf) on the modem core; TRACE=on
 #   logs its peripheral accesses to qemu.log, AMSSLOG=1 its debug messages
 #   (contrib/plugins/amsslog.c; AMSSLOG="hook=0x... ..." adds hooks).
+#   USB=lle hands the gadget to this machine's own USB stack instead: the
+#   emulated HD2 turns up in lsusb and dmesg, and the host's adb and fastboot
+#   talk to it directly.  It needs root and vhci_hcd, so use
+#   tools/start-usb-lle.sh, which comes back through sudo.
 #   (adb: adb connect 127.0.0.1:5555)
 cd "$(dirname "$0")/../images" || exit 1
 rm -f qmp.sock ramcon.log qemu.log
 SD=; [ -f "${SDCARD:-sdcard.img}" ] && SD="-drive if=sd,format=raw,file=${SDCARD:-sdcard.img}"
 # WiFi and mobile data each get a user-mode network (real internet)
 NET="-nic user,model=bcm4329 -nic user,model=msm-modem,net=10.0.3.0/24"
-ADB="-chardev socket,id=adb,host=127.0.0.1,port=${ADB_PORT:-5555},server=on,wait=off -global msm-hsusb.adb=adb"
+# USB=lle is the other end of the cable: the host kernel, not this chardev
+ADB=
+[ "$USB" != lle ] && ADB="-chardev socket,id=adb,host=127.0.0.1,port=${ADB_PORT:-5555},server=on,wait=off -global msm-hsusb.adb=adb"
 M=htcleo
 D=${QEMU_D:-unimp,guest_errors} PLUGIN=
-[ "$BASEBAND" = lle ] && M="htcleo,baseband=lle,baseband-firmware=${AMSS:-amss.elf},baseband-trace=${TRACE:-off}"
+[ "$BASEBAND" = lle ] && M="$M,baseband=lle,baseband-firmware=${AMSS:-amss.elf},baseband-trace=${TRACE:-off}"
+[ "$USB" = lle ] && M="$M,usb-host=lle"
 if [ -n "$AMSSLOG" ]; then
   # AMSS 2.15.50.14's msg_send entry points
   P="../src/qemu/build/contrib/plugins/libamsslog.so,msg=0x526604,msg=0xc55d88,msg=0xc57028"

@@ -1,0 +1,311 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">HTC HD2</string>
+    <string name="settings">Settings</string>
+    <string name="sensors">Sensors</string>
+    <string name="logs">Logs</string>
+    <string name="nand_builder">NAND builder</string>
+
+    <!-- main screen -->
+    <string name="power_on">Power on</string>
+    <string name="shut_down">Shut down</string>
+    <string name="restart">Restart QEMU</string>
+    <string name="reset_board">Reset board</string>
+    <string name="screenshot">Screenshot</string>
+    <string name="view_logs">View logs</string>
+    <string name="key_call">Call</string>
+    <string name="key_home">Home</string>
+    <string name="key_menu">Windows</string>
+    <string name="key_back">Back</string>
+    <string name="key_end">End</string>
+    <string name="key_power">Power</string>
+    <string name="key_volup">Volume up</string>
+    <string name="key_voldown">Volume down</string>
+
+    <string name="state_stopped">Powered off</string>
+    <string name="state_starting">Starting</string>
+    <string name="state_running">Running</string>
+    <string name="state_stopping">Shutting down</string>
+    <string name="state_crashed">Stopped with an error</string>
+    <string name="powered_off_blurb">It boots whatever is in its NAND image, the way the phone would.</string>
+    <string name="starting_blurb">QEMU is bringing up the htcleo machine.</string>
+    <string name="stopping_blurb">Waiting for QEMU to quit.</string>
+    <string name="crashed_blurb">The emulator log says why.</string>
+
+    <string name="menu_settings">Settings</string>
+    <string name="menu_sensors">Sensors</string>
+    <string name="menu_logs">Logs</string>
+    <string name="menu_nand">Build a NAND image</string>
+    <string name="menu_about">About</string>
+    <string name="menu_images">Images</string>
+    <string name="menu_root">Root &amp; USB</string>
+
+    <string name="nok">OK</string>
+    <string name="cancel">Cancel</string>
+    <string name="close">Close</string>
+    <string name="run">Run</string>
+    <string name="stop">Stop</string>
+    <string name="no_picture">There is no picture yet</string>
+    <string name="saved">Saved to %s</string>
+    <string name="imported">%s is now in the app\'s images folder</string>
+    <string name="build_nand">Build the NAND image</string>
+    <string name="preparing">Preparing…</string>
+    <string name="importing">Copying %s…</string>
+    <string name="adding_image">Adding an image</string>
+    <string name="nand_needs_sources">Pick a cLK bootloader (LEOIMG.nbh or lk.bin) and a NAND Android ROM zip first.</string>
+    <string name="nand_needs_magldr">Pick magldr.nbh (MAGLDR 1.13) first.</string>
+    <string name="nand_needs_ruu">Pick the stock Windows Mobile ROM (RUU_signed.nbh) first.</string>
+    <string name="nand_done">%s is built and in the app\'s images folder</string>
+
+    <!-- the ICS switch -->
+    <string name="switch_on">ON</string>
+    <string name="switch_off">OFF</string>
+
+    <!-- main screen -->
+    <string name="about_text">HTC HD2 (Qualcomm QSD8250, Scorpion) on QEMU\'s htcleo machine.\n\nThe picture comes from QEMU\'s VNC server on a socket inside this app\'s own directory, the keys and taps go back through QMP, and the sound is the VNC audio extension played by AudioTrack.\n\nWith a keyboard: F2 call, Home, F1 Windows, Esc back, F3 end, F12 power, Page Up / Page Down volume.\n\nNo Material anywhere: Theme.Holo, hand-drawn Holo widgets, and a framework-only build with no dependencies at all.</string>
+    <string name="uptime_h">%1$d h %2$d min</string>
+    <string name="uptime_m">%1$d min %2$d s</string>
+    <string name="uptime_s">%1$d s</string>
+    <string name="fps">%1$d fps</string>
+    <string name="gallery_refused">The gallery would not take it</string>
+
+    <!-- settings -->
+    <string name="set_running_banner">The emulator is running: changes here apply the next time it starts.</string>
+    <string name="set_cat_processors">Processors</string>
+    <string name="set_baseband">Baseband (modem core)</string>
+    <string name="set_baseband_hle">Modelled (HLE)</string>
+    <string name="set_baseband_lle">Real AMSS firmware (LLE)</string>
+    <string name="set_baseband_hle_sum">Fast. Network registration, data, SMS and GPS fixes work.</string>
+    <string name="set_baseband_lle_sum">The radio ROM\'s own ARM9 code. No network signal.</string>
+    <string name="set_needs_amss">Needs amss.elf: taken from the NAND image\'s radio at start, or added in Images</string>
+    <string name="set_dsp">QDSP6 (multimedia DSP)</string>
+    <string name="set_dsp_off">Not running</string>
+    <string name="set_dsp_lle">Real DSP1 firmware (LLE)</string>
+    <string name="set_dsp_off_sum">Codecs and audio fall back to software</string>
+    <string name="set_dsp_lle_sum">QDSP6 in a second process: H.264 decode, MPEG-4 encode, audio</string>
+    <string name="set_needs_dsp1">Needs dsp1.elf: taken from the NAND image\'s radio at start, or added in Images</string>
+    <string name="set_dsp_note">The DSP firmware runs on top of the real baseband.</string>
+    <string name="set_dsp_clock">DSP clock (icount shift)</string>
+    <string name="set_auto">auto</string>
+    <string name="set_shift_auto_sum">QEMU adjusts the shift to follow real time</string>
+    <string name="set_shift_0_sum">1 ns per instruction</string>
+    <string name="set_shift_1_sum">the default</string>
+    <string name="set_cat_images">Images</string>
+    <string name="set_nand">NAND flash</string>
+    <string name="set_not_in_folder">%1$s (not in the app\'s images folder)</string>
+    <string name="set_missing">missing</string>
+    <string name="set_sdcard">microSD card</string>
+    <string name="set_none">None</string>
+    <string name="set_manage_images">Manage images…</string>
+    <string name="set_manage_images_sum">Use, delete or add images, and take the radio firmware out of one</string>
+    <string name="set_add_image">Add an image…</string>
+    <string name="set_add_image_sum">Copy a NAND or microSD image into the app\'s own storage</string>
+    <string name="set_cat_graphics">Graphics and sound</string>
+    <string name="set_renderer">Adreno 200 renderer</string>
+    <string name="set_renderer_soft">Software</string>
+    <string name="set_renderer_gles">This phone\'s GPU</string>
+    <string name="set_renderer_soft_sum">Everything on the CPU</string>
+    <string name="set_renderer_gles_sum">The Adreno 200 runs on this phone\'s own GPU through OpenGL ES 3</string>
+    <string name="set_gpu_threads">GPU threads</string>
+    <string name="set_one_thread">1 thread</string>
+    <string name="set_threads">%1$d threads</string>
+    <string name="set_gles_note">The host GPU is asked for an OpenGL ES 3 context and checked for what the renderer needs; the answer is in the emulator log. Software until the ES renderer lands. GPU threads: 0 leaves it to QEMU.</string>
+    <string name="set_soft_note">GPU threads: 0 leaves the choice to QEMU; more threads make the software renderer faster on a phone with big cores.</string>
+    <string name="set_audio">Audio output</string>
+    <string name="set_audio_phone">This phone</string>
+    <string name="set_audio_muted">Muted</string>
+    <string name="set_audio_phone_sum">QEMU\'s PCM stream played by AudioTrack</string>
+    <string name="set_audio_muted_sum">No sound at all</string>
+    <string name="set_volume">Volume</string>
+    <string name="percent">%1$d%%</string>
+    <string name="set_cat_screen">Screen</string>
+    <string name="set_keep_on">Keep the screen on</string>
+    <string name="set_keep_on_sum">While the emulator runs and its screen is shown</string>
+    <string name="set_cat_network">Network</string>
+    <string name="set_wifi">WiFi</string>
+    <string name="set_wifi_sum">Open network HD2-QEMU, with internet through QEMU</string>
+    <string name="set_mobile_data">Mobile data</string>
+    <string name="set_mobile_data_sum">The modem\'s packet data link</string>
+    <string name="set_adb_port">adb bridge port</string>
+    <string name="set_cat_boot">Boot</string>
+    <string name="set_boot">Boot</string>
+    <string name="set_boot_nand">Boot from NAND</string>
+    <string name="set_boot_recovery">Recovery</string>
+    <string name="set_boot_menu">Stay in the bootloader</string>
+    <string name="set_boot_nand_sum">Picks BOOT FROM NAND in the cLK menu</string>
+    <string name="set_boot_recovery_sum">Picks RECOVERY in the cLK menu</string>
+    <string name="set_boot_menu_sum">No key presses; also for MAGLDR images</string>
+    <string name="set_cat_debugging">Debugging</string>
+    <string name="set_show_fps">Show the frame rate</string>
+    <string name="set_show_fps_sum">Frames per second, over the screen</string>
+    <string name="set_extra_args">Extra QEMU arguments</string>
+    <string name="set_usb_lle_note">USB LLE is not here: it hands the emulated phone to the host\'s own USB stack through vhci_hcd, which needs root that an app can never have.</string>
+
+    <!-- sensors -->
+    <string name="sen_cat_battery">Battery</string>
+    <string name="sen_charge">Charge level</string>
+    <string name="sen_battery_note">The gauge is a 1230 mAh battery: it drains while the phone is up and charges while it is plugged in.</string>
+    <string name="sen_cat_charger">Charger</string>
+    <string name="sen_cable">Cable</string>
+    <string name="sen_usb">USB</string>
+    <string name="sen_ac">AC</string>
+    <string name="sen_nothing">Nothing</string>
+    <string name="sen_usb_sum">A computer\'s USB port</string>
+    <string name="sen_ac_sum">The wall charger</string>
+    <string name="sen_nothing_sum">Running on battery</string>
+    <string name="sen_cat_gps">GPS</string>
+    <string name="sen_position">Set a position</string>
+    <string name="sen_position_sum">Latitude, longitude and altitude, like qom-set /machine/modem gps-fix</string>
+    <string name="sen_gps_note">A fix moves the phone to where you tell it. With the real baseband (LLE) the modem firmware has no GPS, so this is HLE only.</string>
+    <string name="sen_off_note">Start the emulator to change any of this.</string>
+
+    <!-- NAND builder -->
+    <string name="nand_cat_image">Image</string>
+    <string name="nand_kind">Kind</string>
+    <string name="nand_kind_android">Android (cLK)</string>
+    <string name="nand_kind_magldr" translatable="false">MAGLDR</string>
+    <string name="nand_kind_winmo" translatable="false">Windows Mobile 6.5</string>
+    <string name="nand_kind_android_sum">cLK and a NAND Android ROM, as installed from recovery</string>
+    <string name="nand_kind_magldr_sum">MAGLDR 1.13, which boots an OS from the SD card</string>
+    <string name="nand_kind_winmo_sum">A stock RUU: the radio and Windows Mobile in NAND</string>
+    <string name="nand_cat_sources">Sources</string>
+    <string name="nand_magldr" translatable="false">MAGLDR</string>
+    <string name="nand_magldr_hint">magldr.nbh (MAGLDR 1.13)</string>
+    <string name="nand_radio">Radio</string>
+    <string name="nand_radio_hint">Optional: a radio RUU_signed.nbh</string>
+    <string name="nand_magldr_note">MAGLDR restarts the radio from NAND before it boots an OS from the SD card, so add one: its partitions go in the first blocks, as hd2_radio.py --write-nand puts them.</string>
+    <string name="nand_cat_output">Output</string>
+    <string name="nand_output">Output file</string>
+    <string name="nand_cat_phone">Phone</string>
+    <string name="nand_wifi_mac">WiFi MAC</string>
+    <string name="nand_bt_mac">Bluetooth MAC</string>
+    <string name="nand_stock_rom">Stock ROM</string>
+    <string name="nand_stock_rom_hint">The Windows Mobile RUU_signed.nbh</string>
+    <string name="nand_radio_stock_hint">Optional: the radio in the stock ROM by default</string>
+    <string name="nand_winmo_note">A stock RUU carries its own radio, so it is all this needs; pick a radio NBH to use another one instead.</string>
+    <string name="nand_clk">cLK bootloader</string>
+    <string name="nand_clk_hint">LEOIMG.nbh, or a raw lk.bin</string>
+    <string name="nand_rom">Android ROM zip</string>
+    <string name="nand_rom_hint">A NAND ROM: it needs kernel/, system/, data/ and mods/clk-ppp-patch/</string>
+    <string name="nand_recovery">Recovery image</string>
+    <string name="nand_optional">Optional</string>
+    <string name="nand_sd_note">An SD install zip does not work here: cLK installs from NAND only.</string>
+    <string name="nand_cat_layout">Layout</string>
+    <string name="nand_system">System partition</string>
+    <string name="nand_cache">Cache partition</string>
+    <string name="nand_mib">%1$d MiB</string>
+    <string name="nand_softkeys">Soft buttons</string>
+    <string name="nand_softkeys_sum">qemu.hw.mainkeys=0: the on-screen bar, like the phone</string>
+    <string name="nand_gpu">Emulated Adreno 200</string>
+    <string name="nand_gpu_sum">Let the ROM use its own GPU libraries (slower, but real)</string>
+    <string name="nand_no_room">There is not enough room: the image takes %1$s and %2$s is free.</string>
+
+    <!-- logs -->
+    <string name="logs_share">Share</string>
+    <string name="logs_share_subject">HTC HD2 emulator: %1$s</string>
+    <string name="logs_share_title">Share the %1$s log</string>
+    <string name="logs_nothing_yet">%1$s: nothing yet</string>
+    <string name="logs_monitor_help">QEMU\'s monitor (human-monitor-command), e.g.\n  info cpus\n  info registers\n  info status\n  screendump /sdcard/shot.ppm\n  stop / cont</string>
+    <string name="logs_adb_help">The emulator\'s adb bridge, on 127.0.0.1:%1$d\n\nNothing from the guest until its adbd starts, which is some minutes into the boot.  Then, for example:\n  logcat -v time\n  getprop ro.build.version.release\n  ls /system/app</string>
+    <string name="logs_adb_no_guest">The emulator is not running, or its adb bridge has no guest yet.</string>
+
+    <!-- images -->
+    <string name="img_cat_folder">In the images folder</string>
+    <string name="img_empty">Nothing yet. Add a NAND image, or build one with Build a NAND image.</string>
+    <string name="img_add_sum">Copy a NAND image, a microSD image or firmware into the app\'s storage</string>
+    <string name="img_free">%1$s free on this phone. A NAND image is 528 MB.</string>
+    <string name="img_cat_radio">Radio firmware</string>
+    <string name="img_radio_note">The real baseband (LLE) runs amss.elf and the real DSP runs dsp1.elf.</string>
+    <string name="img_amss_here">amss.elf is here.</string>
+    <string name="img_amss_missing">amss.elf is missing.</string>
+    <string name="img_dsp_here">dsp1.elf is here.</string>
+    <string name="img_dsp_missing">dsp1.elf is missing.</string>
+    <string name="img_from_nand">From the NAND image</string>
+    <string name="img_from_nand_sum">%1$s: the radio that was flashed into it, as a stock ROM or MAGLDR with a radio has it</string>
+    <string name="img_from_nbh">From a radio NBH…</string>
+    <string name="img_from_nbh_sum">A radio RUU_signed.nbh, as tools/hd2_radio.py reads it</string>
+    <string name="img_role_nand">NAND flash</string>
+    <string name="img_role_nand_running">NAND flash, running</string>
+    <string name="img_role_sd">microSD card</string>
+    <string name="img_role_sd_running">microSD card, in the phone</string>
+    <string name="img_role_amss">baseband firmware (AMSS)</string>
+    <string name="img_role_dsp">DSP firmware (QDSP6)</string>
+    <string name="img_role_sd_image">microSD image</string>
+    <string name="img_role_nand_image">NAND image</string>
+    <string name="img_role_file">file</string>
+    <string name="img_use_nand">Use as the NAND flash</string>
+    <string name="img_use_sd">Use as the microSD card</string>
+    <string name="img_delete">Delete</string>
+    <string name="img_now_nand">%1$s is the NAND flash from the next start</string>
+    <string name="img_now_sd">%1$s is the microSD card from the next start</string>
+    <string name="img_is_nand">This is the NAND flash: pick another NAND image first.</string>
+    <string name="img_in_use">The emulator is running on this file. Shut it down first.</string>
+    <string name="img_delete_title">Delete %1$s?</string>
+    <string name="img_delete_text">%1$s. It cannot be brought back.</string>
+    <string name="img_delete_failed">Could not delete %1$s</string>
+    <string name="img_not_in_folder">%1$s is not in the images folder.</string>
+    <string name="img_reading">Reading %1$s…</string>
+    <string name="img_no_dsp">No DSP firmware after it.</string>
+    <string name="img_taken_from">Taken from %1$s:\n\n%2$s</string>
+
+    <!-- root and USB -->
+    <string name="root_cat_access">Root access</string>
+    <string name="root_title">Root</string>
+    <string name="root_granted">Granted</string>
+    <string name="root_denied">Denied. Allow the app in your root manager, then tap to try again.</string>
+    <string name="root_absent">No su on this phone: the root features need Magisk, KernelSU or APatch.</string>
+    <string name="root_not_asked">Not asked yet. Tap to ask for root access.</string>
+    <string name="root_hidden">No su found, but a root manager may hide it. Tap to ask anyway.</string>
+    <string name="root_never_needed">The app never needs root to run the emulator; only the features below do.</string>
+    <string name="root_cat_usb">USB passthrough</string>
+    <string name="root_usb_needs_root">With root, this lists what this phone\'s kernel offers for handing the emulated HD2\'s USB to real USB.</string>
+    <string name="root_check_failed">The check failed: %1$s</string>
+    <string name="root_looking">Looking…</string>
+    <string name="root_not_checked">Not checked yet.</string>
+    <string name="root_check_again">Check again</string>
+    <string name="root_check_again_sum">Look at the kernel\'s USB support once more</string>
+    <string name="root_cat_features">Root features</string>
+    <string name="root_gadget">Expose the HD2 to a PC</string>
+    <string name="root_gadget_sum">Through this phone\'s USB port, so a PC\'s flash tools, adb and fastboot see a real HTC HD2</string>
+    <string name="root_gadget_needs">configfs, FunctionFS and a USB device controller</string>
+    <string name="root_host">Attach the HD2 to this phone</string>
+    <string name="root_host_sum">On this phone\'s own USB stack through vhci_hcd, for adb and fastboot in a terminal</string>
+    <string name="root_host_needs">vhci_hcd in the kernel</string>
+    <string name="root_planned_note">Both are planned and not switched on yet. The gadget bridge needs the emulator to hand its USB/IP stream (what usb-host=lle gives vhci_hcd on a PC) to the app, which then serves it through FunctionFS.</string>
+    <string name="root_later">Coming later</string>
+    <string name="root_later_ready">Coming later · this phone has what it needs</string>
+    <string name="root_later_lacks">Coming later · this phone lacks %1$s</string>
+    <string name="root_waiting">Waiting for the root manager…</string>
+    <string name="usb_configfs">USB gadget configfs</string>
+    <string name="usb_configfs_no">No /config/usb_gadget: this kernel drives its USB port the old way (android_usb)</string>
+    <string name="usb_ffs_yes">A gadget can have its descriptors and endpoints served from user space</string>
+    <string name="usb_ffs_no">Not in /proc/filesystems</string>
+    <string name="usb_udc">USB device controller</string>
+    <string name="usb_udc_free">%1$s, free</string>
+    <string name="usb_udc_busy">%1$s, in use by the phone\'s own gadget</string>
+    <string name="usb_udc_no">No UDC in /sys/class/udc</string>
+    <string name="usb_raw_yes">/dev/raw-gadget: a simpler way to drive the UDC than FunctionFS</string>
+    <string name="usb_raw_no">Not built (optional: FunctionFS does the same job)</string>
+    <string name="usb_vhci_yes">The HD2 could be attached to this phone\'s own USB stack</string>
+    <string name="usb_vhci_no">Not built: the HD2 cannot be attached to this phone itself</string>
+    <string name="usb_unknown">unknown</string>
+    <string name="usb_selinux_enforcing">%1$s: the bridge will need a policy rule for the emulator\'s socket</string>
+
+    <!-- the emulator\'s own messages -->
+    <string name="emu_already_running">The emulator is already running</string>
+    <string name="emu_launching">Launching QEMU</string>
+    <string name="emu_nand_missing">%1$s is not in the app\'s images folder</string>
+    <string name="emu_amss_missing">amss.elf is missing (unpack it from the radio ROM)</string>
+    <string name="emu_dsp_missing">dsp1.elf is missing (unpack it from the radio ROM)</string>
+    <string name="emu_keymaps_missing">The VNC keymaps are missing from the APK</string>
+    <string name="emu_no_monitor">QEMU did not open its monitor:\n%1$s</string>
+    <string name="emu_powered_off_by_qemu">QEMU powered the phone off</string>
+    <string name="emu_taking_firmware">Taking the radio firmware out of %1$s</string>
+    <string name="emu_firmware_failed">%1$s is missing, and %2$s\n\nAdd it in Images, Radio firmware: from a radio NBH.</string>
+    <string name="emu_no_picture">No picture: %1$s</string>
+    <string name="emu_powered_off">The emulator powered off</string>
+    <string name="emu_exit_code">QEMU stopped (exit code %1$d)\n%2$s</string>
+    <string name="emu_not_running">The emulator is not running</string>
+    <string name="emu_gps_hle_only">GPS fixes come from the modelled baseband (HLE mode)</string>
+    <string name="channel_description">The emulated HTC HD2</string>
+</resources>

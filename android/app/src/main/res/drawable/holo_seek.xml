@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The holo scrubber: a 3dp rail across the middle of the bar, blue up to the
+  thumb.  Widget.Holo.SeekBar is 13dp tall; the insets leave the rail in the
+  middle of it, where the platform nine-patch drew it.
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background" android:top="5dp" android:bottom="5dp">
+        <shape android:shape="rectangle">
+            <solid android:color="#40ffffff" />
+        </shape>
+    </item>
+    <item android:id="@android:id/secondaryProgress" android:top="5dp" android:bottom="5dp">
+        <clip>
+            <shape android:shape="rectangle">
+                <solid android:color="#4d33b5e5" />
+            </shape>
+        </clip>
+    </item>
+    <item android:id="@android:id/progress" android:top="5dp" android:bottom="5dp">
+        <clip>
+            <shape android:shape="rectangle">
+                <solid android:color="@color/holo_blue" />
+            </shape>
+        </clip>
+    </item>
+</layer-list>

@@ -9,6 +9,10 @@ export const IMAGES = path.join(ROOT, "images");
 export const QEMU_BUILD = path.join(ROOT, "src", "qemu", "build");
 export const QEMU_ARM = path.join(QEMU_BUILD, "qemu-system-arm");
 export const QEMU_HEXAGON = path.join(QEMU_BUILD, "qemu-system-hexagon");
+/* QEMU's data dir: the keymaps VNC needs live only in the source tree, and
+   the tree is never `ninja install`ed, so both are passed with -L */
+export const QEMU_PCBIOS = path.join(ROOT, "src", "qemu", "pc-bios");
+export const QEMU_PCBIOS_BUILD = path.join(QEMU_BUILD, "pc-bios");
 export const CONFIG_FILE = path.join(WEB_DIR, ".emulator.json");
 
 export const SOCK = {

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The ICS dialog panel: a flat dark sheet with a hairline edge.  The window
+  behind it is transparent (Holo.Box), so this is all there is of it.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <corners android:radius="2dp" />
+    <solid android:color="@color/holo_dialog" />
+    <stroke android:width="1dp" android:color="#ff3a3a3a" />
+</shape>

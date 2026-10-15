@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The scrubber's handle: a small solid blue dot that grows a soft blue halo
+  while it is being dragged, like scrubber_control_holo.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android" android:exitFadeDuration="150">
+    <item android:state_pressed="true">
+        <layer-list>
+            <item>
+                <shape android:shape="oval">
+                    <size android:width="30dp" android:height="30dp" />
+                    <solid android:color="@color/holo_blue_glow" />
+                </shape>
+            </item>
+            <item android:left="9dp" android:top="9dp" android:right="9dp" android:bottom="9dp">
+                <shape android:shape="oval">
+                    <solid android:color="@color/holo_blue" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+    <item>
+        <layer-list>
+            <item>
+                <shape android:shape="oval">
+                    <size android:width="30dp" android:height="30dp" />
+                    <solid android:color="@android:color/transparent" />
+                </shape>
+            </item>
+            <item android:left="9dp" android:top="9dp" android:right="9dp" android:bottom="9dp">
+                <shape android:shape="oval">
+                    <solid android:color="@color/holo_blue" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+</selector>

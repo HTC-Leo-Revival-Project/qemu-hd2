@@ -12,10 +12,17 @@
 /firmware/
 /toolchains/
 /build-tmp/
+/build/
 *.log
 *.ppm
 qmp.sock
-
+# root-only, so it cannot swallow a source file like ImagesActivity.java
+# (it did on a case-insensitive filesystem)
+/images*
 # Built recovery tool
 /tools/recovery/hd2nanddump
 __pycache__/
+android/app/build
+android/build
+android/.gradle
+android/local.properties

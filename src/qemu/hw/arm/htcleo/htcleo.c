@@ -111,6 +111,7 @@ struct HtcleoMachineState {
     bool q6_lle;                /* the QDSP6 runs its firmware (qdsp6=lle) */
     char *q6_link_id;           /* chardev to the qemu-system-hexagon one */
     DeviceState *q6_link;
+    bool usb_lle;               /* the gadget goes on this host's bus (usb=lle) */
     CPUClusterState apps_cluster;
     DeviceState *lle;
     gchar *fw_data;             /* -bios image, copied to RAM on reset */
@@ -1117,6 +1118,10 @@ static void htcleo_init(MachineState *machine)
     htcleo_regfile("msm-sdc4", MSM_SDC4_PHYS, 0x1000);
     dev = qdev_new(TYPE_MSM_HSUSB);
     sbd = SYS_BUS_DEVICE(dev);
+    /* usb=lle: the gadget is exposed to this machine through vhci_hcd */
+    if (s->usb_lle) {
+        qdev_prop_set_string(dev, "mode", "lle");
+    }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, MSM_HSUSB_PHYS);
     sysbus_connect_irq(sbd, 0, vic_in[INT_USB_HS]);
@@ -1266,6 +1271,24 @@ static void htcleo_set_modem_trace(Object *obj, bool v, Error **errp)
     HTCLEO_MACHINE(obj)->modem_trace = v;
 }
 
+static char *htcleo_get_usb(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_MACHINE(obj)->usb_lle ? "lle" : "hle");
+}
+
+static void htcleo_set_usb(Object *obj, const char *v, Error **errp)
+{
+    HtcleoMachineState *s = HTCLEO_MACHINE(obj);
+
+    if (!strcmp(v, "lle")) {
+        s->usb_lle = true;
+    } else if (!strcmp(v, "hle")) {
+        s->usb_lle = false;
+    } else {
+        error_setg(errp, "usb must be 'hle' or 'lle'");
+    }
+}
+
 static char *htcleo_get_q6(Object *obj, Error **errp)
 {
     return g_strdup(HTCLEO_MACHINE(obj)->q6_lle ? "lle" : "hle");
@@ -1325,6 +1348,13 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "qdsp6",
         "hle: the multimedia DSP's DAL services modelled (default); lle: its "
         "firmware runs in qemu-system-hexagon -M htcleo-q6 (see qdsp6-link)");
+    object_class_property_add_str(oc, "usb-host", htcleo_get_usb,
+                                  htcleo_set_usb);
+    object_class_property_set_description(oc, "usb-host",
+        "who plays USB host: hle (built in, adb is bridged to TCP, the "
+        "default) or lle (this machine's own stack enumerates the emulated "
+        "gadget over vhci_hcd, so lsusb/adb/fastboot see a real device; "
+        "needs root and vhci_hcd)");
     object_class_property_add_str(oc, "qdsp6-link", htcleo_get_q6_link,
                                   htcleo_set_q6_link);
     object_class_property_add_str(oc, "baseband-firmware", htcleo_get_modem_fw,

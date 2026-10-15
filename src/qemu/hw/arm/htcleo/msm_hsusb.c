@@ -22,6 +22,11 @@
  *
  * followed by "adb connect 127.0.0.1:5555" gives a working adb.
  *
+ * With mode=lle (the machine's usb=lle) that host is this machine instead:
+ * the same gadget is plugged into vhci_hcd and the host's real USB stack
+ * enumerates it, so lsusb, adb and fastboot see an actual USB device.  See
+ * htcleo_usbip.c; the register model below is shared by both.
+ *
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
@@ -34,8 +39,10 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "chardev/char-fe.h"
+#include "qapi/error.h"
 #include "system/physmem.h"
 #include "htcleo.h"
+#include "hw/arm/htcleo/htcleo_usbip.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmHsusbState, MSM_HSUSB)
 
@@ -101,6 +108,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmHsusbState, MSM_HSUSB)
 #define RX_FIFO             65536
 #define CTL_BUF             1024
 
+/* usb=lle: the root hub port and the speed the gadget advertises */
+#define USBIP_PORT           1
+#define USBIP_SPEED_HIGH     3
+
 /* the built-in host */
 enum {
     H_DETACHED,
@@ -129,6 +140,10 @@ struct MsmHsusbState {
     uint32_t portsc, otgsc, usbmode, ulpi_vp;
     uint32_t setupstat, stat, complete;
     uint32_t epctrl[NUM_EP];
+    /* max packet size per endpoint, from the descriptors the gadget sent */
+    uint16_t mps[NUM_EP];
+    /* how far through the configuration descriptor we have walked */
+    uint32_t desc_at;
     uint8_t ulpi[256];
     uint32_t ahb[0x40];             /* 0x000..0x0FC misc readback */
 
@@ -140,6 +155,9 @@ struct MsmHsusbState {
     int adb_in, adb_out;            /* endpoint numbers, -1 if none */
     uint8_t cfg_value;
     bool adb_connected;
+
+    bool usb_lle;                   /* mode=lle: the host is this machine */
+    UsbipLink usbip;
 };
 
 static uint32_t ld32(hwaddr a)
@@ -259,20 +277,39 @@ static int hsusb_td_xfer(MsmHsusbState *s, int bit, uint8_t *buf,
 
 /* ---- host side: control transfers ---------------------------------- */
 
+/*
+ * Hand an 8-byte SETUP packet to the gadget's ep0.  The controller's whole
+ * job here is to copy it into the queue head's setup_data[8] and set the ep0
+ * bit of ENDPTSETUPSTAT; the gadget then decodes it in handle_setup and
+ * answers through the normal queues.
+ */
+static void hsusb_setup_packet(MsmHsusbState *s, const uint8_t *pkt)
+{
+    qemu_log_mask(LOG_TRACE,
+                  "msm-hsusb: setup %02x %02x %04x %04x %04x at %08x "
+                  "(eplist %08x)\n",
+                  pkt[0], pkt[1], pkt[2] | pkt[3] << 8, pkt[4] | pkt[5] << 8,
+                  pkt[6] | pkt[7] << 8, (uint32_t)(qh_addr(s, 0) + 0x28),
+                  s->eplist);
+    physical_memory_write(qh_addr(s, 0) + 0x28, pkt, 8);
+    s->ctl = CTL_IDLE;
+    /* a new SETUP packet clears whatever stall the last transfer left */
+    s->epctrl[0] &= ~(EPCTRL_RXS | EPCTRL_TXS);
+    s->setupstat |= 1;
+    s->usbsts |= STS_UI;
+    hsusb_update(s);
+}
+
 static void host_setup(MsmHsusbState *s, uint8_t type, uint8_t req,
                        uint16_t value, uint16_t index, uint16_t length)
 {
     uint8_t pkt[8] = { type, req, value, value >> 8, index, index >> 8,
                        length, length >> 8 };
 
-    physical_memory_write(qh_addr(s, 0) + 0x28, pkt, 8);
+    hsusb_setup_packet(s, pkt);
     s->ctl_len = 0;
     s->ctl_want = MIN(length, CTL_BUF);
     s->ctl = (type & 0x80) && length ? CTL_DATA_IN : CTL_STATUS_IN;
-    s->epctrl[0] &= ~(EPCTRL_RXS | EPCTRL_TXS);
-    s->setupstat |= 1;
-    s->usbsts |= STS_UI;
-    hsusb_update(s);
 }
 
 /* advance the control transfer; true once it has finished */
@@ -338,6 +375,208 @@ static void host_detach(MsmHsusbState *s)
     s->ctl = CTL_IDLE;
     s->portsc &= ~(PORTSC_CCS | PORTSC_PE);
 }
+
+/* ---- mode=lle: this machine is the host ------------------------------ */
+
+/*
+ * What a host controller does when it finds a device: connect the port and
+ * reset the bus.  LK's udc_interrupt takes the STS_URI branch, flushes every
+ * endpoint and comes up offline (UDC_EVENT_OFFLINE), which is exactly what it
+ * does on hardware when a host is plugged in.
+ */
+static void hsusb_bus_connect(MsmHsusbState *s)
+{
+    s->setupstat = s->stat = s->complete = 0;
+    s->deviceaddr = 0;
+    s->ctl = CTL_IDLE;
+    s->epctrl[0] &= ~(EPCTRL_RXS | EPCTRL_TXS);
+    s->portsc |= PORTSC_CCS | PORTSC_PE | PORTSC_HS;
+    s->usbsts |= STS_PCI | STS_URI;
+    hsusb_update(s);
+}
+
+static void hsusb_lle_reset(void *opaque)
+{
+    hsusb_bus_connect(opaque);
+}
+
+static void hsusb_lle_setup(void *opaque, const uint8_t *pkt)
+{
+    MsmHsusbState *s = opaque;
+
+    /*
+     * SET_ADDRESS never gets here -- vhci_hcd completes the first one itself,
+     * to turn the port into a real usb_device -- so the gadget's own address
+     * stays at whatever the host stack was told, and only the host stack
+     * knows it.
+     */
+    hsusb_setup_packet(s, pkt);
+    /*
+     * A fresh GET_DESCRIPTOR(CONFIGURATION) starts the descriptor walk over;
+     * anything else leaves it, since the host reads the configuration in
+     * 9-byte pieces and each one is its own request.
+     */
+    if (pkt[1] == 0x06 && pkt[2] == 0x00 && pkt[3] == 0x02) {
+        s->desc_at = 0;
+        s->desc_at = 9;             /* past the configuration header */
+    }
+}
+
+/*
+ * Pick the endpoints' max packet sizes out of the configuration descriptor as
+ * the host reads it, so the transfer code can tell a short packet from a
+ * whole one.  The stream is a 9 byte configuration header followed by, for
+ * each interface, a 9 byte header and then zero or more 7 byte endpoint
+ * descriptors -- so the walk only has to know whether it is at an interface
+ * boundary (a multiple of 16 from the start of the interface).
+ */
+static void hsusb_scan_config(MsmHsusbState *s, const uint8_t *buf,
+                              uint32_t len)
+{
+    uint32_t at = s->desc_at;
+
+    while (len) {
+        bool boundary = (at % 16) == 0;
+        uint32_t need = boundary ? 9 : 7;
+
+        if (len < need) {
+            break;
+        }
+        if (boundary) {
+            if (buf[1] != 0x04) {        /* not an interface descriptor */
+                break;
+            }
+        } else {
+            uint32_t epn, m;
+
+            if (buf[1] != 0x05) {        /* not an endpoint descriptor */
+                break;
+            }
+            epn = buf[2] & 0x0f;
+            m = buf[4] | buf[5] << 8;
+            if (epn < NUM_EP) {
+                s->mps[epn] = m & 0x7ff;
+            }
+        }
+        at += need;
+        buf += need;
+        len -= need;
+    }
+    s->desc_at = at;
+}
+
+static int hsusb_lle_poll(void *opaque, int ep, bool in,
+                          const uint8_t *out, uint32_t out_len,
+                          uint8_t *buf, uint32_t max, bool *more)
+{
+    MsmHsusbState *s = opaque;
+
+    if (ep < 0 || ep >= NUM_EP) {
+        return USBIP_NOPE;
+    }
+    *more = false;
+    /*
+     * LK rejects a request it does not implement by writing TXS|RXS into
+     * ENDPTCTRL (hsusb.c:476) instead of queueing anything, so the bus has
+     * no data to give.  The right answer is a stalled URB, not silence: the
+     * host stack reads a silent ep0 as a dead device.
+     */
+    if (s->epctrl[ep] & (EPCTRL_RXS | EPCTRL_TXS)) {
+        return USBIP_STALL;
+    }
+    /*
+     * One round on this endpoint: USBIP_NOPE (-1) is what hsusb_td_xfer()
+     * returns when nothing is primed, which is the bus's NAK -- the host
+     * retries and the gadget gets another chance as soon as it queues.
+     * `max` is the host's wLength and caps the answer, so an IN never comes
+     * back longer than the buffer the host stack allocated for it.
+     *
+     * hsusb_td_xfer() numbers the queue heads 0..15 OUT and 16..31 IN (it
+     * indexes ENDPTSTAT and the queue head array with them, so BIT_OUT() and
+     * BIT_IN() are the wrong thing to pass -- only its own callers, such as
+     * adb_pump() with "16 + s->adb_in", know this).
+     */
+    {
+        int bit = in ? 16 + ep : ep;
+        uint32_t left = in ? max : out_len;
+        uint32_t done = 0;
+
+        /*
+         * NAK unless there is something to move, and decide that *here*.
+         * hsusb_td_xfer() clears the primed bit when it finds an empty queue,
+         * which is right for the built-in host polling once per packet but
+         * fatal here: this runs again and again while the gadget is thinking,
+         * so one unlucky look at an endpoint the gadget has just primed and
+         * not filled yet would take the prime away and the gadget, which
+         * never primes twice, would leave the request unanswered for good.
+         */
+        if (!(s->stat & (1u << bit)) ||
+            ld32(qh_addr(s, bit) + 8) == TD_TERMINATE) {
+            return USBIP_NOPE;
+        }
+
+        /*
+         * One host transfer is several bus packets: fastboot hands over 16 KB
+         * at a time while the gadget queues 4096-byte descriptors, so walk
+         * the chain until the host's buffer is spent or the gadget runs dry.
+         *
+         * The first round happens even when `left` is zero: a control
+         * transfer's status stage is exactly that, a zero-length packet whose
+         * only job is to retire the descriptor the gadget primed for it.
+         */
+        for (;;) {
+            int n = hsusb_td_xfer(s, bit,
+                                  in ? buf + done : (uint8_t *)out + done,
+                                  left);
+
+            if (n < 0) {
+                break;
+            }
+            /*
+             * A primed transfer descriptor of zero length is the gadget
+             * saying "that was the last packet": a zero-length packet ends
+             * the transfer just as a short one does.
+             */
+            if (!n) {
+                break;
+            }
+            done += n;
+            left -= n;
+            if (!left) {
+                break;
+            }
+        }
+        /*
+         * Running out of primed descriptors with `left` to go is not the end
+         * of the transfer: the gadget simply has not queued the rest yet.  A
+         * bulk IN ends at the first packet shorter than the endpoint's max
+         * packet size, so as long as what we have moved is a whole number of
+         * packets the host has seen nothing that would end it, and finishing
+         * here would strand the transfer short.
+         *
+         * Control reads are the exception: a descriptor that is shorter than
+         * wLength ends the data stage, and that is how the host is told a
+         * descriptor ran out.
+         */
+        if (in && ep == 0 && done) {
+            hsusb_scan_config(s, buf, done);
+        }
+        if (in && left && done) {
+            uint32_t mps = s->mps[ep] ? s->mps[ep] : 64;
+
+            if (ep && !(done % mps)) {
+                *more = true;
+            }
+        }
+        return done;
+    }
+}
+
+static const UsbipOps hsusb_lle_ops = {
+    .reset = hsusb_lle_reset,
+    .setup = hsusb_lle_setup,
+    .poll = hsusb_lle_poll,
+};
 
 /* ---- adb pipe -------------------------------------------------------- */
 
@@ -419,6 +658,10 @@ static void hsusb_timer(void *opaque)
     MsmHsusbState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (s->usb_lle) {
+        /* the host is this machine, so there is no built-in one to run */
+        return;
+    }
     if (!hsusb_running(s)) {
         if (s->hstate != H_DETACHED) {
             host_detach(s);
@@ -500,7 +743,9 @@ static void hsusb_ctrl_reset(MsmHsusbState *s)
     s->epctrl[0] = (1u << 23) | (1u << 7);  /* ep0 always enabled */
     s->portsc &= PORTSC_PHCD;
     s->portsc |= 2u << 30;                  /* ULPI */
-    host_detach(s);
+    if (!s->usb_lle) {
+        host_detach(s);
+    }
     hsusb_update(s);
 }
 
@@ -578,6 +823,18 @@ static void hsusb_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     case R_USBCMD:
         if (val & CMD_RST) {
             hsusb_ctrl_reset(s);
+            if (s->usb_lle) {
+                /*
+                 * The gadget restarting its controller is a device falling
+                 * off the bus and coming back: the host has to enumerate it
+                 * again, or it keeps talking to the instance that is gone.
+                 * cLK does this on every boot (udc_init() resets the core
+                 * before udc_start()), so without this the emulated phone
+                 * would only be usable before its first reboot.
+                 */
+                usbip_link_reset(&s->usbip);
+                hsusb_bus_connect(s);
+            }
             return;
         }
         if (!(s->usbcmd & CMD_RS) && (val & CMD_RS) &&
@@ -587,7 +844,9 @@ static void hsusb_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                               100 * SCALE_MS;
         }
         s->usbcmd = val;
-        if (hsusb_running(s)) {
+        if (s->usb_lle) {
+            /* the real host drives the bus; there is nothing to kick */
+        } else if (hsusb_running(s)) {
             hsusb_kick(s, 10 * SCALE_MS);
         } else if (s->hstate != H_DETACHED) {
             host_detach(s);
@@ -624,7 +883,7 @@ static void hsusb_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         /* PHCD (PHY suspend) and the port test controls are writable */
         s->portsc = (s->portsc & ~(PORTSC_PHCD | (3u << 30))) |
                     (val & (PORTSC_PHCD | (3u << 30)));
-        if (hsusb_running(s)) {
+        if (!s->usb_lle && hsusb_running(s)) {
             hsusb_kick(s, 10 * SCALE_MS);
         }
         break;
@@ -639,8 +898,20 @@ static void hsusb_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case R_PRIME:
         /* the controller loads the queue heads at once */
+        if (s->usb_lle) {
+            qemu_log_mask(LOG_TRACE,
+                          "msm-hsusb: prime %08x -> %08x (qh0 %08x qh1o %08x "
+                          "qh1i %08x)\n", (uint32_t)val, (uint32_t)(s->stat | val),
+                          ld32(qh_addr(s, 0) + 8), ld32(qh_addr(s, 1) + 8),
+                          ld32(qh_addr(s, 17) + 8));
+        }
         s->stat |= val;
-        hsusb_kick(s, 10 * SCALE_US);
+        if (s->usb_lle) {
+            /* the gadget is ready: the host may be waiting for exactly this */
+            usbip_link_kick(&s->usbip);
+        } else {
+            hsusb_kick(s, 10 * SCALE_US);
+        }
         break;
     case R_FLUSH:
         s->stat &= ~val;
@@ -653,8 +924,15 @@ static void hsusb_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             int n = (off - R_EPCTRL0) >> 2;
 
             s->epctrl[n] = val;
-            if (n == 0 && (val & (EPCTRL_RXS | EPCTRL_TXS)) &&
-                s->ctl != CTL_IDLE) {
+            if (s->usb_lle) {
+                /*
+                 * A stall is an answer in itself -- the gadget has given up
+                 * on the request -- so hand it to the host now rather than
+                 * waiting for a transfer that will never be queued.
+                 */
+                usbip_link_kick(&s->usbip);
+            } else if (n == 0 && (val & (EPCTRL_RXS | EPCTRL_TXS)) &&
+                       s->ctl != CTL_IDLE) {
                 /* the gadget stalled a request: carry on without it */
                 qemu_log_mask(LOG_TRACE, "msm-hsusb: ep0 stall\n");
                 s->ctl = CTL_IDLE;
@@ -695,6 +973,14 @@ static void msm_hsusb_reset(DeviceState *dev)
     s->portsc = 0;
     hsusb_ctrl_reset(s);
     fifo8_reset(&s->rx);
+    if (s->usb_lle && s->usbip.attached) {
+        /*
+         * The bridge already put us on the host's bus and reset it at
+         * realize; this reset came after and dropped the connect, so put it
+         * back.  A machine reset is a bus reset for the gadget either way.
+         */
+        hsusb_bus_connect(s);
+    }
 }
 
 static void msm_hsusb_realize(DeviceState *dev, Error **errp)
@@ -703,6 +989,20 @@ static void msm_hsusb_realize(DeviceState *dev, Error **errp)
 
     fifo8_create(&s->rx, RX_FIFO);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, hsusb_timer, s);
+    if (s->usb_lle) {
+        /*
+         * Plug the gadget into this machine's own USB stack.  This has to
+         * happen now, while we are still the process that owns the socket:
+         * vhci_hcd resolves the fd against the writing task's fd table, and
+         * the attribute is root-only.
+         */
+        usbip_link_init(&s->usbip, &hsusb_lle_ops, s, USBIP_PORT,
+                        USBIP_SPEED_HIGH, errp);
+        if (*errp) {
+            return;
+        }
+        return;
+    }
     qemu_chr_fe_set_handlers(&s->adb, adb_can_receive, adb_receive,
                              adb_event, NULL, s, NULL, true);
 }
@@ -722,6 +1022,26 @@ static const Property hsusb_props[] = {
     DEFINE_PROP_CHR("adb", MsmHsusbState, adb),
 };
 
+static char *hsusb_get_mode(Object *obj, Error **errp)
+{
+    MsmHsusbState *s = MSM_HSUSB(obj);
+
+    return g_strdup(s->usb_lle ? "lle" : "hle");
+}
+
+static void hsusb_set_mode(Object *obj, const char *v, Error **errp)
+{
+    MsmHsusbState *s = MSM_HSUSB(obj);
+
+    if (!strcmp(v, "lle")) {
+        s->usb_lle = true;
+    } else if (!strcmp(v, "hle")) {
+        s->usb_lle = false;
+    } else {
+        error_setg(errp, "mode must be 'hle' or 'lle'");
+    }
+}
+
 static void msm_hsusb_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -729,6 +1049,10 @@ static void msm_hsusb_class_init(ObjectClass *oc, const void *data)
     dc->realize = msm_hsusb_realize;
     device_class_set_legacy_reset(dc, msm_hsusb_reset);
     device_class_set_props(dc, hsusb_props);
+    object_class_property_add_str(oc, "mode", hsusb_get_mode, hsusb_set_mode);
+    object_class_property_set_description(oc, "mode",
+        "who is the USB host: hle (built in, adb goes to the 'adb' chardev) "
+        "or lle (this machine's own, through vhci_hcd; needs root)");
 }
 
 static const TypeInfo msm_hsusb_info = {

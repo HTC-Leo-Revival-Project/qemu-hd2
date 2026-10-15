@@ -1,0 +1,85 @@
+plugins {
+    id 'com.android.application'
+}
+
+/*
+ * The QEMU binaries are not in git: scripts/build-native.sh cross-compiles
+ * them with the NDK and drops them into src/main/jniLibs/<abi>/.  Everything
+ * else here is plain framework Java - there is not a single dependency,
+ * AndroidX or otherwise.
+ *
+ * arm64-v8a only: QEMU 11 ships no 32-bit host TCG backend, so there is no
+ * armeabi-v7a emulator to package.
+ */
+def abis = ['arm64-v8a']
+
+android {
+    namespace 'org.htcleorevivalproject.hd2emu'
+    compileSdk 36
+    ndkVersion '27.3.13750724'
+
+    defaultConfig {
+        applicationId 'org.htcleorevivalproject.hd2emu'
+        minSdk 15          // Android 4.0.4
+        targetSdk 36       // Android 16 (runs unchanged on 17)
+        versionCode 1
+        versionName '1.0'
+
+        ndk {
+            abiFilters.addAll(abis)
+        }
+    }
+
+    buildTypes {
+        debug {
+            // the emulator is the interesting part; keep the logs readable
+            applicationIdSuffix ''
+        }
+        release {
+            minifyEnabled false      // no libraries, nothing to shrink, and keep it debuggable
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    packaging {
+        jniLibs {
+            /*
+             * QEMU is exec()ed out of the APK's native library directory, so
+             * the installer has to unpack them instead of loading them in
+             * place from the zip.
+             */
+            useLegacyPackaging = true
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // deliberately empty
+}
+
+/** A build with no emulator in it is legal, but it is never what you want. */
+tasks.register('checkNative') {
+    doLast {
+        abis.each { abi ->
+            def dir = file("src/main/jniLibs/$abi")
+            if (!dir.isDirectory() || dir.listFiles().length == 0) {
+                logger.warn("No QEMU for $abi in $dir - run scripts/build-native.sh, or the app will not start the emulator.")
+            }
+        }
+    }
+}
+tasks.configureEach { task ->
+    if (task.name ==~ /assemble.*|bundle.*/) {
+        task.dependsOn 'checkNative'
+    }
+}

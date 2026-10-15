@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 4.0 "Holo Dark", the same palette as the web UI (web/app/globals.css) -->
+<resources>
+    <color name="holo_blue">#ff33b5e5</color>
+    <color name="holo_blue_dark">#ff0099cc</color>
+    <color name="holo_blue_deep">#ff0077aa</color>
+    <color name="holo_blue_glow">#5933b5e5</color>
+    <color name="holo_green">#ff99cc00</color>
+    <color name="holo_red">#ffff4444</color>
+    <color name="holo_orange">#ffffbb33</color>
+
+    <color name="holo_bg_top">#ff000000</color>
+    <color name="holo_bg_mid">#ff0d1012</color>
+    <color name="holo_bg_bottom">#ff272d33</color>
+
+    <color name="holo_bar">#ff1a1a1a</color>
+    <color name="holo_panel">#e6101214</color>
+    <color name="holo_dialog">#ff282828</color>
+    <color name="holo_dialog_dim">#99000000</color>
+    <color name="holo_pressed">#9933b5e5</color>
+    <color name="holo_focus">#4033b5e5</color>
+    <color name="holo_row_bg">#0dffffff</color>
+
+    <color name="holo_divider">#1affffff</color>
+    <color name="holo_divider_strong">#2effffff</color>
+
+    <color name="holo_text">#ffffffff</color>
+    <color name="holo_text_2">#ffbebebe</color>
+    <color name="holo_text_3">#ff808080</color>
+    <color name="holo_text_disabled">#4dbebebe</color>
+
+    <color name="switch_track">#ff2b2b2b</color>
+    <color name="switch_off_top">#ff6a6a6a</color>
+    <color name="switch_off_bottom">#ff474747</color>
+    <color name="switch_off_text">#ffdcdcdc</color>
+    <color name="switch_on_top">#ff3fc0ee</color>
+    <color name="switch_on_bottom">#ff0099cc</color>
+    <color name="switch_stroke">#ff9a9a9a</color>
+</resources>

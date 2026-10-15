@@ -32,143 +32,19 @@
 #include "system/memory.h"
 #include "system/physmem.h"
 #include "msm_adreno_gl.h"
+#include "msm_adreno_gles.h"
 #include "msm_adreno_sq.h"
 
-#ifdef CONFIG_OPENGL
-#include <epoxy/gl.h>
-#include <epoxy/egl.h>
-
-/* an empty framebuffer covering every window coordinate a draw can use */
-#define FB_SIZE         16384
-#define TEX_CACHE_MAX   768
-
-/* where the vertices come from */
-enum {
-    GEOM_CPU,               /* set up by msm_adreno_draw.c */
-    GEOM_TRIS,              /* the vertex shader on the host GPU */
-    GEOM_POINTS,
-};
-
-typedef struct GlProgKey {
-    uint64_t ps_hash, vs_hash;
-    uint32_t flat_mask;
-    uint32_t cube_mask, vs_cube_mask;
-    uint8_t ninterp, param_gen, param_gen_reg, geom, persp, pad[3];
-} GlProgKey;
-
-typedef struct GlProg {
-    GlProgKey key;
-    GLuint prog;
-    bool exports_depth;
-    AdrenoGlslInfo info, vinfo;
-} GlProg;
-
-typedef struct GlTexKey {
-    uint32_t fc[6];
-} GlTexKey;
-
-typedef struct GlTex {
-    GlTexKey key;
-    GLuint tex;
-    uint64_t hash;
-    AdrenoMemStamp stamp;       /* when hashed or checked */
-    uint32_t lo, hi;            /* the memory it was decoded from */
-    uint32_t npages;
-    uint64_t *pages;            /* its pages' RAM addresses + 1 (0: none) */
-    uint64_t used;
-    AdrenoTexImage im;
-} GlTex;
-
-typedef struct GlSamplerKey {
-    uint32_t wrap[2], mag, min;
-    float min_lod, max_lod, bias;
-    float border[4];
-} GlSamplerKey;
-
-typedef struct GlSampler {
-    GlSamplerKey key;
-    GLuint smp;
-} GlSampler;
-
-/* the Draw uniform block (std140) */
-typedef struct TexU {
-    float size[4];          /* w, h, 1/w, 1/h of level 0 */
-    float scale[4];         /* 2^exp_adj, LOD bias */
-    int32_t swz[4];
-} TexU;
-
-typedef struct DrawU {
-    uint32_t bools[8];
-    uint32_t loops[32];
-    TexU tex[2 * ADRENO_GL_MAX_UNITS];  /* pixel, then vertex shader's */
-    int32_t cb[4];          /* PS, VS constant bases */
-    int32_t csurf[4];       /* colour: GMEM offset, pitch, bpp, sx | sy << 4 */
-    int32_t cfmt[4];        /* channel widths */
-    int32_t cinfo[4];       /* kind, swap, colour write, colour mask */
-    int32_t dsurf[4];       /* depth: GMEM offset, bpp */
-    uint32_t rb[4];         /* DEPTHCONTROL, BLEND_CONTROL, COLORCONTROL,
-                               STENCILREFMASK */
-    uint32_t rb2[4];        /* STENCILREFMASK_BF, blending */
-    float blendc[4];
-    float misc[4];          /* alpha ref, window offset x, y, pixel offset */
-    /* vertex shading on the host GPU */
-    int32_t vb[ADRENO_GL_MAX_VBUFS][4];   /* vertex data: word index in
-                                             vd[], first byte, endian swap,
-                                             bytes */
-    float vp0[4];           /* viewport x scale, offset, y scale, offset */
-    float vp1[4];           /* z scale, offset; point half size */
-    float vp2[4];           /* window offset x, y (when applied); pixel
-                               offset */
-    uint32_t vte[4];        /* PA_CL_VTE_CNTL, PA_CL_CLIP_CNTL */
-    float psz[4];           /* point min, max half size; size from VS */
-} DrawU;
-
-typedef struct AdrenoGl {
-    EGLDisplay dpy;
-    EGLContext ctx;
-    QemuThread owner;
-    GLuint fbo, vao;
-    GLuint gmem;
-    /*
-     * What draws read (uniforms, constants, vertices, indices) is written
-     * once into this persistently mapped buffer; it starts over when the
-     * host GPU is idle (no driver copies, no waits between draws).
-     */
-    GLuint stream;
-    uint8_t *stream_map;
-    size_t stream_pos;
-    GLint ubo_align, ssbo_align;
-    GLuint gmem_stage;          /* GMEM's way to and from the CPU */
-    uint8_t *gmem_map;
-    /* stats: GPU timestamps at the first draw of a kick and its end */
-    GLuint tq[2];
-    bool tq_started;
-    uint32_t tq_kick;
-    /* GMEM snapshots for resolves */
-    GLuint snap[32];
-    uint8_t *snap_map[32];
-    int nsnap, snap_used;
-    int cur_geom;
-    int barriers;
-    const struct GlProg *last_prog;
-    bool stream_wrapped;
-    GLuint dummy2d, dummy_arr;
-    GHashTable *progs, *texes, *samplers;
-    bool gpu_newer, cpu_newer;
-    uint64_t ndraw;
-    AdrenoTlb tlb;
-    uint8_t *scratch;
-    size_t scratch_size;
-    /* by RAM page: the command kick it last changed in (dirty logging) */
-    uint32_t *page_kick;
-    size_t npage_kick;
-} AdrenoGl;
-
+/*
+ * The GLSL both host GPU backends share.  It is only text, so it is
+ * here rather than under CONFIG_OPENGL: a phone has no epoxy and still
+ * needs it (msm_adreno_gles.c).
+ */
 /* ------------------------------------------------------------------ */
 /* GLSL: what every program shares                                     */
 /* ------------------------------------------------------------------ */
 
-static const char glsl_common[] =
+const char glsl_common[] =
     "layout(std140, binding = 0) uniform Consts { vec4 u_c[512]; };\n"
     "struct TexU { vec4 size; vec4 scale; ivec4 swz; };\n"
     "layout(std140, binding = 1) uniform Draw {\n"
@@ -229,7 +105,7 @@ static const char glsl_common[] =
  * into vd[]: u_vb[slot] = word index, first byte (relative to the fetch
  * constant's address), endian swap, bytes.
  */
-static const char glsl_vfetch[] =
+const char glsl_vfetch[] =
     "layout(std430, binding = 2) readonly buffer Vdata { uint vd[]; };\n"
     "uint vfetch_word(int s, int va) {\n"
     "    ivec4 b = u_vb[s];\n"
@@ -279,7 +155,18 @@ static const char glsl_vfetch[] =
  * written with plain stores when whole words, else with atomics, since
  * the neighbouring pixels sharing the word are not interlocked with it.
  */
-static const char glsl_rop[] =
+/*
+ * The render backend, as msm_adreno_draw.c's depth_stencil() and
+ * write_color() on GMEM.  A pixel's own samples are written with plain
+ * stores when whole words, else with atomics, since the neighbouring
+ * pixels sharing the word are not interlocked with it.
+ *
+ * The first piece - gm_get(), gm_put(), px_get(), px_put() - is the only
+ * part that differs between the two host GPU backends: a buffer under
+ * fragment shader interlock on desktop OpenGL, an image with image atomics
+ * on OpenGL ES (msm_adreno_gles.c).  Everything after it is shared.
+ */
+static const char glsl_gm_gl[] =
     "layout(std430, binding = 0) coherent buffer Gmem { uint gm[]; };\n"
     "uint gm_get(uint a, uint n) {\n"
     "    uint w = gm[a >> 2];\n"
@@ -325,7 +212,10 @@ static const char glsl_rop[] =
     "            gm[i + 3u] = w.w;\n"
     "        }\n"
     "    }\n"
-    "}\n"
+    "}\n";
+
+/* the address arithmetic and the comparisons: no GMEM in them */
+const char glsl_rop_mid[] =
     /* sample (i, j) of pixel (x, y) of a surface at GMEM offset off */
     "bool surf_addr(uint off, uint bpp, int x, int y, int i, int j,\n"
     "               out uint a) {\n"
@@ -358,8 +248,11 @@ static const char glsl_rop[] =
     "    case 7u: return (v - 1u) & 0xffu;\n"
     "    }\n"
     "    return v;\n"
-    "}\n"
-    "bool depth_stencil(int x, int y, float z, bool face) {\n"
+    "}\n";
+
+/* the depth/stencil test and the colour write, over gm_get() and friends */
+const char glsl_rop_tail[] =
+"bool depth_stencil(int x, int y, float z, bool face) {\n"
     "    uint dc = u_rb.x;\n"
     "    bool sen = (dc & 1u) != 0u, zen = (dc & 2u) != 0u;\n"
     "    bool zw = (dc & 4u) != 0u;\n"
@@ -544,6 +437,106 @@ static const char glsl_rop[] =
     "        }\n"
     "    }\n"
     "}\n";
+
+uint32_t adreno_gl_cube_mask(MsmAdrenoState *s, uint32_t tex_mask)
+{
+    uint32_t m = 0;
+
+    for (int i = 0; i < 32; i++) {
+        if ((tex_mask & (1u << i)) &&
+            ((s->regs[A2_SQ_FETCH_0 + i * 6 + 5] >> 9) & 3) == 3) {
+            m |= 1u << i;
+        }
+    }
+    return m;
+}
+
+#ifdef CONFIG_OPENGL
+#include <epoxy/gl.h>
+#include <epoxy/egl.h>
+
+/* an empty framebuffer covering every window coordinate a draw can use */
+#define FB_SIZE         16384
+#define TEX_CACHE_MAX   768
+
+/* where the vertices come from */
+
+
+typedef struct GlTexKey {
+    uint32_t fc[6];
+} GlTexKey;
+
+typedef struct GlTex {
+    GlTexKey key;
+    GLuint tex;
+    uint64_t hash;
+    AdrenoMemStamp stamp;       /* when hashed or checked */
+    uint32_t lo, hi;            /* the memory it was decoded from */
+    uint32_t npages;
+    uint64_t *pages;            /* its pages' RAM addresses + 1 (0: none) */
+    uint64_t used;
+    AdrenoTexImage im;
+} GlTex;
+
+typedef struct GlSamplerKey {
+    uint32_t wrap[2], mag, min;
+    float min_lod, max_lod, bias;
+    float border[4];
+} GlSamplerKey;
+
+typedef struct GlSampler {
+    GlSamplerKey key;
+    GLuint smp;
+} GlSampler;
+
+/* the Draw uniform block (std140) */
+typedef struct TexU {
+    float size[4];          /* w, h, 1/w, 1/h of level 0 */
+    float scale[4];         /* 2^exp_adj, LOD bias */
+    int32_t swz[4];
+} TexU;
+
+
+typedef struct AdrenoGl {
+    EGLDisplay dpy;
+    EGLContext ctx;
+    QemuThread owner;
+    GLuint fbo, vao;
+    GLuint gmem;
+    /*
+     * What draws read (uniforms, constants, vertices, indices) is written
+     * once into this persistently mapped buffer; it starts over when the
+     * host GPU is idle (no driver copies, no waits between draws).
+     */
+    GLuint stream;
+    uint8_t *stream_map;
+    size_t stream_pos;
+    GLint ubo_align, ssbo_align;
+    GLuint gmem_stage;          /* GMEM's way to and from the CPU */
+    uint8_t *gmem_map;
+    /* stats: GPU timestamps at the first draw of a kick and its end */
+    GLuint tq[2];
+    bool tq_started;
+    uint32_t tq_kick;
+    /* GMEM snapshots for resolves */
+    GLuint snap[32];
+    uint8_t *snap_map[32];
+    int nsnap, snap_used;
+    int cur_geom;
+    int barriers;
+    const struct GlProg *last_prog;
+    bool stream_wrapped;
+    GLuint dummy2d, dummy_arr;
+    GHashTable *progs, *texes, *samplers;
+    bool gpu_newer, cpu_newer;
+    uint64_t ndraw;
+    AdrenoTlb tlb;
+    uint8_t *scratch;
+    size_t scratch_size;
+    /* by RAM page: the command kick it last changed in (dirty logging) */
+    uint32_t *page_kick;
+    size_t npage_kick;
+} AdrenoGl;
 
 /* ------------------------------------------------------------------ */
 /* Programs                                                            */
@@ -770,7 +763,9 @@ static GString *fs_source(const GlProgKey *k, const AdrenoProgram *ps,
     g_string_append(o, glsl_common);
     g_string_append(o, "#define CONST(i) u_c[((i) + u_cb.x) & 511]\n");
     adreno_glsl_translate(ps, true, k->cube_mask, 0, o, info);
-    g_string_append(o, glsl_rop);
+    g_string_append(o, glsl_gm_gl);
+    g_string_append(o, glsl_rop_mid);
+    g_string_append(o, glsl_rop_tail);
     if (cpu) {
         g_string_append(o,
             "layout(location = 0) noperspective in vec4 v_zw;\n"
@@ -828,18 +823,6 @@ static GString *fs_source(const GlProgKey *k, const AdrenoProgram *ps,
     return o;
 }
 
-static uint32_t cube_mask(MsmAdrenoState *s, uint32_t tex_mask)
-{
-    uint32_t m = 0;
-
-    for (int i = 0; i < 32; i++) {
-        if ((tex_mask & (1u << i)) &&
-            ((s->regs[A2_SQ_FETCH_0 + i * 6 + 5] >> 9) & 3) == 3) {
-            m |= 1u << i;
-        }
-    }
-    return m;
-}
 
 static GlProg *gl_program(AdrenoGl *gl, MsmAdrenoState *s,
                           const AdrenoGlDraw *g)
@@ -857,13 +840,13 @@ static GlProg *gl_program(AdrenoGl *gl, MsmAdrenoState *s,
     key.flat_mask = g->flat_mask & ((1u << g->ninterp) - 1);
     key.param_gen = g->param_gen;
     key.param_gen_reg = g->param_gen ? g->param_gen_reg : 0;
-    key.cube_mask = cube_mask(s, g->ps->tex_mask);
+    key.cube_mask = adreno_gl_cube_mask(s, g->ps->tex_mask);
     if (g->vs) {
         key.geom = (g->prim == A2_PT_POINTLIST ||
                     g->prim == A2_PT_POINTLIST_PSIZE) ? GEOM_POINTS
                                                       : GEOM_TRIS;
         key.vs_hash = g->vs->hash;
-        key.vs_cube_mask = cube_mask(s, g->vs->tex_mask);
+        key.vs_cube_mask = adreno_gl_cube_mask(s, g->vs->tex_mask);
         key.persp = g->persp;
     }
     p = g_hash_table_lookup(gl->progs, &key);
@@ -1289,6 +1272,10 @@ static size_t stream_alloc(AdrenoGl *gl, MsmAdrenoState *s, size_t len,
 
 void adreno_gl_gmem_to_cpu(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_gmem_to_cpu(s);
+        return;
+    }
     AdrenoGl *gl = s->gl;
 
     if (gl && gl->gpu_newer) {
@@ -1327,6 +1314,9 @@ static void gmem_upload(AdrenoGl *gl, MsmAdrenoState *s)
 
 bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot)
 {
+    if (s->gl_gles) {
+        return adreno_gles_gmem_snapshot(s, slot);
+    }
     AdrenoGl *gl = s->gl;
 
     if (!gl || !qemu_thread_is_self(&gl->owner) ||
@@ -1357,6 +1347,10 @@ bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot)
 
 void adreno_gl_snapshots_wait(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_snapshots_wait(s);
+        return;
+    }
     AdrenoGl *gl = s->gl;
     int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
     GLsync fence;
@@ -1383,16 +1377,27 @@ void adreno_gl_snapshots_wait(MsmAdrenoState *s)
 
 uint8_t *adreno_gl_snapshot_ptr(MsmAdrenoState *s, int slot)
 {
+    if (s->gl_gles) {
+        return adreno_gles_snapshot_ptr(s, slot);
+    }
     return s->gl->snap_map[slot];
 }
 
 void adreno_gl_snapshots_release(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_snapshots_release(s);
+        return;
+    }
     s->gl->snap_used = 0;
 }
 
 void adreno_gl_gmem_from_cpu(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_gmem_from_cpu(s);
+        return;
+    }
     AdrenoGl *gl = s->gl;
 
     if (gl) {
@@ -1488,6 +1493,10 @@ static float fx124(uint32_t v)
 
 void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
 {
+    if (s->gl_gles) {
+        adreno_gles_draw(s, g);
+        return;
+    }
     AdrenoGl *gl = s->gl;
     const uint32_t *r = s->regs;
     const AdrenoColorFmt *cf;
@@ -1798,32 +1807,58 @@ bool adreno_gl_available(MsmAdrenoState *s)
 
 void adreno_gl_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
 {
+    if (s->gl_gles) {
+        adreno_gles_draw(s, g);
+        return;
+    }
 }
 
 void adreno_gl_gmem_to_cpu(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_gmem_to_cpu(s);
+        return;
+    }
 }
 
 void adreno_gl_gmem_from_cpu(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_gmem_from_cpu(s);
+        return;
+    }
 }
 
 bool adreno_gl_gmem_snapshot(MsmAdrenoState *s, int *slot)
 {
+    if (s->gl_gles) {
+        return adreno_gles_gmem_snapshot(s, slot);
+    }
     return false;
 }
 
 void adreno_gl_snapshots_wait(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_snapshots_wait(s);
+        return;
+    }
 }
 
 uint8_t *adreno_gl_snapshot_ptr(MsmAdrenoState *s, int slot)
 {
+    if (s->gl_gles) {
+        return adreno_gles_snapshot_ptr(s, slot);
+    }
     return NULL;
 }
 
 void adreno_gl_snapshots_release(MsmAdrenoState *s)
 {
+    if (s->gl_gles) {
+        adreno_gles_snapshots_release(s);
+        return;
+    }
 }
 
 #endif

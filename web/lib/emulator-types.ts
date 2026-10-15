@@ -8,6 +8,7 @@ export type Cable = "usb" | "ac" | "none";
 export type EmulatorConfig = {
   baseband: Mode;
   dsp: Mode;
+  usb: Mode;
   nand: string;
   sdcard: string;
   boot: BootTarget;
@@ -27,6 +28,7 @@ export type EmulatorConfig = {
 export const DEFAULT_CONFIG: EmulatorConfig = {
   baseband: "hle",
   dsp: "hle",
+  usb: "hle",
   nand: "nand.img",
   sdcard: "sdcard.img",
   boot: "nand",
@@ -49,7 +51,14 @@ export type PowerState = "stopped" | "starting" | "running" | "stopping" | "cras
 export type NandOs = "winmo" | "other";
 export type ImageFile = { name: string; size: number; kind: "nand" | "sdcard" | "firmware"; os?: NandOs };
 
-export type Firmware = { amss: boolean; dsp1: boolean; arm: boolean; hexagon: boolean };
+/*
+ * What the machine can actually do.  `vhci` is not firmware: it says the
+ * kernel's virtual host controller is there *and* that we may claim a port,
+ * which is what usb=lle needs.  vhci_hcd's attach attribute is root-only and
+ * the kernel resolves the socket fd against the process that writes it, so
+ * this is false whenever QEMU is not running as root.
+ */
+export type Firmware = { amss: boolean; dsp1: boolean; arm: boolean; hexagon: boolean; vhci: boolean };
 
 export type EmulatorStatus = {
   state: PowerState;

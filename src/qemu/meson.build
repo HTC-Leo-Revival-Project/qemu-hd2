@@ -1367,7 +1367,14 @@ rt = not_found
 if host_os != 'windows'
   have_shm_open = cc.has_function('shm_open')
   if not have_shm_open
-    rt = cc.find_library('rt', required: true)
+    # Android has neither POSIX shared memory nor a librt an app may link
+    # against: qemu_shm_alloc() opens (and unlinks) a file of its own there
+    # (util/oslib-posix.c), so there is nothing here to find.  meson calls
+    # Android linux, so ask the compiler what it is really building for.
+    android_target = cc.get_define('__ANDROID__') != ''
+    if not android_target
+      rt = cc.find_library('rt', required: true)
+    endif
   endif
 endif
 

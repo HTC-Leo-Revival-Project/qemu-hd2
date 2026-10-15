@@ -34,6 +34,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/rcu.h"
 #include "msm_adreno.h"
+#include "msm_adreno_gles.h"
 
 /* chip id 0x00020100: core 0, major 2, minor 1, patch 0 (Yamato DX 2.1) */
 #define ADRENO_PERIPHID1    0x00
@@ -1159,6 +1160,8 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     if (!s->backend) {
         s->backend = g_strdup("gl");
     }
+    /* tell the log straight away what the host GPU turned out to be */
+    adreno_gles_probe(s);
     /* worker 0 is the vCPU thread itself; the rest are rasterizer threads */
     s->nthreads = MAX(1, MIN(s->nthreads, ADRENO_MAX_THREADS));
     s->workers = g_new0(AdrenoWorker, s->nthreads);

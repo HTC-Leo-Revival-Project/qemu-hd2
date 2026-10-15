@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the one button on a screen that does the thing the screen is for -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android" android:exitFadeDuration="200">
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <corners android:radius="2dp" />
+            <solid android:color="#2633b5e5" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <corners android:radius="2dp" />
+            <solid android:color="@color/holo_blue_dark" />
+        </shape>
+    </item>
+    <item>
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <corners android:radius="2dp" />
+                    <solid android:color="#ff6fd0f2" />
+                </shape>
+            </item>
+            <item android:top="1dp">
+                <shape android:shape="rectangle">
+                    <corners android:radius="2dp" />
+                    <gradient
+                        android:angle="270"
+                        android:startColor="@color/holo_blue"
+                        android:endColor="#ff1aa4d8" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+</selector>
