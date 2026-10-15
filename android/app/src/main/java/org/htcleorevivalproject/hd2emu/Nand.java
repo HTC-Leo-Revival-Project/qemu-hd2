@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import java.nio.charset.Charset;
 
@@ -37,10 +37,11 @@ static final Charset UTF8 = Charset.forName("UTF-8");
 
     Nand(File path) throws IOException {
         f = new RandomAccessFile(path, "rw");
-        /* erased flash is all 0xFF, a block at a time */
-        byte[] ff = new byte[RAW_PAGE * PPB];
+        /* erased flash is all 0xFF, written 16 blocks (2 MiB) at a time */
+        f.setLength(0);
+        byte[] ff = new byte[RAW_PAGE * PPB * 16];
         Arrays.fill(ff, (byte) 0xff);
-        for (int i = 0; i < NBLOCKS; i++) f.write(ff);
+        for (int i = 0; i < NBLOCKS; i += 16) f.write(ff);
     }
 
     static byte[] encode(byte[] data, byte[] oob) {
@@ -52,6 +53,8 @@ static final Charset UTF8 = Charset.forName("UTF-8");
                 int src = cw * 512 + i;
                 raw[o + i] = src < data.length ? data[src] : (byte) 0xff;
             }
+            /* controller ECC parity: zeros, as hd2_mknand.py writes them */
+            Arrays.fill(raw, o + 512, o + 522, (byte) 0);
             if (oob != null) {
                 for (int i = 0; i < 4; i++) {
                     int src = cw * 4 + i;

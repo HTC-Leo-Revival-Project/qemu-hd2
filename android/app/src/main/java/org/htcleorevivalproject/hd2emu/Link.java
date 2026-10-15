@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;

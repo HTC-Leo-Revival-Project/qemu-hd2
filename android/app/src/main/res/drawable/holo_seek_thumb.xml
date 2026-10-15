@@ -1,23 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The seek bar's handle: the holo blue dot in the middle of its glow, not a
-  solid ball.  Two ovals - a transparent one with a soft ring, and the dot.
+  The scrubber's handle: a small solid blue dot that grows a soft blue halo
+  while it is being dragged, like scrubber_control_holo.
 -->
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+<selector xmlns:android="http://schemas.android.com/apk/res/android" android:exitFadeDuration="150">
+    <item android:state_pressed="true">
+        <layer-list>
+            <item>
+                <shape android:shape="oval">
+                    <size android:width="30dp" android:height="30dp" />
+                    <solid android:color="@color/holo_blue_glow" />
+                </shape>
+            </item>
+            <item android:left="9dp" android:top="9dp" android:right="9dp" android:bottom="9dp">
+                <shape android:shape="oval">
+                    <solid android:color="@color/holo_blue" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
     <item>
-        <shape android:shape="oval">
-            <size android:width="22dp" android:height="22dp" />
-            <solid android:color="@color/holo_blue_glow" />
-            <stroke android:width="1dp" android:color="@color/holo_blue" />
-        </shape>
+        <layer-list>
+            <item>
+                <shape android:shape="oval">
+                    <size android:width="30dp" android:height="30dp" />
+                    <solid android:color="@android:color/transparent" />
+                </shape>
+            </item>
+            <item android:left="9dp" android:top="9dp" android:right="9dp" android:bottom="9dp">
+                <shape android:shape="oval">
+                    <solid android:color="@color/holo_blue" />
+                </shape>
+            </item>
+        </layer-list>
     </item>
-    <item
-        android:left="8dp"
-        android:top="8dp"
-        android:right="8dp"
-        android:bottom="8dp">
-        <shape android:shape="oval">
-            <solid android:color="@color/holo_blue" />
-        </shape>
-    </item>
-</layer-list>
+</selector>

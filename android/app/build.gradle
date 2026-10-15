@@ -14,12 +14,12 @@ plugins {
 def abis = ['arm64-v8a']
 
 android {
-    namespace 'org.qemu.htcleo'
+    namespace 'org.htcleorevivalproject.hd2emu'
     compileSdk 36
     ndkVersion '27.3.13750724'
 
     defaultConfig {
-        applicationId 'org.qemu.htcleo'
+        applicationId 'org.htcleorevivalproject.hd2emu'
         minSdk 15          // Android 4.0.4
         targetSdk 36       // Android 16 (runs unchanged on 17)
         versionCode 1

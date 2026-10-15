@@ -180,7 +180,23 @@ Everything else Android needed was already in the NDK or in configure.
 
 ## NAND builder
 
-The menu has **Build a NAND image**, which is `tools/hd2_mknand.py` in Java
+The menu has **Build a NAND image**, which builds any of the three kinds of
+image the tools in `tools/` make; **Kind** at the top picks one:
+
+* **Android (cLK)** - `tools/hd2_mknand.py`, below.
+* **MAGLDR** - `tools/hd2_mkmagldr.py`: `magldr.nbh`'s OS section in the OS
+  area and the factory MACs.  An optional radio NBH is written into the first
+  blocks the way `hd2_radio.py --write-nand` adds it afterwards, since MAGLDR
+  restarts the radio from NAND.
+* **Windows Mobile 6.5** - `tools/hd2_wmnand.py`: a stock `RUU_signed.nbh`'s
+  radio (or another radio NBH's) and its OS section, page by page with the
+  WinCE sector info, from block 0x212.  The RUU is read in place
+  (`Radio.Nbh`), not loaded whole: it is bigger than an app's heap.
+
+`Radio.java` is `hd2_radio.py`'s NAND half.  The Java builders write the same
+bytes as the Python tools.
+
+The Android kind is `tools/hd2_mknand.py` in Java
 (`NandBuilder.java`, `Nand.java`, `Yaffs2.java`): pick `LEOIMG.nbh` (or a raw
 `lk.bin`), a *NAND* Android ROM zip and, optionally, a recovery image, and it
 writes the same 512 MiB image the Python tool does - OS area at block 0x212,
@@ -191,22 +207,69 @@ Files come in through the system file picker (`ACTION_OPEN_DOCUMENT`) and are
 copied into the app's own storage, so no storage permission is needed and
 scoped storage does not matter.
 
+## Images and the radio firmware
+
+**Images** (in the menu, and Settings -> Manage images) lists the images
+folder: tap a file to use it as the NAND flash or the microSD card, or to
+delete it.  Settings also picks the microSD card directly.
+
+The real baseband (LLE) runs `amss.elf` and the real DSP `dsp1.elf`.  A NAND
+image with a radio in it - a stock ROM's, or MAGLDR's built with a radio -
+already holds both, so when one is missing at start the emulator takes it out
+of the NAND image's radio partitions by itself (`Radio.fromNand`, the MIBIB
+table in the boot area says where).  Images -> Radio firmware does the same on
+demand, from the NAND image or from a radio NBH (`hd2_radio.py -o amss.elf
+--dsp dsp1.elf`).  Both give the same bytes as `hd2_radio.py`.
+
+## Root and USB
+
+The emulator never needs root.  **Root & USB** is the start of the features
+that do: `Root.java` keeps one `su` shell (Magisk, KernelSU, APatch ask once)
+and frames each command with a marker line carrying its exit status;
+`UsbBridge.java` probes, as root, what this phone's kernel offers for putting
+the emulated HD2's USB on real USB:
+
+* **to a PC** through this phone's USB port (configfs `usb_gadget`, FunctionFS
+  and a free UDC), so a PC's flash tools, adb and fastboot see a real HD2;
+* **to this phone** through `vhci_hcd`, what `usb-host=lle` does on a PC.
+
+Neither is switched on yet.  The gadget bridge needs QEMU to hand the USB/IP
+stream `htcleo_usbip.c` speaks to `vhci_hcd` to the app over a unix socket
+instead; the app then serves the HD2's descriptors and endpoints through
+FunctionFS, with the phone's own gadget unbound from the UDC meanwhile.
+
+## Languages
+
+English, German, French, Spanish, Italian, Brazilian Portuguese, Russian,
+Polish and Simplified Chinese, in `res/values-*/strings.xml`; Android 13 and
+later list them under the app's own language setting (`res/xml/locales_config.xml`).
+Every string the screens show is a resource.  What stays English is the
+output of the ported tools (the NAND builder's steps, the NBH and radio
+parsers' errors) and protocol errors from QEMU, adb and su, which match what
+the Python tools and the desktop print.
+
 ## Layout
 
     android/scripts/build-native.sh    deps + QEMU, for both ABIs
     android/scripts/fetch-toolchain.sh  JDK, Gradle, SDK, NDK
     android/scripts/make-icon.py        the launcher icon, no PIL needed
     app/src/main/java/org/qemu/htcleo/
-        MainActivity      the screen, the keys, the power buttons
+        MainActivity      the screen, the key bar, the machine in the action bar
         Emulator          the QEMU processes, the state machine, QMP
         EmuService        the foreground service that keeps it alive
         Qmp VncClient     the two protocols, in Java
         PcmPlayer         AudioTrack
         ScreenView        the screen: frames drawn in onDraw, touches
-        Holo              switches, checkboxes, dialogs, insets
+        Holo              the hand-drawn Holo kit: switch, radio, field, dialogs,
+                          rows and the scrolling preference Page; insets
+        HoloIcons         the action bar and key glyphs, as Paths (no PNGs)
+        HoloActivity      the sub-screens' base: up caret, black bars
+        ImagesActivity    the images folder, and the radio firmware out of an image
+        Root UsbBridge    the root shell, and the USB passthrough probe
+        RootActivity      Root & USB
         Config Images     the settings, and the files in the images folder
         LogsActivity      the four logs, and QEMU's monitor
-        Nand NandBuilder Yaffs2   the NAND builder
+        Nand NandBuilder Yaffs2 Radio   the NAND builder (Android, MAGLDR, WinMo)
 
 ## Notes
 

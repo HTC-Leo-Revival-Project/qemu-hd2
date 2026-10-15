@@ -2,113 +2,48 @@
 <resources>
     <!--
       Holo, not Material.  @android:style/Theme.Holo has been in the platform
-      since Android 4.0 (API 14) and still renders the old action bar, the
-      blue accent and the Holo widgets on Android 16/17.
+      since Android 4.0 (API 14) and still renders the old action bar, its
+      overflow menu and the Holo spinner on Android 16/17.  The widgets that
+      changed under it over the years (switch, dialog, text field) are drawn
+      by Holo.java instead, so they look like 4.0 everywhere.
     -->
     <style name="Holo" parent="@android:style/Theme.Holo">
         <item name="android:windowBackground">@drawable/holo_window_bg</item>
         <item name="android:windowContentOverlay">@null</item>
         <item name="android:colorAccent">@color/holo_blue</item>
+        <item name="android:textColorHighlight">@color/holo_blue_glow</item>
         <item name="android:actionBarStyle">@style/HoloActionBar</item>
-        <item name="android:actionBarSize">48dp</item>
-        <item name="android:titleTextStyle">@style/HoloTitle</item>
+        <item name="android:actionBarSize">52dp</item>
+        <item name="android:actionBarTabTextStyle">@style/HoloTabText</item>
         <item name="android:alertDialogTheme">@style/HoloAlertDialog</item>
     </style>
 
     <style name="HoloActionBar" parent="@android:style/Widget.Holo.ActionBar.Solid">
         <item name="android:background">@drawable/holo_actionbar</item>
+        <item name="android:backgroundStacked">@drawable/holo_actionbar_plain</item>
+        <item name="android:backgroundSplit">@drawable/holo_keybar</item>
         <item name="android:titleTextStyle">@style/HoloTitle</item>
+        <item name="android:subtitleTextStyle">@style/HoloSubtitle</item>
     </style>
 
-    <style name="HoloTitle" parent="@android:style/TextAppearance.Holo">
+    <style name="HoloTitle" parent="@android:style/TextAppearance.Holo.Widget.ActionBar.Title">
         <item name="android:textColor">@color/holo_text</item>
+        <item name="android:textSize">18sp</item>
+    </style>
+
+    <style name="HoloSubtitle" parent="@android:style/TextAppearance.Holo.Widget.ActionBar.Subtitle">
+        <item name="android:textColor">@color/holo_text_2</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+
+    <style name="HoloTabText" parent="@android:style/Widget.Holo.ActionBar.TabText">
+        <item name="android:textColor">@color/holo_text</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textAllCaps">true</item>
     </style>
 
     <style name="HoloAlertDialog" parent="@android:style/Theme.Holo.Dialog">
         <item name="android:windowBackground">@drawable/holo_dialog_bg</item>
-    </style>
-
-    <!-- the small blue capital letter above every group of rows -->
-    <style name="HoloCategory">
-        <item name="android:textSize">13sp</item>
-        <item name="android:textStyle">bold</item>
-        <item name="android:textAllCaps">true</item>
-        <item name="android:textColor">@color/holo_blue</item>
-        <item name="android:letterSpacing">0.04</item>
-        <item name="android:paddingLeft">16dp</item>
-        <item name="android:paddingRight">16dp</item>
-        <item name="android:paddingTop">20dp</item>
-        <item name="android:paddingBottom">6dp</item>
-    </style>
-
-    <style name="HoloRow">
-        <item name="android:background">@drawable/holo_row</item>
-        <item name="android:minHeight">64dp</item>
-        <item name="android:paddingLeft">16dp</item>
-        <item name="android:paddingRight">16dp</item>
-        <item name="android:paddingTop">10dp</item>
-        <item name="android:paddingBottom">10dp</item>
-        <item name="android:gravity">center_vertical</item>
-        <item name="android:orientation">horizontal</item>
-        <item name="android:clickable">true</item>
-        <item name="android:focusable">true</item>
-    </style>
-
-    <style name="HoloRowTitle">
-        <item name="android:textSize">17sp</item>
-        <item name="android:textColor">@color/holo_text</item>
-        <item name="android:singleLine">true</item>
-    </style>
-
-    <style name="HoloRowSummary">
-        <item name="android:textSize">13.5sp</item>
-        <item name="android:textColor">@color/holo_text_3</item>
-    </style>
-
-    <style name="HoloMono">
-        <item name="android:fontFamily">monospace</item>
-        <item name="android:textColor">@color/holo_blue</item>
-        <item name="android:textSize">13sp</item>
-    </style>
-
-    <style name="HoloButton" parent="@android:style/Widget.Holo.Button">
-        <item name="android:background">@drawable/holo_button</item>
-        <item name="android:textColor">@color/holo_text</item>
-        <item name="android:textSize">15sp</item>
-        <item name="android:minHeight">48dp</item>
-        <item name="android:minWidth">64dp</item>
-        <item name="android:gravity">center</item>
-        <item name="android:paddingLeft">16dp</item>
-        <item name="android:paddingRight">16dp</item>
-        <item name="android:textAllCaps">false</item>
-    </style>
-
-    <style name="HoloButtonPrimary">
-        <item name="android:background">@drawable/holo_button_primary</item>
-    </style>
-
-    <style name="HoloField">
-        <item name="android:background">@drawable/holo_field</item>
-        <item name="android:textColor">@color/holo_text</item>
-        <item name="android:textColorHint">@color/holo_text_3</item>
-        <item name="android:textSize">16sp</item>
-        <item name="android:singleLine">true</item>
-    </style>
-
-    <!-- the emulated phone's hardware keys: they light up when held -->
-    <style name="HoloKey">
-        <item name="android:background">@drawable/holo_key</item>
-        <item name="android:textColor">@color/holo_text</item>
-        <item name="android:textSize">14sp</item>
-        <item name="android:gravity">center</item>
-        <item name="android:minHeight">58dp</item>
-        <item name="android:clickable">true</item>
-        <item name="android:focusable">true</item>
-    </style>
-
-    <style name="HoloKeyHint" parent="HoloRowSummary">
-        <item name="android:textSize">10.5sp</item>
-        <item name="android:textAllCaps">true</item>
-        <item name="android:letterSpacing">0.08</item>
     </style>
 </resources>

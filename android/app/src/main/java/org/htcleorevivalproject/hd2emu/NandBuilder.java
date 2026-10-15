@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import java.nio.charset.Charset;
 
@@ -16,13 +16,21 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Builds a NAND image inside the app: the Java twin of tools/hd2_mknand.py.
+ * Builds a NAND image inside the app, in one of three kinds:
  *
- * It takes the same three things - cLK (LEOIMG.nbh or a raw lk.bin), a NAND
- * Android ROM zip and optionally a recovery image - and lays them out the way
- * HSPL, the cLK partition table and a recovery install would: the OS area at
- * block 0x212, then a VPTABLE (or cLK 1.4's compiled table), then boot.img,
- * then yaffs2 /system and /userdata.
+ * ANDROID, the Java twin of tools/hd2_mknand.py: cLK (LEOIMG.nbh or a raw
+ * lk.bin), a NAND Android ROM zip and optionally a recovery image, laid out
+ * the way HSPL, the cLK partition table and a recovery install would: the OS
+ * area at block 0x212, then a VPTABLE (or cLK 1.4's compiled table), then
+ * boot.img, then yaffs2 /system and /userdata.
+ *
+ * MAGLDR, tools/hd2_mkmagldr.py: magldr.nbh's OS section in the OS area and
+ * the factory MACs - plus, if given, a radio NBH's partitions the way
+ * tools/hd2_radio.py --write-nand adds them afterwards.
+ *
+ * WINMO, tools/hd2_wmnand.py: a stock Windows Mobile 6.5 RUU - its radio
+ * (or another radio NBH's) in the first blocks, its OS section page by page,
+ * WinCE sector info and all, from block 0x212.
  */
 public class NandBuilder {
 
@@ -38,7 +46,15 @@ static final Charset UTF8 = Charset.forName("UTF-8");
         void onError(String why);
     }
 
+    public static final int ANDROID = 0;
+    public static final int MAGLDR = 1;
+    public static final int WINMO = 2;
+
     public static class Options {
+        public int kind = ANDROID;
+        public File magldr;                   // MAGLDR: magldr.nbh
+        public File ruu;                      // WINMO: the stock RUU_signed.nbh
+        public File radio;                    // MAGLDR, WINMO: a radio RUU_signed.nbh, optional
         public File nbh;                      // cLK LEOIMG.nbh
         public File lk;                       // or a raw lk.bin
         public File rom;                      // a NAND ROM zip
@@ -73,6 +89,14 @@ static final Charset UTF8 = Charset.forName("UTF-8");
     }
 
     private void build() throws Exception {
+        if (o.kind == MAGLDR) {
+            buildMagldr();
+            return;
+        }
+        if (o.kind == WINMO) {
+            buildWinMo();
+            return;
+        }
         Nand.Os os;
         List<String[]> clk14 = null;
 
@@ -184,6 +208,124 @@ static final Charset UTF8 = Charset.forName("UTF-8");
             nand.close();
         }
         p.onDone(o.output);
+    }
+
+    /* -------------------------------------------------------------- MAGLDR */
+
+    /** hd2_mkmagldr.py, then (with a radio) hd2_radio.py --write-nand. */
+    private void buildMagldr() throws Exception {
+        if (o.magldr == null) throw new IOException("need magldr.nbh");
+        step("Reading MAGLDR");
+        Nand.Os os = Nand.extractNbhOs(Nand.read(o.magldr));
+        byte[] radio = null;
+        if (o.radio != null) {
+            step("Reading the radio");
+            Radio.Nbh nbh = new Radio.Nbh(o.radio);
+            try {
+                radio = nbh.payload();
+            } finally {
+                nbh.close();
+            }
+        }
+
+        step("Erasing the NAND");
+        Nand nand = new Nand(o.output);
+        try {
+            nand.writeFactoryMacs(Nand.mac(o.wifiMac), Nand.mac(o.btMac));
+            step("Writing the OS area");
+            for (int i = 0; i < os.sectors.size(); i++) {
+                nand.writePage((long) Nand.ROM_BLOCK * Nand.PPB + i, os.sectors.get(i));
+            }
+            step(os.sectors.size() + " OS-area pages from " + o.magldr.getName());
+            if (radio != null) {
+                step("Writing the radio partitions");
+                Radio.install(nand, radio, log());
+            }
+        } finally {
+            nand.close();
+        }
+        p.onDone(o.output);
+    }
+
+    /* ------------------------------------------------------- Windows Mobile */
+
+    /** Each RUU page in the file: 2048 data bytes and 8 of WinCE SectorInfo. */
+    private static final int NBH_PAGE = Nand.PAGE + 8;
+
+    /** hd2_wmnand.py: the radio partitions, then the OS section from block 0x212. */
+    private void buildWinMo() throws Exception {
+        if (o.ruu == null) throw new IOException("need the stock ROM's RUU_signed.nbh");
+        step("Reading the ROM");
+        Radio.Nbh ruu = new Radio.Nbh(o.ruu);
+        try {
+            long[] osSec = ruu.sections().get(0x400);
+            if (osSec == null || osSec[1] == 0 || osSec[1] % NBH_PAGE != 0) {
+                throw new IOException(o.ruu.getName() + ": no OS section");
+            }
+
+            step("Reading the radio");
+            byte[] radio;
+            File radioFile = o.radio != null ? o.radio : o.ruu;
+            if (o.radio != null) {
+                Radio.Nbh r = new Radio.Nbh(o.radio);
+                try {
+                    radio = r.section(0x301);
+                } finally {
+                    r.close();
+                }
+            } else {
+                radio = ruu.section(0x301);
+            }
+            if (radio == null || radio.length == 0) {
+                throw new IOException(radioFile.getName() + ": no radio section");
+            }
+
+            step("Erasing the NAND");
+            Nand nand = new Nand(o.output);
+            try {
+                step("Writing the radio partitions");
+                Radio.install(nand, radio, log());
+
+                long n = osSec[1] / NBH_PAGE;
+                if ((long) Nand.ROM_BLOCK * Nand.PPB + n > (long) Nand.NBLOCKS * Nand.PPB) {
+                    throw new IOException("the OS image does not fit");
+                }
+                step("Writing the OS area");
+                final int batch = 256;                       /* pages per read */
+                for (long i = 0; i < n; i += batch) {
+                    int count = (int) Math.min(batch, n - i);
+                    byte[] buf = ruu.read(osSec[0] + i * NBH_PAGE, count * NBH_PAGE);
+                    if (buf.length < count * NBH_PAGE) throw new IOException(o.ruu.getName() + " is cut short");
+                    for (int k = 0; k < count; k++) {
+                        int at = k * NBH_PAGE;
+                        if (erased(buf, at, NBH_PAGE)) continue;
+                        byte[] data = java.util.Arrays.copyOfRange(buf, at, at + Nand.PAGE);
+                        byte[] info = java.util.Arrays.copyOfRange(buf, at + Nand.PAGE, at + NBH_PAGE);
+                        nand.writePage((long) Nand.ROM_BLOCK * Nand.PPB + i + k, data, info);
+                    }
+                }
+                step(String.format(java.util.Locale.ROOT, "OS        block %d  %d pages", Nand.ROM_BLOCK, n));
+            } finally {
+                nand.close();
+            }
+        } finally {
+            ruu.close();
+        }
+        p.onDone(o.output);
+    }
+
+    private static boolean erased(byte[] b, int at, int n) {
+        for (int i = at; i < at + n; i++) if (b[i] != (byte) 0xff) return false;
+        return true;
+    }
+
+    private Radio.Log log() {
+        return new Radio.Log() {
+            @Override
+            public void line(String text) {
+                step(text);
+            }
+        };
     }
 
     private void writeYaffs(Nand nand, java.util.Map<String, int[]> layout, String name,

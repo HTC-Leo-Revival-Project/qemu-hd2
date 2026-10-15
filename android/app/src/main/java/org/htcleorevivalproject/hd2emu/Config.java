@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.content.Context;
 import android.content.SharedPreferences;
@@ -32,6 +32,7 @@ public class Config {
     public int gpuThreads = 0;            // 0 = QEMU's own choice
     public float volume = 1.0f;
     public boolean showFps = false;
+    public boolean keepScreenOn = true;   // while the emulator runs and its screen is shown
     public String extraArgs = "";
 
     private final SharedPreferences prefs;
@@ -89,6 +90,7 @@ public class Config {
         gpuThreads = prefs.getInt("gpuThreads", gpuThreads);
         volume = prefs.getFloat("volume", volume);
         showFps = prefs.getBoolean("showFps", showFps);
+        keepScreenOn = prefs.getBoolean("keepScreenOn", keepScreenOn);
         extraArgs = prefs.getString("extraArgs", extraArgs);
     }
 
@@ -109,6 +111,7 @@ public class Config {
                 .putInt("gpuThreads", gpuThreads)
                 .putFloat("volume", volume)
                 .putBoolean("showFps", showFps)
+                .putBoolean("keepScreenOn", keepScreenOn)
                 .putString("extraArgs", extraArgs)
                 .apply();
     }

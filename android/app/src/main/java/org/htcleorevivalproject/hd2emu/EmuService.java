@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -77,7 +77,7 @@ public class EmuService extends Service {
         if (nm == null || nm.getNotificationChannel(CHANNEL) != null) return;
         NotificationChannel c = new NotificationChannel(CHANNEL, getString(R.string.app_name),
                 NotificationManager.IMPORTANCE_LOW);
-        c.setDescription("The emulated HTC HD2");
+        c.setDescription(getString(R.string.channel_description));
         c.setShowBadge(false);
         nm.createNotificationChannel(c);
     }
@@ -96,7 +96,7 @@ public class EmuService extends Service {
                 : new Notification.Builder(this);
         b.setContentTitle(getString(R.string.app_name))
                 .setContentText(describe(state, message))
-                .setSmallIcon(android.R.drawable.ic_menu_manage)
+                .setSmallIcon(Build.VERSION.SDK_INT >= 21 ? R.drawable.ic_stat_hd2 : android.R.drawable.ic_menu_manage)
                 .setOngoing(state != Emulator.State.STOPPED && state != Emulator.State.CRASHED)
                 .setContentIntent(pi);
         if (state == Emulator.State.RUNNING || state == Emulator.State.STARTING) {
@@ -164,7 +164,7 @@ public class EmuService extends Service {
 
     /** The notification's Shut down button. */
     public static class Receiver extends android.content.BroadcastReceiver {
-        public static final String STOP = "org.qemu.htcleo.STOP";
+        public static final String STOP = "org.htcleorevivalproject.hd2emu.STOP";
 
         @Override
         public void onReceive(Context context, Intent intent) {

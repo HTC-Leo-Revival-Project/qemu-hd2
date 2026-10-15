@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.content.Context;
 import android.util.Log;
@@ -54,9 +54,11 @@ public class Emulator {
 
     private Process arm, hexagon;
     private Qmp qmp, q6qmp;
-    private VncClient vnc, q6vnc;
+    private volatile VncClient vnc, q6vnc;
     private PcmPlayer audio;
     private Thread sensors, bootKeys;
+    /** Whether anyone is looking at the screen; see {@link #setVideo}. */
+    private volatile boolean videoOn = true;
 
     public Emulator(Context ctx) {
         this.ctx = ctx.getApplicationContext();
@@ -111,10 +113,10 @@ public class Emulator {
     public void start(final Config cfg) {
         synchronized (opLock) {
             if (state == State.RUNNING || state == State.STARTING) {
-                setState(state, "The emulator is already running");
+                setState(state, ctx.getString(R.string.emu_already_running));
                 return;
             }
-            setState(State.STARTING, "Launching QEMU");
+            setState(State.STARTING, ctx.getString(R.string.emu_launching));
         }
         Thread t = new Thread(new Runnable() {
             @Override
@@ -136,15 +138,18 @@ public class Emulator {
     private void launch(Config cfg) throws Exception {
         running = cfg;
         File nand = paths.image(cfg.nand);
-        if (!nand.isFile()) throw new IOException(cfg.nand + " is not in the app's images folder");
-        if (Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile()) {
-            throw new IOException("amss.elf is missing (unpack it from the radio ROM)");
-        }
+        if (!nand.isFile()) throw new IOException(ctx.getString(R.string.emu_nand_missing, cfg.nand));
         boolean dsp = cfg.dspRunning();
-        if (dsp && !paths.image("dsp1.elf").isFile()) {
-            throw new IOException("dsp1.elf is missing (unpack it from the radio ROM)");
+        boolean needAmss = Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile();
+        boolean needDsp = dsp && !paths.image("dsp1.elf").isFile();
+        if (needAmss || needDsp) firmwareFromNand(nand, needAmss, needDsp);
+        if (Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile()) {
+            throw new IOException(ctx.getString(R.string.emu_amss_missing));
         }
-        if (!paths.ensurePcBios()) throw new IOException("the VNC keymaps are missing from the APK");
+        if (dsp && !paths.image("dsp1.elf").isFile()) {
+            throw new IOException(ctx.getString(R.string.emu_dsp_missing));
+        }
+        if (!paths.ensurePcBios()) throw new IOException(ctx.getString(R.string.emu_keymaps_missing));
 
         File qemu = paths.qemu("qemu-system-arm");
         cleanSockets();
@@ -233,13 +238,13 @@ public class Emulator {
         arm = spawn(qemu, args, "qemu.out", true);
 
         if (!waitForSocket(paths.qmpSocket(), 15000)) {
-            throw new IOException("QEMU did not open its monitor:\n" + tail("qemu.out"));
+            throw new IOException(ctx.getString(R.string.emu_no_monitor, tail("qemu.out")));
         }
         qmp = Qmp.connect(paths.qmpSocket().getAbsolutePath(), new Qmp.Events() {
             @Override
             public void onEvent(String name, JSONObject body) {
                 if ("SHUTDOWN".equals(name)) {
-                    note("QEMU powered the phone off");
+                    note(ctx.getString(R.string.emu_powered_off_by_qemu));
                 }
             }
         });
@@ -282,6 +287,25 @@ public class Emulator {
         if (!"menu".equals(cfg.boot)) startBootKeys(cfg);
     }
 
+    /**
+     * The real baseband and DSP run from amss.elf and dsp1.elf, but a NAND
+     * image with a radio in it (a stock ROM's, or MAGLDR's with a radio)
+     * already holds both: take the missing ones from there, as Images -> Radio
+     * firmware would.  If it has none, say where else they come from.
+     */
+    private void firmwareFromNand(File nand, boolean amss, boolean dsp) throws IOException {
+        note(ctx.getString(R.string.emu_taking_firmware, nand.getName()));
+        Radio.Firmware fw;
+        try {
+            fw = Radio.fromNand(nand);
+        } catch (IOException e) {
+            throw new IOException(ctx.getString(R.string.emu_firmware_failed, amss ? "amss.elf" : "dsp1.elf",
+                    e.getMessage()));
+        }
+        if (amss) Radio.Firmware.write(paths.image("amss.elf"), fw.amss);
+        if (dsp && fw.dsp != null) Radio.Firmware.write(paths.image("dsp1.elf"), fw.dsp);
+    }
+
     private boolean soundOn(Config cfg) {
         return "app".equals(cfg.audio);
     }
@@ -311,10 +335,10 @@ public class Emulator {
                     public void onClosed(String why) {
                         if (!why.isEmpty()) Log.i(TAG, "vnc closed: " + why);
                     }
-                }, true, sound);
+                }, videoOn, sound);
                 return;
             } catch (IOException e) {
-                if (tries == 19) note("No picture: " + e.getMessage());
+                if (tries == 19) note(ctx.getString(R.string.emu_no_picture, e.getMessage()));
                 sleep(250);
             }
         }
@@ -347,8 +371,8 @@ public class Emulator {
                     int code = p.waitFor();
                     if (state == State.STOPPING || state == State.STOPPED) return;
                     killAll();
-                    if (code == 0) setState(State.STOPPED, "The emulator powered off");
-                    else setState(State.CRASHED, "QEMU stopped (exit code " + code + ")\n" + tail("qemu.out"));
+                    if (code == 0) setState(State.STOPPED, ctx.getString(R.string.emu_powered_off));
+                    else setState(State.CRASHED, ctx.getString(R.string.emu_exit_code, code, tail("qemu.out")));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
@@ -420,7 +444,7 @@ public class Emulator {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                setState(State.STOPPING, "Shutting down");
+                setState(State.STOPPING, ctx.getString(R.string.state_stopping));
                 killAll();
                 setState(State.STOPPED, "");
             }
@@ -476,7 +500,7 @@ public class Emulator {
 
     public void reset() {
         if (qmp == null) {
-            note("The emulator is not running");
+            note(ctx.getString(R.string.emu_not_running));
             return;
         }
         qmp.exec("system_reset", null, new Qmp.Reply());
@@ -514,15 +538,25 @@ public class Emulator {
 
     public void setGps(final String latLonAlt) {
         if (qmp == null) {
-            note("The emulator is not running");
+            note(ctx.getString(R.string.emu_not_running));
             return;
         }
         if (running != null && Config.LLE.equals(running.baseband)) {
-            note("GPS fixes come from the modelled baseband (HLE mode)");
+            note(ctx.getString(R.string.emu_gps_hle_only));
             return;
         }
         qmp.exec("qom-set", arg("path", "/machine/modem", "property", "gps-fix", "value", latLonAlt),
                 new Qmp.Reply());
+    }
+
+    /**
+     * The picture only while it is on screen: the main activity turns it off
+     * when it goes into the background, and QEMU stops sending frames.
+     */
+    public void setVideo(boolean on) {
+        videoOn = on;
+        VncClient v = vnc;
+        if (v != null) v.setVideo(on);
     }
 
     public void setVolume(float v) {
@@ -550,7 +584,7 @@ public class Emulator {
     public Qmp.Reply hmp(final String command) {
         Qmp.Reply r = new Qmp.Reply();
         if (qmp == null) {
-            r.error = "The emulator is not running";
+            r.error = ctx.getString(R.string.emu_not_running);
             return r;
         }
         qmp.exec("human-monitor-command", arg("command-line", command), r);
@@ -565,7 +599,7 @@ public class Emulator {
     public Qmp.Reply hmpSync(final String command) {
         Qmp.Reply r = new Qmp.Reply();
         if (qmp == null) {
-            r.error = "The emulator is not running";
+            r.error = ctx.getString(R.string.emu_not_running);
             return r;
         }
         qmp.exec("human-monitor-command", arg("command-line", command), r);

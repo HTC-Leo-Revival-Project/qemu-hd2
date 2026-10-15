@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.util.Log;
 
@@ -43,6 +43,8 @@ public class VncClient {
     private final Thread thread;
     private volatile boolean closed;
     private volatile String reason = "";
+    /** False while nobody looks at the screen: no update is asked for, so none is sent. */
+    private volatile boolean video;
 
     private int width, height;
     private byte[] fb;
@@ -56,10 +58,11 @@ public class VncClient {
         this.thread = new Thread(new Runnable() {
             @Override
             public void run() {
-                handshake(wantVideo, wantAudio);
+                handshake(wantAudio);
             }
         }, "vnc");
         this.thread.setDaemon(true);
+        this.video = wantVideo;
     }
 
     public static VncClient connect(String path, Listener listener, boolean video, boolean audio)
@@ -80,6 +83,23 @@ public class VncClient {
     public void close() {
         closed = true;
         link.close();
+    }
+
+    /**
+     * Turns the picture on or off.  Off, the next update simply is not asked
+     * for, so QEMU stops encoding 1.5 MB frames nobody sees (the sound goes
+     * on); on again asks for one whole frame.
+     */
+    public void setVideo(boolean on) {
+        if (video == on) return;
+        video = on;
+        if (on && fb != null && !closed) {
+            try {
+                requestUpdate(false);
+            } catch (IOException e) {
+                Log.w(TAG, "update request: " + e.getMessage());
+            }
+        }
     }
 
     /* ------------------------------------------------------------- plumbing */
@@ -111,7 +131,7 @@ public class VncClient {
 
     /* ------------------------------------------------------------ handshake */
 
-    private void handshake(boolean wantVideo, boolean wantAudio) {
+    private void handshake(boolean wantAudio) {
         try {
             byte[] ver = readFully(12);
             if (!new String(ver, LATIN1).startsWith("RFB ")) throw new IOException("not a VNC server");
@@ -176,7 +196,7 @@ public class VncClient {
                 write(fmt);
                 write(new byte[]{(byte) 255, 1, 0, 0});          // and then silence
             }
-            if (wantVideo) requestUpdate(false);
+            if (video) requestUpdate(false);
             loop();
         } catch (EOFException e) {
             close("QEMU closed the VNC connection");
@@ -195,6 +215,7 @@ public class VncClient {
                     byte[] hdr = readFully(3);
                     int n = u16(hdr, 1);
                     boolean pixels = false;
+                    int top = Integer.MAX_VALUE, bottom = 0;
                     for (int i = 0; i < n; i++) {
                         byte[] r = readFully(12);
                         int x = u16(r, 0), y = u16(r, 2), w = u16(r, 4), h = u16(r, 6);
@@ -205,6 +226,8 @@ public class VncClient {
                             /* the server acknowledging the audio extension */
                         } else if (enc == ENC_RAW) {
                             pixels = true;
+                            top = Math.min(top, y);
+                            bottom = Math.max(bottom, y + h);
                             int stride = width * 4;
                             if (x == 0 && w == width && y * stride + h * stride <= fb.length) {
                                 /* the common case: one full frame, straight into place */
@@ -224,10 +247,11 @@ public class VncClient {
                         /* BGRX: Android's ARGB_8888 is the same four bytes, if the
                          * fourth one is opaque */
                         byte[] px = fb;
-                        for (int i = 3; i < px.length; i += 4) px[i] = (byte) 0xff;
+                        int end = Math.min(px.length, bottom * width * 4);
+                        for (int i = top * width * 4 + 3; i < end; i += 4) px[i] = (byte) 0xff;
                         listener.onFrame(px, width, height);
                     }
-                    requestUpdate(true);
+                    if (video) requestUpdate(true);
                     break;
                 }
                 case 1: {                                            // SetColourMapEntries
@@ -272,6 +296,8 @@ public class VncClient {
         width = w;
         height = h;
         fb = new byte[w * h * 4];
+        /* opaque from the start: only the rows an update touches are fixed up later */
+        for (int i = 3; i < fb.length; i += 4) fb[i] = (byte) 0xff;
         Log.i(TAG, "screen is now " + w + "x" + h);
     }
 

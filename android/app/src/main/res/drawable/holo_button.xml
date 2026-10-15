@@ -1,21 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
-<selector xmlns:android="http://schemas.android.com/apk/res/android">
+<!--
+  btn_default_holo_dark: a flat grey slab, a shade lighter along its top
+  edge, holo blue while it is held down.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android" android:exitFadeDuration="200">
     <item android:state_enabled="false">
         <shape android:shape="rectangle">
-            <solid android:color="#0affffff" />
-            <stroke android:width="1dp" android:color="#12ffffff" />
+            <corners android:radius="2dp" />
+            <solid android:color="#14ffffff" />
         </shape>
     </item>
     <item android:state_pressed="true">
         <shape android:shape="rectangle">
+            <corners android:radius="2dp" />
             <solid android:color="@color/holo_pressed" />
-            <stroke android:width="1dp" android:color="@color/holo_blue" />
+        </shape>
+    </item>
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <corners android:radius="2dp" />
+            <solid android:color="#ff3a3a3a" />
+            <stroke android:width="2dp" android:color="@color/holo_blue_glow" />
         </shape>
     </item>
     <item>
-        <shape android:shape="rectangle">
-            <solid android:color="#12ffffff" />
-            <stroke android:width="1dp" android:color="#1affffff" />
-        </shape>
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <corners android:radius="2dp" />
+                    <solid android:color="#ff555555" />
+                </shape>
+            </item>
+            <item android:top="1dp">
+                <shape android:shape="rectangle">
+                    <corners android:radius="2dp" />
+                    <solid android:color="#ff3a3a3a" />
+                </shape>
+            </item>
+        </layer-list>
     </item>
 </selector>

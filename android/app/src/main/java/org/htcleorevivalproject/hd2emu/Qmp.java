@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.util.Log;
 
@@ -250,16 +250,25 @@ public class Qmp {
     }
 
     private void watchReplies() {
-        synchronized (sent) {
-            while (true) {
+        while (true) {
+            Object[] head;
+            /*
+             * Only take the next reply under the lock, and wait for it outside:
+             * send() runs on the UI thread for every touch, and it must never
+             * queue behind a slow reply.
+             */
+            synchronized (sent) {
                 while (sent.isEmpty()) {
+                    if (closed) return;
                     try {
-                        sent.wait();
+                        sent.wait(1000);
                     } catch (InterruptedException e) {
                         return;
                     }
                 }
-                Object[] head = sent.removeFirst();
+                head = sent.removeFirst();
+            }
+            {
                 String name = (String) head[0];
                 Pending p = (Pending) head[1];
                 synchronized (p) {
@@ -284,8 +293,19 @@ public class Qmp {
         exec(name, args, new Reply());
     }
 
+    /** Threads for the commands that wait for their reply: reused, not one per command. */
+    private static final java.util.concurrent.ExecutorService POOL =
+            java.util.concurrent.Executors.newCachedThreadPool(new java.util.concurrent.ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "qmp-exec");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+
     public void exec(final String name, final JSONObject args, final Reply reply) {
-        Thread t = new Thread(new Runnable() {
+        POOL.execute(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -302,9 +322,7 @@ public class Qmp {
                     }
                 }
             }
-        }, "qmp-" + name);
-        t.setDaemon(true);
-        t.start();
+        });
     }
 
     /** Blocks for the answer; only call from a worker thread. */

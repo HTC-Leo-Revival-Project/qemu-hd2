@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The action bar on a screen with tabs, and the bar the tabs sit in: the same
+  black with no rule, because the selected tab's own blue bar takes its place.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#ff1d1d1d" />
+</shape>

@@ -1,18 +1,10 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
-import android.app.Activity;
 import android.content.Intent;
-import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
 import android.text.InputType;
-import android.view.Gravity;
 import android.view.View;
-import android.view.ViewGroup;
-import android.widget.EditText;
-import android.widget.LinearLayout;
-import android.widget.SeekBar;
-import android.widget.TextView;
 import android.widget.Toast;
 
 /**
@@ -21,42 +13,32 @@ import android.widget.Toast;
  * interlock), and no USB LLE (that needs vhci_hcd and root).  Everything else
  * takes effect the next time the emulator is started.
  */
-public class SettingsActivity extends Activity {
+public class SettingsActivity extends HoloActivity {
     private static final int REQ_PICK = 1;
 
     private Config config;
-    private Holo holo;
     private Emulator emu;
     private Images images;
-    private LinearLayout root;
+    private Holo.Page page;
+
+    private final Runnable build = new Runnable() {
+        @Override
+        public void run() {
+            build();
+        }
+    };
 
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
         config = new Config(this);
         config.load();
-        holo = new Holo(this);
         emu = EmuService.instance(this);
         images = new Images(emu.paths());
 
-        root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        setContentView(root);
-        Holo.apply(root);
-
-        if (android.os.Build.VERSION.SDK_INT >= 11 && getActionBar() != null) {
-            getActionBar().setDisplayHomeAsUpEnabled(true);
-        }
-        build();
-    }
-
-    @Override
-    public boolean onOptionsItemSelected(android.view.MenuItem item) {
-        if (item.getItemId() == android.R.id.home) {
-            finish();
-            return true;
-        }
-        return super.onOptionsItemSelected(item);
+        page = new Holo.Page(this);
+        setContentView(page.scroll);
+        Holo.apply(page.scroll);
     }
 
     @Override
@@ -67,162 +49,11 @@ public class SettingsActivity extends Activity {
 
     private void rebuild() {
         config.load();
-        root.removeAllViews();
-        build();
+        page.rebuild(build);
     }
 
     private void save() {
         config.save();
-    }
-
-    /* ------------------------------------------------------------- the rows */
-
-    private void category(String title) {
-        TextView t = new TextView(this);
-        t.setText(title);
-        t.setTextSize(13f);
-        t.setTypeface(null, android.graphics.Typeface.BOLD);
-        t.setAllCaps(true);
-        t.setLetterSpacing(0.04f);
-        t.setTextColor(0xff33b5e5);
-        t.setPadding(holo.dp(16), holo.dp(20), holo.dp(16), holo.dp(6));
-        root.addView(t);
-    }
-
-    private void note(String text) {
-        TextView t = new TextView(this);
-        t.setText(text);
-        t.setTextSize(12.5f);
-        t.setTextColor(0xff808080);
-        t.setPadding(holo.dp(16), holo.dp(4), holo.dp(16), holo.dp(10));
-        t.setLineSpacing(0, 1.2f);
-        root.addView(t);
-    }
-
-    private void divider() {
-        View v = new View(this);
-        v.setBackgroundColor(0x1affffff);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 1);
-        lp.leftMargin = holo.dp(16);
-        lp.rightMargin = holo.dp(16);
-        root.addView(v, lp);
-    }
-
-    /** A row that opens a list of choices. */
-    private void list(String title, final String summary, final String[] labels,
-                      final String[] summaries, final String value, final Holo.OnPick pick) {
-        Holo.Row row = new Holo.Row(this);
-        row.setTitle(title, summary);
-        row.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                int checked = 0;
-                for (int i = 0; i < labels.length; i++) {
-                    if (labels[i].equals(value)) checked = i;
-                }
-                holo.list(title, labels, summaries, checked, pick);
-            }
-        });
-        root.addView(row);
-    }
-
-    private void listPref(String title, String summary, String[] labels, String[] summaries,
-                          String value, final Holo.OnPick pick) {
-        list(title, summary, labels, summaries, value, pick);
-    }
-
-    private void switchRow(String title, String summary, boolean on, final Holo.OnToggle toggle) {
-        Holo.Row row = new Holo.Row(this);
-        row.setTitle(title, summary);
-        row.addWidget(holo.switchView(on, toggle));
-        root.addView(row);
-    }
-
-    private void seekRow(String title, int min, int max, int value, final Holo.Format label,
-                         final Holo.OnSeek onSeek) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(holo.dp(16), holo.dp(8), holo.dp(16), holo.dp(8));
-
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        TextView name = new TextView(this);
-        name.setText(title);
-        name.setTextSize(17f);
-        name.setTextColor(Color.WHITE);
-        final TextView val = new TextView(this);
-        val.setText(label.format(value));
-        val.setTextSize(13f);
-        val.setTypeface(android.graphics.Typeface.MONOSPACE);
-        val.setTextColor(0xff33b5e5);
-        head.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        head.addView(val);
-        box.addView(head);
-
-        SeekBar bar = holo.seek(min, max, value, new Holo.OnSeek() {
-            @Override
-            public void onSeek(int v) {
-                val.setText(label.format(v));
-                onSeek.onSeek(v);
-            }
-        });
-        /* -1 is MATCH_CONTENT: API 36's android.jar no longer exposes the constant */
-        box.addView(bar, new LinearLayout.LayoutParams(-1,
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
-        root.addView(box);
-    }
-
-    private void editRow(String title, String summary, String value, final String what) {
-        Holo.Row row = new Holo.Row(this);
-        row.setTitle(title, summary);
-        row.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                final EditText field = new EditText(SettingsActivity.this);
-                field.setBackgroundResource(R.drawable.holo_field);
-                field.setTextColor(Color.WHITE);
-                field.setSingleLine(true);
-                field.setInputType(InputType.TYPE_CLASS_TEXT);
-                field.setText(what.equals("adbPort") ? String.valueOf(config.adbPort) : config.extraArgs);
-                field.setSelectAllOnFocus(true);
-
-                LinearLayout box = new LinearLayout(SettingsActivity.this);
-                box.setOrientation(LinearLayout.VERTICAL);
-                box.setPadding(holo.dp(20), holo.dp(20), holo.dp(20), holo.dp(20));
-                box.addView(field, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.WRAP_CONTENT));
-                android.app.AlertDialog d = new android.app.AlertDialog.Builder(SettingsActivity.this)
-                        .setTitle(title)
-                        .setView(box)
-                        .setNegativeButton(R.string.cancel, null)
-                        .setPositiveButton(R.string.nok, new android.content.DialogInterface.OnClickListener() {
-                            @Override
-                            public void onClick(android.content.DialogInterface dialog, int which) {
-                                String s = field.getText().toString();
-                                if (what.equals("adbPort")) {
-                                    config.adbPort = Math.max(1024, Math.min(65535, number(s, 5555)));
-                                } else {
-                                    config.extraArgs = s;
-                                }
-                                save();
-                                rebuild();
-                            }
-                        })
-                        .create();
-                holo.show(d);
-                field.requestFocus();
-            }
-        });
-        root.addView(row);
-    }
-
-    private static int number(String s, int fallback) {
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (Exception e) {
-            return fallback;
-        }
     }
 
     /* --------------------------------------------------------------- the page */
@@ -230,14 +61,18 @@ public class SettingsActivity extends Activity {
     private void build() {
         final boolean lle = Config.LLE.equals(config.baseband);
 
-        category("Processors");
-        listPref("Baseband (modem core)", basebandSummary(), new String[]{"Modelled (HLE)",
-                        "Real AMSS firmware (LLE)"},
-                new String[]{"Fast. Network registration, data, SMS and GPS fixes work.",
-                        images.amss() ? "The radio ROM's own ARM9 code. No network signal."
-                                      : "Needs amss.elf in the app's images folder"},
-                Config.LLE.equals(config.baseband) ? "Real AMSS firmware (LLE)" : "Modelled (HLE)",
-                new Holo.OnPick() {
+        if (emu.isRunning()) {
+            page.banner(getString(R.string.set_running_banner),
+                    0x3333b5e5);
+        }
+
+        page.category(getString(R.string.set_cat_processors));
+        page.choice(getString(R.string.set_baseband),
+                getString(lle ? R.string.set_baseband_lle : R.string.set_baseband_hle),
+                new String[]{getString(R.string.set_baseband_hle), getString(R.string.set_baseband_lle)},
+                new String[]{getString(R.string.set_baseband_hle_sum),
+                        getString(images.amss() ? R.string.set_baseband_lle_sum : R.string.set_needs_amss)},
+                lle ? 1 : 0, new Holo.OnPick() {
                     @Override
                     public void onPick(int index) {
                         config.baseband = index == 1 ? Config.LLE : Config.HLE;
@@ -253,15 +88,13 @@ public class SettingsActivity extends Activity {
                         rebuild();
                     }
                 });
-        divider();
-        listPref("QDSP6 (multimedia DSP)", Config.LLE.equals(config.dsp)
-                        ? "Real DSP1 firmware (LLE)" : "Not running",
-                new String[]{"Not running", "Real DSP1 firmware (LLE)"},
-                new String[]{"Codecs and audio fall back to software",
-                        images.dsp1() ? "QDSP6 in a second process: H.264 decode, MPEG-4 encode, audio"
-                                      : "Needs dsp1.elf in the app's images folder"},
-                Config.LLE.equals(config.dsp) ? "Real DSP1 firmware (LLE)" : "Not running",
-                new Holo.OnPick() {
+        boolean dsp = Config.LLE.equals(config.dsp);
+        page.choice(getString(R.string.set_dsp),
+                getString(dsp ? R.string.set_dsp_lle : R.string.set_dsp_off),
+                new String[]{getString(R.string.set_dsp_off), getString(R.string.set_dsp_lle)},
+                new String[]{getString(R.string.set_dsp_off_sum),
+                        getString(images.dsp1() ? R.string.set_dsp_lle_sum : R.string.set_needs_dsp1)},
+                dsp ? 1 : 0, new Holo.OnPick() {
                     @Override
                     public void onPick(int index) {
                         config.dsp = index == 1 ? Config.LLE : Config.HLE;
@@ -269,14 +102,13 @@ public class SettingsActivity extends Activity {
                         rebuild();
                     }
                 });
-        if (!lle) note("The DSP firmware runs on top of the real baseband.");
+        if (!lle) page.note(getString(R.string.set_dsp_note));
         if (config.dspRunning()) {
-            divider();
-            listPref("DSP clock (icount shift)", shiftLabel(config.dspShift),
-                    new String[]{"auto", "shift=0", "shift=1", "shift=2", "shift=3", "shift=4"},
-                    new String[]{"QEMU adjusts the shift to follow real time",
-                            "1 ns per instruction", "the default", "", "", ""},
-                    shiftLabel(config.dspShift), new Holo.OnPick() {
+            page.choice(getString(R.string.set_dsp_clock), shiftLabel(config.dspShift),
+                    new String[]{getString(R.string.set_auto), "shift=0", "shift=1", "shift=2", "shift=3", "shift=4"},
+                    new String[]{getString(R.string.set_shift_auto_sum),
+                            getString(R.string.set_shift_0_sum), getString(R.string.set_shift_1_sum), "", "", ""},
+                    config.dspShift + 1, new Holo.OnPick() {
                         @Override
                         public void onPick(int index) {
                             config.dspShift = index - 1;
@@ -286,34 +118,57 @@ public class SettingsActivity extends Activity {
                     });
         }
 
-        category("Images");
-        listPref("NAND flash", nandSummary(), nandLabels(), nandSizes(), config.nand,
+        page.category(getString(R.string.set_cat_images));
+        final String[] nands = nandLabels();
+        int nandIndex = 0;
+        for (int i = 0; i < nands.length; i++) if (nands[i].equals(config.nand)) nandIndex = i;
+        page.choice(getString(R.string.set_nand), nandSummary(), nands, nandSizes(), nandIndex,
                 new Holo.OnPick() {
                     @Override
                     public void onPick(int index) {
-                        config.nand = nandLabels()[index];
+                        config.nand = nands[index];
                         save();
                         rebuild();
                     }
                 });
-        divider();
-        Holo.Row add = new Holo.Row(this);
-        add.setTitle("Add an image…", "Copy a NAND or microSD image into the app's own storage");
-        add.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startActivityForResult(Images.picker(), REQ_PICK);
-            }
-        });
-        root.addView(add);
+        final java.util.List<String> cards = new java.util.ArrayList<String>();
+        cards.add(getString(R.string.set_none));
+        for (Images.File2 f : images.list()) if (!f.name.equals(config.nand)) cards.add(f.name);
+        final String[] cardLabels = cards.toArray(new String[0]);
+        int cardIndex = Math.max(0, cards.indexOf(config.sdcard));
+        page.choice(getString(R.string.set_sdcard), config.sdcard.isEmpty() ? getString(R.string.set_none)
+                        : images.has(config.sdcard) ? config.sdcard
+                        : getString(R.string.set_not_in_folder, config.sdcard),
+                cardLabels, null, cardIndex, new Holo.OnPick() {
+                    @Override
+                    public void onPick(int index) {
+                        config.sdcard = index == 0 ? "" : cardLabels[index];
+                        save();
+                        rebuild();
+                    }
+                });
+        page.row(getString(R.string.set_manage_images), getString(R.string.set_manage_images_sum),
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        startActivity(new Intent(SettingsActivity.this, ImagesActivity.class));
+                    }
+                });
+        page.row(getString(R.string.set_add_image), getString(R.string.set_add_image_sum),
+                new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        startActivityForResult(Images.picker(), REQ_PICK);
+                    }
+                });
 
-        category("Graphics and sound");
+        page.category(getString(R.string.set_cat_graphics));
         final boolean gles = "gles".equals(config.gpu);
-        listPref("Adreno 200 renderer", gles ? "This phone's GPU" : "Software",
-                new String[]{"Software", "This phone's GPU"},
-                new String[]{"Everything on the CPU",
-                        "The Adreno 200 runs on this phone's own GPU through OpenGL ES 3"},
-                gles ? "This phone's GPU" : "Software", new Holo.OnPick() {
+        page.choice(getString(R.string.set_renderer),
+                getString(gles ? R.string.set_renderer_gles : R.string.set_renderer_soft),
+                new String[]{getString(R.string.set_renderer_soft), getString(R.string.set_renderer_gles)},
+                new String[]{getString(R.string.set_renderer_soft_sum), getString(R.string.set_renderer_gles_sum)},
+                gles ? 1 : 0, new Holo.OnPick() {
                     @Override
                     public void onPick(int index) {
                         config.gpu = index == 1 ? "gles" : "soft";
@@ -321,16 +176,11 @@ public class SettingsActivity extends Activity {
                         rebuild();
                     }
                 });
-        note(gles ? "The host GPU is asked for an OpenGL ES 3 context and checked "
-                        + "for what the renderer needs; the answer is in the emulator "
-                        + "log. Software until the ES renderer lands."
-                : "Software only: the phone's GPU has no desktop OpenGL 4.5, which "
-                        + "is what the translated shaders ask for today.");
-        divider();
-        seekRow("GPU threads", 0, 8, config.gpuThreads, new Holo.Format() {
+        page.seek(getString(R.string.set_gpu_threads), 0, 8, config.gpuThreads, new Holo.Format() {
             @Override
             public String format(int v) {
-                return threadsLabel(v);
+                return v == 0 ? getString(R.string.set_auto) : v == 1 ? getString(R.string.set_one_thread)
+                        : getString(R.string.set_threads, v);
             }
         }, new Holo.OnSeek() {
             @Override
@@ -339,13 +189,13 @@ public class SettingsActivity extends Activity {
                 save();
             }
         });
-        note("0 leaves the choice to QEMU; more threads make the software renderer faster on "
-                + "a phone with big cores.");
-        divider();
-        listPref("Audio output", "app".equals(config.audio) ? "This phone" : "Muted",
-                new String[]{"This phone", "Muted"},
-                new String[]{"QEMU's PCM stream played by AudioTrack", "No sound at all"},
-                "app".equals(config.audio) ? "This phone" : "Muted", new Holo.OnPick() {
+        page.note(getString(gles ? R.string.set_gles_note : R.string.set_soft_note));
+        final boolean sound = "app".equals(config.audio);
+        page.choice(getString(R.string.set_audio),
+                getString(sound ? R.string.set_audio_phone : R.string.set_audio_muted),
+                new String[]{getString(R.string.set_audio_phone), getString(R.string.set_audio_muted)},
+                new String[]{getString(R.string.set_audio_phone_sum), getString(R.string.set_audio_muted_sum)},
+                sound ? 0 : 1, new Holo.OnPick() {
                     @Override
                     public void onPick(int index) {
                         config.audio = index == 0 ? "app" : "off";
@@ -354,11 +204,10 @@ public class SettingsActivity extends Activity {
                         rebuild();
                     }
                 });
-        divider();
-        seekRow("Volume", 0, 100, Math.round(config.volume * 100), new Holo.Format() {
+        page.seek(getString(R.string.set_volume), 0, 100, Math.round(config.volume * 100), new Holo.Format() {
             @Override
             public String format(int v) {
-                return volumeLabel(v / 100f);
+                return getString(R.string.percent, v);
             }
         }, new Holo.OnSeek() {
             @Override
@@ -369,8 +218,18 @@ public class SettingsActivity extends Activity {
             }
         });
 
-        category("Network");
-        switchRow("WiFi", "Open network HD2-QEMU with internet through QEMU", config.wifi,
+        page.category(getString(R.string.set_cat_screen));
+        page.switchRow(getString(R.string.set_keep_on), getString(R.string.set_keep_on_sum),
+                config.keepScreenOn, new Holo.OnToggle() {
+                    @Override
+                    public void onToggle(boolean on) {
+                        config.keepScreenOn = on;
+                        save();
+                    }
+                });
+
+        page.category(getString(R.string.set_cat_network));
+        page.switchRow(getString(R.string.set_wifi), getString(R.string.set_wifi_sum), config.wifi,
                 new Holo.OnToggle() {
                     @Override
                     public void onToggle(boolean on) {
@@ -378,8 +237,7 @@ public class SettingsActivity extends Activity {
                         save();
                     }
                 });
-        divider();
-        switchRow("Mobile data", "The modem's packet data link", config.mobileData,
+        page.switchRow(getString(R.string.set_mobile_data), getString(R.string.set_mobile_data_sum), config.mobileData,
                 new Holo.OnToggle() {
                     @Override
                     public void onToggle(boolean on) {
@@ -387,15 +245,25 @@ public class SettingsActivity extends Activity {
                         save();
                     }
                 });
-        divider();
-        editRow("adb port", "adb connect 127.0.0.1:" + config.adbPort, "", "adbPort");
+        page.edit(getString(R.string.set_adb_port), "adb connect 127.0.0.1:" + config.adbPort,
+                String.valueOf(config.adbPort), "5555", InputType.TYPE_CLASS_NUMBER,
+                new Holo.OnText() {
+                    @Override
+                    public void onText(String s) {
+                        config.adbPort = Math.max(1024, Math.min(65535, number(s, 5555)));
+                        save();
+                        rebuild();
+                    }
+                });
 
-        category("Boot");
-        listPref("Boot", bootLabel(config.boot), new String[]{"Boot from NAND", "Recovery",
-                        "Stay in the bootloader"},
-                new String[]{"Picks BOOT FROM NAND in the cLK menu", "Picks RECOVERY in the cLK menu",
-                        "No key presses; also for MAGLDR images"},
-                bootLabel(config.boot), new Holo.OnPick() {
+        page.category(getString(R.string.set_cat_boot));
+        page.choice(getString(R.string.set_boot), bootLabel(config.boot),
+                new String[]{getString(R.string.set_boot_nand), getString(R.string.set_boot_recovery),
+                        getString(R.string.set_boot_menu)},
+                new String[]{getString(R.string.set_boot_nand_sum), getString(R.string.set_boot_recovery_sum),
+                        getString(R.string.set_boot_menu_sum)},
+                "nand".equals(config.boot) ? 0 : "recovery".equals(config.boot) ? 1 : 2,
+                new Holo.OnPick() {
                     @Override
                     public void onPick(int index) {
                         config.boot = index == 0 ? "nand" : index == 1 ? "recovery" : "menu";
@@ -404,8 +272,8 @@ public class SettingsActivity extends Activity {
                     }
                 });
 
-        category("Debugging");
-        switchRow("Show the frame rate", "Frames per second, over the screen", config.showFps,
+        page.category(getString(R.string.set_cat_debugging));
+        page.switchRow(getString(R.string.set_show_fps), getString(R.string.set_show_fps_sum), config.showFps,
                 new Holo.OnToggle() {
                     @Override
                     public void onToggle(boolean on) {
@@ -413,41 +281,50 @@ public class SettingsActivity extends Activity {
                         save();
                     }
                 });
-        divider();
-        editRow("Extra QEMU arguments", config.extraArgs.isEmpty() ? "None" : config.extraArgs,
-                "", "extra");
-        divider();
-        editRow("adb bridge port", String.valueOf(config.adbPort), "", "adbPort");
-        note("USB LLE is not here: it hands the emulated phone to the host's own USB stack "
-                + "through vhci_hcd, which needs root that an app can never have.");
+        page.edit(getString(R.string.set_extra_args), config.extraArgs.isEmpty() ? getString(R.string.set_none) : config.extraArgs,
+                config.extraArgs, "-d guest_errors", 0, new Holo.OnText() {
+                    @Override
+                    public void onText(String s) {
+                        config.extraArgs = s;
+                        save();
+                        rebuild();
+                    }
+                });
+        page.edit(getString(R.string.set_adb_port), String.valueOf(config.adbPort),
+                String.valueOf(config.adbPort), "5555", InputType.TYPE_CLASS_NUMBER,
+                new Holo.OnText() {
+                    @Override
+                    public void onText(String s) {
+                        config.adbPort = Math.max(1024, Math.min(65535, number(s, 5555)));
+                        save();
+                        rebuild();
+                    }
+                });
+        page.note(getString(R.string.set_usb_lle_note));
     }
 
-    private String basebandSummary() {
-        return Config.LLE.equals(config.baseband) ? "Real AMSS firmware (LLE)" : "Modelled (HLE)";
+    private static int number(String s, int fallback) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return fallback;
+        }
     }
 
     private String shiftLabel(int shift) {
-        return shift < 0 ? "auto" : "shift=" + shift;
+        return shift < 0 ? getString(R.string.set_auto) : "shift=" + shift;
     }
 
     private String bootLabel(String boot) {
-        return "nand".equals(boot) ? "Boot from NAND" : "recovery".equals(boot) ? "Recovery"
-                : "Stay in the bootloader";
-    }
-
-    private String threadsLabel(int n) {
-        return n == 0 ? "auto" : n + " threads";
-    }
-
-    private String volumeLabel(float v) {
-        return Math.round(v * 100) + "%";
+        return getString("nand".equals(boot) ? R.string.set_boot_nand
+                : "recovery".equals(boot) ? R.string.set_boot_recovery : R.string.set_boot_menu);
     }
 
     private String nandSummary() {
         for (Images.File2 f : images.list()) {
             if (f.name.equals(config.nand)) return f.name + " · " + Config.gb(f.size);
         }
-        return config.nand + " (not in the app's images folder)";
+        return getString(R.string.set_not_in_folder, config.nand);
     }
 
     private String[] nandLabels() {
@@ -462,7 +339,7 @@ public class SettingsActivity extends Activity {
         java.util.List<Images.File2> all = images.list();
         String[] out = new String[all.size()];
         for (int i = 0; i < out.length; i++) out[i] = Config.gb(all.get(i).size);
-        if (out.length == 0) out = new String[]{"missing"};
+        if (out.length == 0) out = new String[]{getString(R.string.set_missing)};
         return out;
     }
 
@@ -474,17 +351,12 @@ public class SettingsActivity extends Activity {
         if (request != REQ_PICK || result != RESULT_OK || data == null || data.getData() == null) return;
         final Uri uri = data.getData();
         final String name = Images.nameOf(this, uri);
-        final android.app.ProgressDialog bar = new android.app.ProgressDialog(this);
-        bar.setProgressStyle(android.app.ProgressDialog.STYLE_HORIZONTAL);
-        bar.setIndeterminate(true);
-        bar.setMessage("Copying " + name + "…");
-        bar.setCancelable(false);
-        bar.show();
+        final Holo.Progress bar = new Holo.Progress(this, getString(R.string.adding_image),
+                getString(R.string.importing, name));
         new Images.Import().run(this, uri, name, new Images.Import.Progress() {
             @Override
             public void onProgress(long done, long total) {
-                if (total > 0) bar.setMax((int) (total / 1024));
-                bar.setProgress((int) (done / 1024));
+                bar.progress(done, total);
             }
 
             @Override

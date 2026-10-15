@@ -1,4 +1,4 @@
-package org.qemu.htcleo;
+package org.htcleorevivalproject.hd2emu;
 
 import android.content.Context;
 import android.graphics.Bitmap;
@@ -46,6 +46,7 @@ public class ScreenView extends View {
     private volatile boolean haveFrame;
     private volatile boolean renderPending;
     private int activePointer = -1;
+    private int frames;
 
     public ScreenView(Context context) {
         super(context);
@@ -105,6 +106,14 @@ public class ScreenView extends View {
         src.set(0, 0, w, h);
         canvas.drawColor(Color.BLACK);
         canvas.drawBitmap(bitmap, src, dst, paint);
+        frames++;
+    }
+
+    /** Frames drawn since the last call: called once a second, it is the frame rate. */
+    public int takeFrames() {
+        int n = frames;
+        frames = 0;
+        return n;
     }
 
     /** The screen is 480x800; show all of it, centred, never stretched. */
