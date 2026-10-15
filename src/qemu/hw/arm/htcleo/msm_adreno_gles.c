@@ -24,6 +24,7 @@
 #include "system/memory.h"
 #include "system/physmem.h"
 #include "msm_adreno_gles.h"
+#include "msm_adreno_sq.h"
 
 /* ------------------------------------------------------- the host's GL ES */
 
@@ -1668,9 +1669,11 @@ static void gles_upload_vertices(MsmAdrenoState *s, const GlesProg *p,
 
     for (int i = 0; i < vi->nvtx; i++) {
         uint32_t stride = vi->vtx_stride[i];
+        uint32_t unit = ADRENO_VFETCH_UNIT(s->regs[A2_SQ_FETCH_0 +
+                                                  vi->vtx[i] * 2 + 1]);
 
-        lo[i] = (int64_t)g->min_idx * stride + vi->vtx_lo[i];
-        hi[i] = (int64_t)g->max_idx * stride + vi->vtx_hi[i];
+        lo[i] = ((int64_t)g->min_idx * stride + vi->vtx_lo[i]) * unit;
+        hi[i] = ((int64_t)g->max_idx * stride + vi->vtx_hi[i]) * unit;
         hi[i] = MIN(hi[i], lo[i] + (16 << 20));
         total += ROUND_UP(hi[i] - lo[i], 16);
     }
@@ -1687,7 +1690,7 @@ static void gles_upload_vertices(MsmAdrenoState *s, const GlesProg *p,
                         buf + at, len);
         du->vb[i][0] = (base + at) / 4;
         du->vb[i][1] = lo[i];
-        du->vb[i][2] = fc1 & 3;
+        du->vb[i][2] = (fc1 & 3) | (ADRENO_VFETCH_UNIT(fc1) == 4 ? 4 : 0);
         du->vb[i][3] = len;
         at += ROUND_UP(len, 16);
     }
@@ -2101,6 +2104,12 @@ void adreno_gles_probe(MsmAdrenoState *s)
     gles_rop_smoke_test();
     /* the real context belongs to the thread that draws */
     gles_teardown();
+    /*
+     * The host proved it can do ES, so let the adreno_gl_*() entry points
+     * forward here.  Without desktop OpenGL in the build they are empty stubs
+     * that do nothing unless this says so, and nothing else picks the backend.
+     */
+    s->gl_gles = true;
 }
 
 bool adreno_gles_available(MsmAdrenoState *s)
