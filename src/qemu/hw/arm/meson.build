@@ -158,6 +158,10 @@ else
   arm_common_ss.add(when: 'CONFIG_HTCLEO',
                     if_true: files('htcleo/msm_adreno_gl.c'))
 endif
+# the OpenGL ES one for hosts without desktop OpenGL (a phone): it finds its
+# entry points in libEGL/libGLESv3 with dlopen, so it needs nothing linked in
+arm_common_ss.add(when: 'CONFIG_HTCLEO',
+                  if_true: files('htcleo/msm_adreno_gles.c'))
 
 arm_common_ss.add(files('boot.c'))
 

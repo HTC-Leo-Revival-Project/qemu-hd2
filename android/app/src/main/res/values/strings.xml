@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HTC HD2</string>
+    <string name="settings">Settings</string>
+    <string name="sensors">Sensors</string>
+    <string name="logs">Logs</string>
+    <string name="nand_builder">NAND builder</string>
+
+    <!-- main screen -->
+    <string name="power_on">Power on</string>
+    <string name="shut_down">Shut down</string>
+    <string name="restart">Restart QEMU</string>
+    <string name="reset_board">Reset board</string>
+    <string name="screenshot">Screenshot</string>
+    <string name="key_call">Call</string>
+    <string name="key_home">Home</string>
+    <string name="key_menu">Windows</string>
+    <string name="key_back">Back</string>
+    <string name="key_end">End</string>
+    <string name="key_power">Power</string>
+    <string name="key_volup">Volume +</string>
+    <string name="key_voldown">Volume −</string>
+
+    <string name="state_stopped">Powered off</string>
+    <string name="state_starting">Starting</string>
+    <string name="state_running">Running</string>
+    <string name="state_stopping">Shutting down</string>
+    <string name="state_crashed">Stopped with an error</string>
+    <string name="powered_off_blurb">Power on to start the emulated phone.\n\nIt boots whatever is in its NAND image, the way the phone would.</string>
+
+    <string name="menu_settings">Settings</string>
+    <string name="menu_sensors">Sensors</string>
+    <string name="menu_logs">Logs</string>
+    <string name="menu_nand">Build a NAND image</string>
+    <string name="menu_about">About</string>
+
+    <string name="nok">OK</string>
+    <string name="cancel">Cancel</string>
+    <string name="close">Close</string>
+    <string name="no_picture">There is no picture yet</string>
+    <string name="saved">Saved to %s</string>
+    <string name="imported">%s is now in the app\'s images folder</string>
+    <string name="build_nand">Build the NAND image</string>
+    <string name="preparing">Preparing…</string>
+    <string name="importing">Copying %s…</string>
+    <string name="nand_needs_sources">Pick a cLK bootloader (LEOIMG.nbh or lk.bin) and a NAND Android ROM zip first.</string>
+    <string name="nand_done">%s is built and in the app\'s images folder</string>
+</resources>

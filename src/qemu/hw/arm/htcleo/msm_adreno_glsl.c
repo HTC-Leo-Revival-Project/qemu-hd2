@@ -33,7 +33,7 @@
 static const char comp[] = "xyzw";
 
 /* Helpers every translated program uses: the interpreter's arithmetic */
-static const char glsl_helpers[] =
+const char adreno_glsl_helpers[] =
     "#define FLT_MAX 3.402823466e+38\n"
     "float sat(float f) { return f > 1.0 ? 1.0 : (f >= 0.0 ? f : 0.0); }\n"
     "vec4 sat4(vec4 v) { return vec4(sat(v.x), sat(v.y), sat(v.z), "
@@ -814,7 +814,7 @@ void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
     }
 
     /* the helpers, the texture units this program samples, then the body */
-    g_string_append(o, glsl_helpers);
+    g_string_append(o, adreno_glsl_helpers);
     for (int u = 0; u < info->ntex; u++) {
         const AdrenoGlslTexUnit *tu = &info->tex[u];
         bool cube = cube_mask & (1u << tu->const_idx);

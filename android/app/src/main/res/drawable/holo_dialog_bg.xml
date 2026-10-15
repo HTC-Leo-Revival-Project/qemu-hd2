@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The dialog panel: the flat dark sheet of ICS.  The platform's own Holo
+  dialog is a black box inside a light grey frame, which is not what ICS
+  looked like, so the window background is replaced with this one
+  (see Holo.show()).  No blue bar here: a layer-list item cannot be given a
+  height on API < 23, so the bar would stretch into a frame - the platform's
+  own line under the title does the job.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <corners android:radius="3dp" />
+    <solid android:color="@color/holo_dialog" />
+</shape>

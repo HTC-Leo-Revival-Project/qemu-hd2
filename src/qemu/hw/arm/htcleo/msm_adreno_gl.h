@@ -11,6 +11,57 @@
 #define ADRENO_GL_MAX_UNITS 16
 #define ADRENO_GL_MAX_VBUFS 16
 
+/*
+ * What a host GPU draw is keyed and parameterised by, shared by both
+ * backends: the desktop one (msm_adreno_gl.c) and OpenGL ES
+ * (msm_adreno_gles.c).
+ */
+enum {
+    GEOM_CPU,               /* set up by msm_adreno_draw.c */
+    GEOM_TRIS,              /* the vertex shader on the host GPU */
+    GEOM_POINTS,
+};
+
+typedef struct GlProgKey {
+    uint64_t ps_hash, vs_hash;
+    uint32_t flat_mask;
+    uint32_t cube_mask, vs_cube_mask;
+    uint8_t ninterp, param_gen, param_gen_reg, geom, persp, pad[3];
+} GlProgKey;
+
+typedef struct TexU {
+    float size[4];          /* w, h, 1/w, 1/h of level 0 */
+    float scale[4];         /* 2^exp_adj, LOD bias */
+    int32_t swz[4];
+} TexU;
+
+typedef struct DrawU {
+    uint32_t bools[8];
+    uint32_t loops[32];
+    TexU tex[2 * ADRENO_GL_MAX_UNITS];  /* pixel, then vertex shader's */
+    int32_t cb[4];          /* PS, VS constant bases */
+    int32_t csurf[4];       /* colour: GMEM offset, pitch, bpp, sx | sy << 4 */
+    int32_t cfmt[4];        /* channel widths */
+    int32_t cinfo[4];       /* kind, swap, colour write, colour mask */
+    int32_t dsurf[4];       /* depth: GMEM offset, bpp */
+    uint32_t rb[4];         /* DEPTHCONTROL, BLEND_CONTROL, COLORCONTROL,
+                               STENCILREFMASK */
+    uint32_t rb2[4];        /* STENCILREFMASK_BF, blending */
+    float blendc[4];
+    float misc[4];          /* alpha ref, window offset x, y, pixel offset */
+    /* vertex shading on the host GPU */
+    int32_t vb[ADRENO_GL_MAX_VBUFS][4];   /* vertex data: word index in
+                                             vd[], first byte, endian swap,
+                                             bytes */
+    float vp0[4];           /* viewport x scale, offset, y scale, offset */
+    float vp1[4];           /* z scale, offset; point half size */
+    float vp2[4];           /* window offset x, y (when applied); pixel
+                               offset */
+    uint32_t vte[4];        /* PA_CL_VTE_CNTL, PA_CL_CLIP_CNTL */
+    float psz[4];           /* point min, max half size; size from VS */
+} DrawU;
+
+
 /* a texture fetch of a translated program: one host texture unit each */
 typedef struct AdrenoGlslTexUnit {
     uint8_t const_idx, mag, min, mip;
@@ -37,6 +88,22 @@ typedef struct AdrenoGlslInfo {
 void adreno_glsl_translate(const AdrenoProgram *p, bool fragment,
                            uint32_t cube_mask, int unit_base, GString *o,
                            AdrenoGlslInfo *info);
+
+/*
+ * The GLSL every program shares, split where the two host GPU backends part
+ * company: the uniforms and the half-float helpers are the same, the render
+ * backend's GMEM access is not (a buffer under fragment shader interlock on
+ * desktop OpenGL, an image under OpenGL ES).
+ */
+/* which texture units are cube maps, for these fetch constants */
+uint32_t adreno_gl_cube_mask(MsmAdrenoState *s, uint32_t tex_mask);
+
+/* the arithmetic helpers every translated program starts with */
+extern const char adreno_glsl_helpers[];
+extern const char glsl_common[];
+extern const char glsl_vfetch[];
+extern const char glsl_rop_mid[];      /* address arithmetic, comparisons */
+extern const char glsl_rop_tail[];     /* depth/stencil, write_color */
 
 /*
  * A draw for the host GPU: the primitives are set up already (screen

@@ -22,6 +22,7 @@ MEM="-object memory-backend-file,id=htcleo.ram,size=1G,mem-path=dram.bin,share=o
   -chardev socket,id=q6link,path=q6link.sock,server=on,wait=off "$@"
 for i in $(seq 20); do [ -S q6link.sock ] && break; sleep 0.3; done
 ../src/qemu/build/qemu-system-hexagon \
+  -L ../src/qemu/pc-bios -L ../src/qemu/build/pc-bios \
   -M htcleo-q6,link=q6link,${Q6_MACH:+$Q6_MACH,}apps-irq=${Q6_APPS_IRQ:-11},modem-irq=${Q6_MODEM_IRQ:-2},trace=${Q6TRACE:-on} -kernel dsp1.elf \
   -icount shift=${Q6_SHIFT:-1} \
   $MEM -machine memory-backend=htcleo.ram \

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the ICS action bar: light blue on top, deep blue at the bottom -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <gradient
+        android:angle="90"
+        android:startColor="#ff3a8fc6"
+        android:centerColor="#ff2477ad"
+        android:endColor="#ff0f4d7a" />
+</shape>

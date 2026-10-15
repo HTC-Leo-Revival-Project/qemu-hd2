@@ -12,10 +12,13 @@
 /firmware/
 /toolchains/
 /build-tmp/
+/build/
 *.log
 *.ppm
 qmp.sock
-
+images*
 # Built recovery tool
 /tools/recovery/hd2nanddump
 __pycache__/
+android/app/build
+android/build

@@ -309,10 +309,13 @@ struct MsmAdrenoState {
     uint64_t draws, pixels;
     uint32_t texgen;            /* texture cache generation, per draw */
 
-    /* host GPU backend (msm_adreno_gl.c) */
-    char *backend;              /* "gl" or "soft" */
+    /* host GPU backend (msm_adreno_gl.c for OpenGL, msm_adreno_gles.c for
+     * OpenGL ES - a phone has no desktop OpenGL, so "gles" is the one it
+     * wants there) */
+    char *backend;              /* "gl", "gles" or "soft" */
     AdrenoGl *gl;
     bool gl_failed;
+    bool gl_gles;               /* the host context is OpenGL ES */
     bool const_dirty;           /* ALU constants changed since uploaded */
     AdrenoResolveJob *resolves; /* resolves waiting for the kick's end */
     uint32_t nresolves, cap_resolves;

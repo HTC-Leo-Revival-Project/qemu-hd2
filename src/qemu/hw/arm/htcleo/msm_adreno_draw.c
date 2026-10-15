@@ -31,6 +31,7 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "msm_adreno_gl.h"
+#include "msm_adreno_gles.h"
 
 #define SUBPIX      16
 #define MAX_CLIPPED 12
@@ -1728,10 +1729,12 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
                      !(r[A2_RB_COLORCONTROL] & (3 << 3));
         /*
          * The host GPU renders to GMEM; render targets in memory (the
-         * blob's texture copies) are drawn here.
+         * blob's texture copies) are drawn here.  Two host backends can do
+         * it: desktop OpenGL ("gl") and OpenGL ES ("gles", for a phone).
          */
         d->gl = (!d->color_write || d->color.host) &&
-                (!(dc & 3) || d->depth.host) && adreno_gl_available(s);
+                (!(dc & 3) || d->depth.host) &&
+                (adreno_gl_available(s) || adreno_gles_available(s));
     }
 
     /* the vertices */
