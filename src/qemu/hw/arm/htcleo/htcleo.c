@@ -737,6 +737,45 @@ static MsmRegfileState *htcleo_regfile(const char *name, hwaddr base,
     return MSM_REGFILE(d);
 }
 
+    /*
+ * The catch-all for the peripheral windows we do not model.  Reading 0 is what
+ * a real device with an idle register does, so a guest can go a long way on
+ * it; logging who touches it says which register the model is missing.
+ */
+static uint64_t htcleo_unclaimed_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint32_t pc = current_cpu ?
+        ((CPUARMState *)cpu_env(current_cpu))->regs[15] : 0;
+
+    qemu_log_mask(LOG_UNIMP, "msm-periph: read 0x%08" HWADDR_PRIx "\n",
+                  0xA0000000ULL + off);
+    qemu_log_mask(LOG_UNIMP,
+                  "msm-periph: read 0x%08" HWADDR_PRIx " at pc %08x\n",
+                  0xA0000000ULL + off, pc);
+    return 0;
+}
+
+static void htcleo_unclaimed_write(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size)
+{
+    uint32_t pc = current_cpu ?
+        ((CPUARMState *)cpu_env(current_cpu))->regs[15] : 0;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "msm-periph: write 0x%08" HWADDR_PRIx " = 0x%08" PRIx64 "\n",
+                  0xA0000000ULL + off, val);
+    qemu_log_mask(LOG_UNIMP,
+                  "msm-periph: write 0x%08" HWADDR_PRIx " at pc %08x\n",
+                  0xA0000000ULL + off, pc);
+}
+
+static const MemoryRegionOps htcleo_unclaimed_ops = {
+    .read = htcleo_unclaimed_read,
+    .write = htcleo_unclaimed_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static void htcleo_init(MachineState *machine)
 {
     HtcleoMachineState *s = HTCLEO_MACHINE(machine);
@@ -815,8 +854,14 @@ static void htcleo_init(MachineState *machine)
         qdev_realize_and_unref(s->lle, NULL, &error_fatal);
     }
 
-    /* Catch-all for every peripheral window we do not model, logged */
-    create_unimplemented_device("msm-periph", 0xA0000000, 0x10000000);
+        /* Catch-all for every peripheral window we do not model, logged */
+    {
+        MemoryRegion *mr = g_new(MemoryRegion, 1);
+
+        memory_region_init_io(mr, OBJECT(s), &htcleo_unclaimed_ops, s,
+                              "msm-periph", 0x10000000);
+        memory_region_add_subregion(sysmem, 0xA0000000, mr);
+    }
 
     /* VIC */
     s->vic = qdev_new(TYPE_MSM_VIC);

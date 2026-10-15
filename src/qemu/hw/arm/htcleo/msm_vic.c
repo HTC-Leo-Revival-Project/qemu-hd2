@@ -216,6 +216,10 @@ static uint64_t vic_read(void *opaque, hwaddr off, unsigned size)
         return s->vecaddr[(off - 0x400) >> 2];
     }
     qemu_log_mask(LOG_UNIMP, "msm-vic: read 0x%03" HWADDR_PRIx "\n", off);
+    qemu_log_mask(LOG_UNIMP,
+                  "msm-vic: read 0x%03" HWADDR_PRIx " at pc %08x\n", off,
+                  current_cpu ?
+                  ((CPUARMState *)cpu_env(current_cpu))->regs[15] : 0);
     return 0;
 }
 
