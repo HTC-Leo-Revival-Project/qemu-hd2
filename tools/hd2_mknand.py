@@ -467,6 +467,11 @@ def main():
     ap.add_argument('--nbh', help='cLK LEOIMG.nbh (official image)')
     ap.add_argument('--lk', help='raw cLK lk.bin instead of an NBH')
     ap.add_argument('--rom', required=True, help='NAND ROM zip')
+    ap.add_argument('--kernel',
+                    help='replace the ROM kernel with this zImage')
+    ap.add_argument('--cmdline',
+                    help='replace the ROM boot cmdline, e.g. to put the '
+                         'console on the emulator UART')
     ap.add_argument('--recovery', help='recovery boot image (optional)')
     ap.add_argument('--system-mb', type=int, default=220)
     ap.add_argument('--cache-mb', type=int, default=30)
@@ -536,11 +541,19 @@ def main():
 
     # 3. boot.img exactly as the ROM's mkbootimg.sh builds it for cLK
     kernel = z.read('kernel/zImage')
+    if a.kernel:
+        kernel = open(a.kernel, 'rb').read()
+        print('kernel: %s (%d bytes)' % (a.kernel, len(kernel)))
     ramdisk = z.read('kernel/boot_NAND/initrd.gz')
     cmdline = 'no_console_suspend=1 console=null'
     m = re.search(r"--cmdline '([^']*)'", z.read('kernel/mkbootimg.sh').decode())
     if m:
         cmdline = m.group(1)
+    # the emulator has a UART where a real HD2 has none, so the console can go
+    # there too and nothing is lost when the kernel wedges before the ramcon
+    # is up: "console=null" alone swallows everything
+    if a.cmdline:
+        cmdline = a.cmdline
     boot = mkbootimg(kernel, ramdisk, cmdline)
     b0, bsize = layout['boot']
     if len(boot) > bsize * BLK:
