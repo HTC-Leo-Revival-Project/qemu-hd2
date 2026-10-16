@@ -970,6 +970,11 @@ static void cp_run_ring(MsmAdrenoState *s)
                         s->st.decodes, s->st.hash_bytes / 1e6, s->st.cp / 1e3,
                         s->st.sync / 1e3, s->st.resolve / 1e3, s->st.tex / 1e3,
                         s->st.upload / 1e3, s->st.gpu / 1e3);
+            fprintf(stderr, "adreno:   of those draws: %" PRIu64 " to memory, "
+                        "%" PRIu64 " with a sample grid, %" PRIu64 " blending, "
+                        "%" PRIu64 " no colour write, %" PRIu64 " empty clip\n",
+                        s->st.d_mem, s->st.d_msaa, s->st.d_blend,
+                        s->st.d_nocolor, s->st.d_empty);
                 memset(&s->st, 0, sizeof(s->st));
                 s->st.last = now;
             }
@@ -1091,6 +1096,7 @@ static void adreno_set_trace(Object *obj, const char *value, Error **errp)
     }
 }
 
+
 /* debugging: qom-set /machine/gpu dump "GPUADDR,SIZE,FILE" */
 static void adreno_set_dump(Object *obj, const char *value, Error **errp)
 {
@@ -1159,6 +1165,21 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     }
     if (!s->backend) {
         s->backend = g_strdup("gl");
+    }
+    /* a trace asked for on the command line's environment, before the first
+     * draw, for when there is no monitor to reach */
+    {
+        const char *trace = getenv("ADRENO_TRACE");
+
+        if (trace && *trace) {
+            adreno_set_trace(OBJECT(s), trace, NULL);
+            /* by default only the next 2000 draws' vertices; on a phone
+             * there is no monitor to turn the trace on late, so ADRENO_TRACE_ALL
+             * asks for all of them */
+            if (getenv("ADRENO_TRACE_ALL")) {
+                s->trace_vtx_draws = UINT64_MAX;
+            }
+        }
     }
     /* tell the log straight away what the host GPU turned out to be */
     adreno_gles_probe(s);

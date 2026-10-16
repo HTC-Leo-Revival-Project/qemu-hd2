@@ -1735,6 +1735,25 @@ void adreno_draw(MsmAdrenoState *s, uint32_t init, uint32_t num_indices,
         d->gl = (!d->color_write || d->color.host) &&
                 (!(dc & 3) || d->depth.host) &&
                 (adreno_gl_available(s) || adreno_gles_available(s));
+        if (s->stats_on) {
+            /* what this draw is, whichever backend ends up taking it */
+            if (d->color_write && !d->color.host) {
+                s->st.d_mem++;
+            }
+            if (d->color.sx > 1 || d->color.sy > 1) {
+                s->st.d_msaa++;
+            }
+            if (!(r[A2_RB_COLORCONTROL] & (1 << 5)) &&
+                r[A2_RB_BLEND_CONTROL] != 0x00010001) {
+                s->st.d_blend++;
+            }
+            if (!d->color_write) {
+                s->st.d_nocolor++;
+            }
+            if (d->clip_x0 >= d->clip_x1 || d->clip_y0 >= d->clip_y1) {
+                s->st.d_empty++;
+            }
+        }
     }
 
     /* the vertices */

@@ -334,6 +334,10 @@ struct MsmAdrenoState {
         int64_t last;
         uint64_t kicks, gpu_draws, cpu_draws, soft_draws, resolves;
         uint64_t hashes, decodes, hash_bytes;
+        /* what the draws were: a layer drawn to memory rather than GMEM, one
+         * with a sample grid, one with blending, one dropped for an empty
+         * clip - the same numbers whichever backend ran them */
+        uint64_t d_mem, d_msaa, d_blend, d_empty, d_cull, d_nocolor;
         int64_t cp, sync, resolve, tex, upload, gpu;
     } st;
 

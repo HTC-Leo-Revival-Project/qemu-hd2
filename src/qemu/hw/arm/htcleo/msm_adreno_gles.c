@@ -77,8 +77,7 @@ typedef long            GLsizeiptr;
 #define GL_TEXTURE_WRAP_S_               0x2802
 #define GL_TEXTURE_WRAP_T_               0x2803
 #define GL_TEXTURE_MIN_LOD_              0x813A
-#define GL_TEXTURE_MAX_LOD_              0x813D
-#define GL_TEXTURE_LOD_BIAS_             0x8501
+#define GL_TEXTURE_MAX_LEVEL_            0x813D
 #define GL_RGBA_                        0x1908
 #define GL_RGBA_INTEGER_                0x8D99
 #define GL_RED_INTEGER_                  0x8D94
@@ -90,6 +89,7 @@ typedef long            GLsizeiptr;
 #define GL_TEXTURE_2D_ARRAY_            0x8C1A
 #define GL_UNIFORM_BUFFER_              0x8A11
 #define GL_SHADER_STORAGE_BUFFER_       0x90D2
+#define GL_MAP_READ_BIT_                 0x0001
 #define GL_RGBA32F_                     0x8814
 #define GL_RGBA8_                       0x8058
 #define GL_REPEAT_                       0x2901
@@ -97,8 +97,7 @@ typedef long            GLsizeiptr;
 #define GL_TEXTURE_WRAP_S_               0x2802
 #define GL_TEXTURE_WRAP_T_               0x2803
 #define GL_TEXTURE_MIN_LOD_              0x813A
-#define GL_TEXTURE_MAX_LOD_              0x813D
-#define GL_TEXTURE_LOD_BIAS_             0x8501
+#define GL_TEXTURE_MAX_LEVEL_            0x813D
 #define GL_FLOAT_                       0x1406
 #define GL_FRONT_                       0x0404
 #define GL_BACK_                        0x0405
@@ -120,8 +119,6 @@ typedef long            GLsizeiptr;
 #define GL_LINEAR_                      0x2601
 #define GL_LINEAR_MIPMAP_LINEAR_        0x2703
 #define GL_CLAMP_TO_EDGE_               0x812F
-#define GL_CLAMP_TO_BORDER_             0x812D
-#define GL_TEXTURE_BORDER_COLOR_        0x1004
 #define GL_ARRAY_BUFFER_                0x8892
 #define GL_POINTS_                      0x0000
 #define GL_TRIANGLES_                   0x0004
@@ -153,7 +150,6 @@ typedef long            GLsizeiptr;
 #define GL_MAX_VERTEX_UNIFORM_VECTORS_   0x8DFB
 #define GL_MAX_FRAGMENT_UNIFORM_VECTORS_ 0x8DFD
 #define GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS_ 0x8B4D
-#define GL_MAX_IMAGE_UNITS_              0x8D38
 
 /* GLES does not have these; the ROP runs in the shaders instead */
 #define GL_NOSUCH_                      0
@@ -189,6 +185,7 @@ typedef void (*GlesActiveTextureFn)(GLenum);
 typedef void (*GlesGenBuffersFn)(GLsizei, GLuint *);
 typedef void (*GlesBindBufferFn)(GLenum, GLuint);
 typedef void (*GlesBufferDataFn)(GLenum, GLsizeiptr, const void *, GLenum);
+typedef void (*GlesBufferSubDataFn)(GLenum, GLintptr, GLsizeiptr, const void *);
 typedef void (*GlesDeleteBuffersFn)(GLsizei, const GLuint *);
 typedef GLuint (*GlesGenVertexArraysFn)(GLsizei, GLuint *);
 typedef void (*GlesBindVertexArrayFn)(GLuint);
@@ -349,6 +346,7 @@ static struct {
     GlesGenBuffersFn GenBuffers;
     GlesBindBufferFn BindBuffer;
     GlesBufferDataFn BufferData;
+    GlesBufferSubDataFn BufferSubData;
     GlesDeleteBuffersFn DeleteBuffers;
     GlesGenVertexArraysFn GenVertexArrays;
     GlesBindVertexArrayFn BindVertexArray;
@@ -444,6 +442,7 @@ static struct {
 #define glGenBuffers              gl.GenBuffers
 #define glBindBuffer              gl.BindBuffer
 #define glBufferData              gl.BufferData
+#define glBufferSubData           gl.BufferSubData
 #define glDeleteBuffers           gl.DeleteBuffers
 #define glGenVertexArrays         gl.GenVertexArrays
 #define glBindVertexArray         gl.BindVertexArray
@@ -523,7 +522,6 @@ static bool gles_tried;
 static bool g_clip_dist;      /* GL_EXT_clip_cull_distance: gl_ClipDistance */
 static bool g_float_linear;   /* GL_OES_texture_float_linear: filtered RGBA32F */
 static bool g_gles_checked;   /* the draw path has been asked for its errors */
-static int g_gmem_unit = 2 * ADRENO_GL_MAX_UNITS;   /* GMEM's image */
 static int g_vs_unit_base = ADRENO_GL_MAX_UNITS;    /* vertex shader's */
 static QemuThread gles_owner;
 
@@ -599,6 +597,7 @@ static bool gles_load(void)
     LOAD(GenBuffers, "glGenBuffers");
     LOAD(BindBuffer, "glBindBuffer");
     LOAD(BufferData, "glBufferData");
+    LOAD(BufferSubData, "glBufferSubData");
     LOAD(DeleteBuffers, "glDeleteBuffers");
     LOAD(GenVertexArrays, "glGenVertexArrays");
     LOAD(BindVertexArray, "glBindVertexArray");
@@ -848,34 +847,26 @@ static bool gles_init(const char *what)
                         count, extension_n(0) ? extension_n(0) : "(none)");
         }
         /*
-         * Where GMEM's image and the two stages' textures go.  The pixel
-         * shader takes units 0..15 and the vertex shader 16..31, so GMEM
-         * needs a unit outside both - and a host with fewer units than that
-         * shares the vertex shader's with the pixel shader's, which only
-         * costs a vertex shader that samples something different from the
-         * pixel shader.
+         * Where the two stages' textures go.  The pixel shader takes units
+         * 0..15 and the vertex shader 16..31, unless the host has fewer
+         * units than that, in which case the vertex shader shares the pixel
+         * shader's - which only costs a vertex shader that samples something
+         * different from the pixel shader.  GMEM is a storage buffer, so it
+         * takes no texture unit at all.
          */
         glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS_, &units);
-        if (units >= 2 * ADRENO_GL_MAX_UNITS + 1) {
-            g_gmem_unit = 2 * ADRENO_GL_MAX_UNITS;
+        if (units >= 2 * ADRENO_GL_MAX_UNITS) {
             g_vs_unit_base = ADRENO_GL_MAX_UNITS;
         } else {
-            g_gmem_unit = ADRENO_GL_MAX_UNITS;
             g_vs_unit_base = 0;
-            if (units <= ADRENO_GL_MAX_UNITS) {
-                error_report("msm-adreno: only %d texture units: GMEM's image "
-                             "has to share one with a guest texture", units);
+            if (units < ADRENO_GL_MAX_UNITS) {
+                error_report("msm-adreno: only %d texture units: a guest "
+                             "shader cannot bind its %dth", units,
+                             ADRENO_GL_MAX_UNITS);
             }
         }
-        {
-            GLint images = 0;
-
-            glGetIntegerv(GL_MAX_IMAGE_UNITS_, &images);
-            info_report("msm-adreno:   %d texture units (%d image units): "
-                        "GMEM on texture unit %d, the guest's vertex shader "
-                        "textures on %d", units, images, g_gmem_unit,
-                        g_vs_unit_base);
-        }
+        info_report("msm-adreno:   %d texture units: the guest's vertex "
+                    "shader textures on %d", units, g_vs_unit_base);
     }
     /*
      * gl_ClipDistance needs the extension even in GLSL ES 3.20.  Without it
@@ -917,53 +908,48 @@ static void gles_teardown(void)
  * guest's own driver gets to it.
  */
 /*
- * GMEM as an OpenGL ES image: the 256 KiB the Adreno bins into, one unsigned
- * int per texel of an R32UI image, so a byte address is a texel index.  The
- * same four functions the desktop backend gets from its SSBO, and the same
- * split whole words versus atomics - the neighbours sharing a word are not
- * ordered against this fragment either way, which is what framebuffer fetch
- * on a tiler is for.
+ * GMEM as a shader storage buffer: the 256 KiB the Adreno bins into, 65536
+ * unsigned ints, laid out so a byte address is a word and a quarter offset.
+ * The same buffer the desktop backend keeps, and the same four accessors the
+ * pixel shader needs.
+ *
+ * An R32UI image is the other way to write this, and it was tried first: the
+ * phone's driver reports GL_MAX_IMAGE_UNITS as 0 and drops every imageStore,
+ * so the draws ran and GMEM stayed empty.  A storage buffer is what the
+ * vertex path already uses here, so it is known to work.
  */
-#define GMEM_TEXELS_W  1024
-#define GMEM_TEXELS_H  64
-#define GMEM_TEXELS    (GMEM_TEXELS_W * GMEM_TEXELS_H)     /* 65536, 256 KiB */
+#define GMEM_WORDS    (ADRENO_GMEM_SIZE / 4)       /* 65536 */
 
 static const char glsl_gm_gles[] =
-    "layout(binding = 0, r32ui) uniform highp uimage2D u_gmem;\n"
-    "ivec2 gm_texel(uint a) {\n"
-    "    uint i = a >> 2u;\n"
-    "    return ivec2(int(i) & 1023, int(i >> 10));\n"
-    "}\n"
+    "layout(std430, binding = 0) buffer Gmem { uint gm[]; };\n"
     "uint gm_get(uint a, uint n) {\n"
-    "    uint w = imageLoad(u_gmem, gm_texel(a)).r;\n"
+    "    uint w = gm[a >> 2u];\n"
     "    return n == 4u ? w : (w >> ((a & 3u) * 8u)) & ((1u << (n * 8u)) - 1u);\n"
     "}\n";
 
 static const char glsl_gm_put_atomic[] =
     "void gm_put(uint a, uint n, uint v) {\n"
-    "    ivec2 t = gm_texel(a);\n"
     "    if (n == 4u) {\n"
-    "        imageStore(u_gmem, t, uvec4(v, 0u, 0u, 1u));\n"
+    "        gm[a >> 2u] = v;\n"
     "        return;\n"
     "    }\n"
     "    uint sh = (a & 3u) * 8u;\n"
     "    uint m = ((1u << (n * 8u)) - 1u) << sh;\n"
-    "    imageAtomicAnd(u_gmem, t, ~m);\n"
-    "    imageAtomicOr(u_gmem, t, (v << sh) & m);\n"
+    "    atomicAnd(gm[a >> 2u], ~m);\n"
+    "    atomicOr(gm[a >> 2u], (v << sh) & m);\n"
     "}\n";
 
-/* a host without image atomics: only to compile against */
+/* a host without storage-buffer atomics: only to compile against */
 static const char glsl_gm_put_plain[] =
     "void gm_put(uint a, uint n, uint v) {\n"
-    "    ivec2 t = gm_texel(a);\n"
     "    if (n == 4u) {\n"
-    "        imageStore(u_gmem, t, uvec4(v, 0u, 0u, 1u));\n"
+    "        gm[a >> 2u] = v;\n"
     "        return;\n"
     "    }\n"
     "    uint sh = (a & 3u) * 8u;\n"
     "    uint m = ((1u << (n * 8u)) - 1u) << sh;\n"
-    "    uint old = imageLoad(u_gmem, t).r;\n"
-    "    imageStore(u_gmem, t, uvec4((old & ~m) | ((v << sh) & m), 0u, 0u, 1u));\n"
+    "    uint i = a >> 2u;\n"
+    "    gm[i] = (gm[i] & ~m) | ((v << sh) & m);\n"
     "}\n";
 
 static const char glsl_gm_px[] =
@@ -1004,15 +990,12 @@ static const char glsl_gm_px[] =
 /* ------------------------------------------------------------------ */
 
 /*
- * GMEM through an image, with the atomic read-modify-write where the host
- * has it (the renderer needs it) and without where it does not (so a host
- * can still be asked whether the render backend compiles at all).
+ * GMEM through a storage buffer, with the atomic read-modify-write where the
+ * host has it (the renderer needs it) and without where it does not (so a
+ * host can still be asked whether the render backend compiles at all).
  *
- * The image unit is 0 and the texture unit GMEM's texture is bound to is
- * not: an image's binding names an image unit, of which a host has far
- * fewer than it has texture units, and glUniform1i() below is what points
- * the sampler at the texture.  The guest's textures take texture units 0..15
- * and its vertex shader's 16..31, so GMEM's is g_gmem_unit.
+ * It is binding 0 of the shader storage blocks, which is free: the vertex
+ * shader's own buffers take 1 and 2, and the Draw block is a uniform buffer.
  */
 static void gles_gm_source(GString *o, bool atomics)
 {
@@ -1031,8 +1014,7 @@ static const char glsl_precision[] =
     "precision highp int;\n"
     "precision highp sampler2D;\n"
     "precision highp samplerCube;\n"
-    "precision highp usampler2D;\n"
-    "precision highp uimage2D;\n";
+    "precision highp usampler2D;\n";
 
 /* the interpolators between the two stages, the way the desktop one has them */
 static void interp_decls_gles(GString *o, int ninterp, const char *dir)
@@ -1120,6 +1102,16 @@ static GString *vs_source_gles(const GlProgKey *k, const AdrenoProgram *vs,
         "    r[0].x = float(gl_VertexID);\n"
         "    sq_main();\n"
         "    vec4 p = o_pos;\n"
+        /*
+         * What the pixel shader reads from us: the depth and 1/w for its
+         * perspective-correct interpolation, plus the point-sprite
+         * coordinates.  The CPU-shaded path takes all of it from the vertex
+         * data; here we only have the position, and leaving these outputs
+         * unwritten would hand the pixel shader whatever was in them - which
+         * for v_zw.y is the divisor of every interpolated value.
+         */
+        "    v_zw = vec4(p.z, p.w, 0.0, 0.0);\n"
+        "    v_face = 0.0;\n"
         "    uint vte = u_vte.x;\n");
     if (g_clip_dist) {
         g_string_append_printf(o,
@@ -1238,7 +1230,7 @@ static GString *fs_source_gles(const AdrenoProgram *ps, uint32_t cube_mask,
 
 /*
  * Does the render backend compile as GLSL ES?  The pieces that matter are
- * glsl_gm_gles() - GMEM as an image - and the shared depth/stencil and colour
+ * glsl_gm_gles() - GMEM as a storage buffer - and the shared depth/stencil and
  * write, which is where the ES dialect shows.  The atomics are swapped out
  * here so a host without them (Mesa) can still answer the question; the phone
  * compiles the real ones.
@@ -1326,14 +1318,13 @@ typedef struct GlesTex {
 
 /*
  * The framebuffer the draws go to.  It has no attachment of GMEM: the
- * shaders write GMEM themselves, through an image, and a texture that is
- * both an attachment and bound for imageLoad() and imageStore() is a
- * feedback loop the spec leaves undefined.  What the attachment is for is
- * the window the fragments are clipped to: it has to be at least as large
- * as the scissor box a draw sets, or everything outside it - most of the
- * screen - is dropped before a shader ever runs.  A dummy the size of the
- * window space the scissor can name does it; nothing is ever written to
- * it, so one byte per texel is enough.
+ * shaders write GMEM themselves, through a storage buffer, and nothing needs
+ * GMEM to be a texture.  What the attachment is for is the window the
+ * fragments are clipped to: it has to be at least as large as the scissor box
+ * a draw sets, or everything outside it - most of the screen - is dropped
+ * before a shader ever runs.  A dummy the size of the window space the
+ * scissor can name does it; nothing is ever written to it, so one byte per
+ * texel is enough.
  */
 #define GLES_FB_DIM      2048
 #define GLES_R8_         0x8229
@@ -1341,7 +1332,8 @@ typedef struct GlesTex {
 typedef struct AdrenoGles {
     GLuint vao;
     GLuint consts, draw, verts, vdata, idx;
-    GLuint gmem_tex, fbo, gmem_fbo, target_tex;
+    GLuint gmem;                 /* the storage buffer binding 0 */
+    GLuint fbo, target_tex;
     GLuint dummy2d, dummy_arr;
     GHashTable *progs, *texes;
     AdrenoTlb tlb;
@@ -1518,10 +1510,18 @@ static GlesProg *gles_program(MsmAdrenoState *s, const AdrenoGlDraw *g)
  * sampler objects, so the parameters of the fetch constant ride on the
  * texture itself.
  */
+/*
+ * GL ES cannot do a border colour, so the guest's clamp-to-border becomes a
+ * clamp to the edge: the nearest texel stands in for the border.  Where the
+ * border colour is the same as the edge texel - which is most textures - this
+ * is exactly what the guest asked for, and it beats sampling the transparent
+ * black that ES would otherwise hand back.
+ */
 static GLenum gles_wrap(unsigned m)
 {
-    return m == 1 ? GL_MIRRORED_REPEAT_ : m == 3 ? GL_CLAMP_TO_BORDER_ :
-           m == 2 ? GL_CLAMP_TO_EDGE_ : GL_REPEAT_;
+    return m == 1 ? GL_MIRRORED_REPEAT_ :
+           m == 2 ? GL_CLAMP_TO_EDGE_ :
+           m == 3 ? GL_CLAMP_TO_EDGE_ : GL_REPEAT_;
 }
 
 static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
@@ -1649,11 +1649,18 @@ static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
         }
         glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, gles_wrap(im.clamp[0]));
         glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, gles_wrap(im.clamp[1]));
-        /* GL_CLAMP_TO_BORDER reads the texture's own border colour */
-        glTexParameterfv(GL_TEXTURE_2D_, GL_TEXTURE_BORDER_COLOR_, im.border);
-        glTexParameterf(GL_TEXTURE_2D_, GL_TEXTURE_MIN_LOD_, im.min_level);
-        glTexParameterf(GL_TEXTURE_2D_, GL_TEXTURE_MAX_LOD_, im.max_level);
-        glTexParameterf(GL_TEXTURE_2D_, GL_TEXTURE_LOD_BIAS_, im.lod_bias);
+        /*
+         * GL ES has no GL_TEXTURE_BORDER_COLOR and no GL_TEXTURE_LOD_BIAS:
+         * both are desktop-only, and asking for either is an error that
+         * leaves the texture as it was.  The LOD bias is not lost with it -
+         * the shader gets it as a scale - but the border colour is the
+         * problem, because ES fixes it at (0, 0, 0, 0), so GL_CLAMP_TO_BORDER
+         * here reads transparent black where the guest expects its own
+         * colour.  Clamping to the edge is the closest ES can do, and is
+         * what the guest gets on any host without a real border.
+         */
+        glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_LOD_, im.min_level);
+        glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAX_LEVEL_, im.max_level);
     }
     adreno_trace(s, "  gles: texture %u %ux%u x%d levels %d %s\n", idx, im.w,
                  im.h, im.layers, im.levels, fresh ? "new" : "changed");
@@ -1704,20 +1711,18 @@ static void gles_bind_textures(MsmAdrenoState *s, const AdrenoGlslInfo *info,
 /* ------------------------------------------------------------------ */
 
 /*
- * GMEM is a 256 KiB image of 65536 unsigned ints, laid out so a byte address
- * is a texel index.  The CPU's copy is s->gmem; the two are copied across
- * when one of them changed, the way the desktop backend moves its buffer.
+ * GMEM is a 256 KiB buffer of 65536 unsigned ints, the CPU's copy in s->gmem.
+ * The two are copied across when one of them changed, the way the desktop
+ * backend moves its buffer.
  */
 static void gles_gmem_upload(MsmAdrenoState *s)
 {
     AdrenoGles *gls = g_gles;
 
     if (gls->cpu_newer) {
-        glActiveTexture(GL_TEXTURE0_ + g_gmem_unit);
-        glBindTexture(GL_TEXTURE_2D_, gls->gmem_tex);
-        glPixelStorei(GL_UNPACK_ALIGNMENT_, 4);
-        glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, GMEM_TEXELS_W, GMEM_TEXELS_H,
-                        GL_RED_INTEGER_, GL_UNSIGNED_INT_, s->gmem);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->gmem);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER_, 0, ADRENO_GMEM_SIZE,
+                        s->gmem);
         gls->cpu_newer = false;
     }
 }
@@ -1729,13 +1734,27 @@ void adreno_gles_gmem_to_cpu(MsmAdrenoState *s)
     if (!gls || !gls->gpu_newer) {
         return;
     }
+    void *p;
+
     glFinish();
-    /* GMEM as an attachment of its own: the draws' framebuffer has a dummy */
-    glBindFramebuffer(GL_FRAMEBUFFER_, gls->gmem_fbo);
-    glPixelStorei(GL_PACK_ALIGNMENT_, 4);
-    glReadPixels(0, 0, GMEM_TEXELS_W, GMEM_TEXELS_H, GL_RED_INTEGER_,
-                 GL_UNSIGNED_INT_, s->gmem);
-    glBindFramebuffer(GL_FRAMEBUFFER_, gls->fbo);
+    /*
+     * Mapped rather than read with glGetBufferSubData(): the phone's
+     * libGLESv3.so does not have that symbol, and mapping is what a resolve
+     * needs anyway - the CPU walks the copy straight afterwards.  A buffer
+     * mapped for reading has to be flushed first, which the glFinish() is.
+     */
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->gmem);
+    p = glMapBufferRange(GL_SHADER_STORAGE_BUFFER_, 0, ADRENO_GMEM_SIZE,
+                         GL_MAP_READ_BIT_);
+    if (p) {
+        memcpy(s->gmem, p, ADRENO_GMEM_SIZE);
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER_);
+    } else if (!g_gles_checked) {
+        g_gles_checked = true;
+        error_report("msm-adreno: this host GPU will not map GMEM for "
+                     "reading (0x%x); the resolves will come out empty",
+                     glGetError());
+    }
     gls->gpu_newer = false;
     gls->cpu_newer = true;
 }
@@ -1864,7 +1883,6 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     DrawU du;
     uint32_t cc = r[A2_RB_COLORCONTROL], bc = r[A2_RB_BLEND_CONTROL];
     size_t vbytes;
-    GLint loc;
 
     /*
      * With a vertex shader the primitives come as indices and the host GPU
@@ -1990,14 +2008,6 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
             glUniformBlockBinding(p->prog, db, 1);
             glBindBufferBase(GL_UNIFORM_BUFFER_, 1, gls->draw);
         }
-    }
-
-    /* GMEM, on a unit of its own: the guest's textures have the rest */
-    glActiveTexture(GL_TEXTURE0_ + g_gmem_unit);
-    glBindTexture(GL_TEXTURE_2D_, gls->gmem_tex);
-    loc = glGetUniformLocation(p->prog, "u_gmem");
-    if (loc >= 0) {
-        glUniform1i(loc, g_gmem_unit);
     }
 
     glScissor(g->clip_x0, g->clip_y0, g->clip_x1 - g->clip_x0,
@@ -2128,17 +2138,12 @@ static bool gles_render_init(MsmAdrenoState *s)
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 4, GL_FLOAT_, GL_FALSE_, 0, (void *)0);
 
-    /* GMEM itself: an image the shaders read and write, never an attachment */
-    glGenTextures(1, &gls->gmem_tex);
-    glBindTexture(GL_TEXTURE_2D_, gls->gmem_tex);
-    glTexStorage2D(GL_TEXTURE_2D_, 1, GL_R32UI_, GMEM_TEXELS_W, GMEM_TEXELS_H);
-    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
-    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
-    /* and the framebuffer it is read back through */
-    glGenFramebuffers(1, &gls->gmem_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER_, gls->gmem_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
-                           gls->gmem_tex, 0);
+    /* GMEM itself: a storage buffer the shaders read and write */
+    glGenBuffers(1, &gls->gmem);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->gmem);
+    glBufferData(GL_SHADER_STORAGE_BUFFER_, ADRENO_GMEM_SIZE, s->gmem,
+                 GL_DYNAMIC_DRAW_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER_, 0, gls->gmem);
     /*
      * The framebuffer the draws go to.  Its only job is the window: nothing
      * is written to it, so it gets one byte per texel, and it must be at
@@ -2186,9 +2191,14 @@ static bool gles_render_init(MsmAdrenoState *s)
 
 /*
  * Everything the renderer will ask of the host, asked once: a shader in GLSL
- * ES, a vertex array, a draw, an image store (how GMEM is written), an atomic
- * read-modify-write (how a pixel of a three-byte format is put back), and the
- * read-back.  Whatever this cannot do, the renderer must not use.
+ * ES, a vertex array, a draw, a storage buffer write (how GMEM is written), an
+ * atomic read-modify-write (how a pixel of a three-byte format is put back),
+ * and the read-back.  Whatever this cannot do, the renderer must not use.
+ *
+ * The answer is read out of GMEM itself, not off a framebuffer.  A colour
+ * attachment shows only that the draw landed, so a host that quietly drops
+ * every store into GMEM still passes - which is exactly what this host did
+ * when GMEM was an image rather than a buffer.
  */
 static void gles_smoke_test(void)
 {
@@ -2196,53 +2206,42 @@ static void gles_smoke_test(void)
         "layout(location = 0) in highp vec2 a_pos;\n"
         "void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n";
     /*
-     * Writes GMEM the way the render backend will: through an image.  The
-     * atomic read-modify-write is what a pixel of a three-byte format needs
-     * (its neighbours share the word), so a driver without image atomics
-     * cannot run the backend - the smoke test says so and stops there.
+     * Writes GMEM the way the render backend will: through a storage buffer.
+     * The atomic read-modify-write is what a pixel of a three-byte format
+     * needs (its neighbours share the word), so a driver without storage
+     * buffer atomics cannot run the backend - the smoke test says so and
+     * stops there.
      */
     static const char fs_head[] =
         "precision highp float;\n"
         "precision highp int;\n"
-        "precision highp usampler2D;\n"
-        "precision highp uimage2D;\n"
-        "layout(r32ui) uniform uimage2D u_gmem;\n"
+        "layout(std430, binding = 0) buffer Gmem { uint gm[]; };\n"
         "out uvec4 o_col;\n";
     static const char fs_atomic[] =
         "void main() {\n"
-        "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
-        "    uint v = imageAtomicOr(u_gmem, p, 0x0a0bu);\n"
-        "    imageStore(u_gmem, p, uvec4(v | 0x00c0u, 0u, 0u, 1u));\n"
+        "    uint p = uint(gl_FragCoord.x);\n"
+        "    uint v = atomicOr(gm[p], 0x0a0bu);\n"
+        "    gm[p] = v | 0x00c0u;\n"
         "    o_col = uvec4(v | 0xc0u, 0u, 0u, 1u);\n"
         "}\n";
     static const char fs_plain[] =
         "void main() {\n"
-        "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
-        "    imageStore(u_gmem, p, uvec4(0x000000c0u, 0u, 0u, 1u));\n"
+        "    uint p = uint(gl_FragCoord.x);\n"
+        "    gm[p] = 0x000000c0u;\n"
         "    o_col = uvec4(0xc0u, 0u, 0u, 1u);\n"
         "}\n";
     static const float verts[] = { -1, -1, 3, -1, -1, 3 };
-    GLuint tex = 0, fbo = 0, vao = 0, vbo = 0, vs_id = 0, fs_id = 0, prog = 0;
+    GLuint gmem = 0, vao = 0, vbo = 0, vs_id = 0, fs_id = 0, prog = 0;
     GLint ok = 0;
-    GLuint out[4] = { 0, 0, 0, 0 };   /* four red texels */
+    GLuint out[4] = { 0, 0, 0, 0 };   /* the first four words of GMEM */
     bool atomic_gmem = false;
     char log[512];
 
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D_, tex);
-    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
-    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
-    glTexImage2D(GL_TEXTURE_2D_, 0, GL_R32UI_, 1024, 64, 0, GL_RED_INTEGER_,
-                 GL_UNSIGNED_INT_, NULL);
-    glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER_, fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
-                           tex, 0);
-    if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER_) != 0x8CD5 /* COMPLETE */) {
-        info_report("msm-adreno:   smoke test: no framebuffer (0x%x)",
-                    gl.CheckFramebufferStatus(GL_FRAMEBUFFER_));
-        goto out;
-    }
+    glGenBuffers(1, &gmem);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gmem);
+    glBufferData(GL_SHADER_STORAGE_BUFFER_, ADRENO_GMEM_SIZE, NULL,
+                 GL_DYNAMIC_DRAW_);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER_, 0, gmem);
 
     vs_id = glCreateShader(GL_VERTEX_SHADER_);
     {
@@ -2273,10 +2272,11 @@ static void gles_smoke_test(void)
     if (!ok) {
         const GLchar *src[3];
 
-        /* no image atomics: the renderer cannot use this host, but say what
-         * it can do */
+        /* no storage buffer atomics: the renderer cannot use this host, but
+         * say what it can do */
         glGetShaderInfoLog(fs_id, sizeof(log), NULL, log);
-        info_report("msm-adreno:   smoke test: no image atomics (%s)", log);
+        info_report("msm-adreno:   smoke test: no storage buffer atomics (%s)",
+                    log);
         src[0] = gles_version_line();
         src[1] = fs_head;
         src[2] = fs_plain;
@@ -2313,31 +2313,32 @@ static void gles_smoke_test(void)
     glEnableVertexAttribArray(0);
 
     glUseProgram(prog);
-    glUniform1i(glGetUniformLocation(prog, "u_gmem"), 0);
-    glActiveTexture(GL_TEXTURE0_);
-    glBindTexture(GL_TEXTURE_2D_, tex);
-    glViewport(0, 0, 1024, 64);
+    glViewport(0, 0, 4, 1);          /* four fragments, GMEM words 0..3 */
     glDisable(GL_SCISSOR_TEST_);
     glDisable(GL_BLEND_);
-    {
-        static const GLuint zero[4] = { 0, 0, 0, 0 };
-
-        glClearBufferuiv(GL_COLOR_, 0, zero);
-    }
     glDrawArrays(GL_TRIANGLES_, 0, 3);
     glFinish();
-    glReadPixels(0, 0, 4, 1, GL_RED_INTEGER_, GL_UNSIGNED_INT_, out);
-    info_report("msm-adreno:   smoke test: GMEM image store + atomic read "
-                "gave %08x %08x %08x (want 000000c0 each)", out[0], out[1],
-                out[2]);
-    if (out[0] == 0xc0 && out[1] == 0xc0 && out[2] == 0xc0) {
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gmem);
+    {
+        void *p = glMapBufferRange(GL_SHADER_STORAGE_BUFFER_, 0, sizeof(out),
+                                   GL_MAP_READ_BIT_);
+
+        if (p) {
+            memcpy(out, p, sizeof(out));
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER_);
+        }
+    }
+    info_report("msm-adreno:   smoke test: GMEM storage buffer gave "
+                "%08x %08x %08x %08x (want 000000c0 each)", out[0], out[1],
+                out[2], out[3]);
+    if (out[0] == 0xc0 && out[1] == 0xc0 && out[2] == 0xc0 && out[3] == 0xc0) {
         info_report("msm-adreno:   smoke test: OK, the host GPU runs the "
                     "translated shaders and writes GMEM%s",
                     atomic_gmem ? ", with atomics" : " (no atomics: the "
                     "renderer needs them for three-byte formats)");
     } else {
-        info_report("msm-adreno:   smoke test: the draw did not land as "
-                    "asked");
+        info_report("msm-adreno:   smoke test: the host GPU did not write "
+                    "GMEM; the draws cannot go through it");
     }
 out:
     glDeleteProgram(prog);
@@ -2345,9 +2346,7 @@ out:
     glDeleteShader(vs_id);
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
-    glDeleteFramebuffers(1, &fbo);
-    glDeleteTextures(1, &tex);
-    glBindFramebuffer(GL_FRAMEBUFFER_, 0);
+    glDeleteBuffers(1, &gmem);
 }
 
 void adreno_gles_probe(MsmAdrenoState *s)
