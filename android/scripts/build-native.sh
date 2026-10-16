@@ -320,7 +320,15 @@ build_bridge() { # build_bridge <abi> <output>
         arm64-v8a)   cc="aarch64-linux-android$API" ;;
         armeabi-v7a) cc="armv7a-linux-androideabi$API" ;;
     esac
+    # The same 16 KB page alignment the QEMU build gets (see cross_file() and
+    # qemu_configure): every LOAD segment has to line up with a 16 KB boundary
+    # or the loader refuses the file on a device whose pages are that big
+    # (https://developer.android.com/16kb-page-size).  usbffs is exec'd rather
+    # than dlopen'd, but it is unpacked from the APK by the installer into the
+    # same directory as the two QEMU binaries, so it holds itself to the same
+    # rule rather than being the one odd file out.
     "$LLVM/bin/$cc-clang" -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
+        -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 \
         -o "$out" "$dir/usbffs.c" || {
             echo "--- usbffs failed ---" >&2; exit 1; }
     "$LLVM/bin/llvm-strip" --strip-all "$out" 2>/dev/null || true

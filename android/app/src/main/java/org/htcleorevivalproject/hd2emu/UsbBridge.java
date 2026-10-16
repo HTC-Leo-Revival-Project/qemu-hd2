@@ -120,11 +120,17 @@ public final class UsbBridge {
          * is part of being able to do this at all.  Only the service: writing
          * sys.usb.config would restart adbd.
          */
-        p.usbHalName = out("getprop | grep -o 'init.svc.[a-z0-9._-]*usb[a-z0-9._-]*' | head -1");
+        /*
+         * The service the bridge stops is vendor.usb-hal, so look for that one
+         * specifically: a plain grep for "usb" in init.svc.* finds usbd first on
+         * most phones (usbd is adbd's helper, and never running), which would
+         * both misname the row and pass a check for a service that does not do
+         * what the bridge needs.
+         */
+        p.usbHalName = out("getprop init.svc." + USB_HAL);
         p.usbHal = !p.usbHalName.isEmpty();
         p.checks.add(new Check(c.getString(R.string.usb_hal), p.usbHal, p.usbHal
-                ? c.getString(R.string.usb_hal_yes, p.usbHalName.replace("init.svc.", ""),
-                        out("getprop " + p.usbHalName))
+                ? c.getString(R.string.usb_hal_yes, USB_HAL, p.usbHalName)
                 : c.getString(R.string.usb_hal_no)));
 
         try {
