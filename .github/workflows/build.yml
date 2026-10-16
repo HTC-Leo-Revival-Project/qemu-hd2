@@ -127,14 +127,18 @@ jobs:
       - uses: actions/checkout@v4
 
       # The cross build runs on the host too: meson/ninja/pkg-config for glib,
-      # pixman, libslirp and dtc; flex/bison for dtc and QEMU's Hexagon
-      # idef-parser; python3 (with packaging, which glib's meson insists on)
-      # and a venv for QEMU's configure.
+      # pixman, libslirp and dtc; flex/bison for dtc; python3 (with packaging,
+      # which glib's meson insists on) and a venv for QEMU's configure.
+      # libglib2.0-dev is the *build machine's* glib, which is separate from
+      # the glib cross-compiled into the prefix: QEMU's Hexagon target builds a
+      # native idef-parser against it (dependency('glib-2.0', native: true)),
+      # and without it configure dies with "Dependency glib-2.0 not found".
       - name: build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential ninja-build pkg-config flex bison \
+            libglib2.0-dev \
             python3 python3-venv python3-pip python3-packaging \
             xz-utils bzip2
           python3 -m pip install --user --break-system-packages 'meson>=1.5.0'

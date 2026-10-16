@@ -85,8 +85,14 @@ Linux build above, plus `meson` for glib, pixman, libslirp and dtc and
 `python3` with the `packaging` module (glib's meson refuses without it):
 
 ```bash
-sudo apt install meson ninja-build pkg-config flex bison python3-packaging
+sudo apt install meson ninja-build pkg-config flex bison \
+    libglib2.0-dev python3-packaging
 ```
+
+`libglib2.0-dev` is the *build machine's* glib, which is separate from the glib
+this script cross-compiles into the prefix: QEMU's Hexagon target builds a
+native `idef-parser` against it (`dependency('glib-2.0', native: true)`), and
+without it QEMU's configure fails with `Dependency "glib-2.0" not found`.
 
 **arm64-v8a only.** QEMU 11 has no 32-bit host TCG backend left, so there is no
 `armeabi-v7a` emulator to package. `android/README.md` explains why; the app's
