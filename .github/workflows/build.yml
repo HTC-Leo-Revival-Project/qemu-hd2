@@ -5,7 +5,7 @@
 #   act --list          # the jobs below
 #   act -j lint         # shell/python/YAML checks (seconds)
 #   act -j linux        # the Linux emulator
-#   act -j web          # the web UI (npm ci + next build)
+#   act -j web          # the web UI, built and packaged
 #   act -j android      # the APK (downloads the NDK, several GB)
 name: build
 
@@ -223,3 +223,31 @@ jobs:
       - name: build
         working-directory: web
         run: npm run build
+
+      # A tree that runs as-is: the Next build, the custom server (Node runs
+      # server/index.ts straight, no compile step) and its production
+      # dependencies.  Unpack it and `NODE_ENV=production node server/index.ts`;
+      # it still wants the NAND images and the two QEMU binaries beside it at
+      # runtime, which is the layout tools/deploy-web.sh installs.
+      - name: package
+        working-directory: web
+        run: |
+          npm prune --omit=dev
+          cd ..
+          tar -czf hd2-web-ui.tar.gz \
+            --exclude='web/node_modules/.cache' \
+            --exclude='web/.next/cache' \
+            --exclude='web/*.tsbuildinfo' \
+            --exclude='web/.emulator.json' \
+            --transform 's,^web,hd2-web-ui,' \
+            web
+          ls -lh hd2-web-ui.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hd2-web-ui
+          path: hd2-web-ui.tar.gz
+          # the tarball is already gzipped; do not have the runner recompress it
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14

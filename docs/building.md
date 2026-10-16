@@ -114,7 +114,8 @@ npm run typecheck && npm run lint   # what CI checks before the build
 
 At runtime it drives QEMU (which is always built with VNC, above).
 [web/README.md](../web/README.md) is the full story; `tools/deploy-web.sh`
-installs it on a server.
+installs it on a server, and CI builds and packages it as the `hd2-web-ui`
+artifact (see below).
 
 ## Continuous integration
 
@@ -123,6 +124,10 @@ installs it on a server.
 | Workflow | What it does |
 |---|---|
 | [build.yml](../.github/workflows/build.yml) | On every push and pull request: `lint` (shell/Python/YAML), `linux` (the emulator), `web` (the web UI) and `android` (the APK). |
+
+Each job uploads what it made: `htcleo-linux-x86_64` (the two emulator
+binaries), `hd2-web-ui` (the web UI, built and tarballed) and
+`htcleo-debug-apk` (the app).
 
 It can be run locally with [nektos/act](https://github.com/nektos/act)
 instead of pushing to GitHub, which is how the workflow file itself is checked:
