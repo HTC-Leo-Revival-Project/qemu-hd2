@@ -152,6 +152,8 @@ typedef long            GLsizeiptr;
 #define GL_MAX_RENDERBUFFER_SIZE_        0x84E8
 #define GL_MAX_VERTEX_UNIFORM_VECTORS_   0x8DFB
 #define GL_MAX_FRAGMENT_UNIFORM_VECTORS_ 0x8DFD
+#define GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS_ 0x8B4D
+#define GL_MAX_IMAGE_UNITS_              0x8D38
 
 /* GLES does not have these; the ROP runs in the shaders instead */
 #define GL_NOSUCH_                      0
@@ -270,6 +272,7 @@ typedef unsigned int EGLenum;
 #define EGL_NO_DISPLAY_            ((EGLDisplay)0)
 #define FB_SIZE                    16384
 #define EGL_NO_CONTEXT_           ((EGLContext)0)
+#define EGL_NO_CONFIG_            ((EGLConfig)0)
 #define EGL_NONE_                 0x3038
 #define EGL_NO_SURFACE_           ((void *)0)
 #define EGL_DEFAULT_DISPLAY_       ((void *)0)
@@ -517,6 +520,11 @@ static bool g_asked;            /* the guest has drawn once */
 static bool gatomics_gles;    /* the host can do GMEM atomics */
 static bool g_smoke_atomics;  /* what the smoke test found on this host */
 static bool gles_tried;
+static bool g_clip_dist;      /* GL_EXT_clip_cull_distance: gl_ClipDistance */
+static bool g_float_linear;   /* GL_OES_texture_float_linear: filtered RGBA32F */
+static bool g_gles_checked;   /* the draw path has been asked for its errors */
+static int g_gmem_unit = 2 * ADRENO_GL_MAX_UNITS;   /* GMEM's image */
+static int g_vs_unit_base = ADRENO_GL_MAX_UNITS;    /* vertex shader's */
 static QemuThread gles_owner;
 
 /* dlopen every entry point; true when the host can give us GL ES 3 */
@@ -534,8 +542,8 @@ static bool gles_load(void)
         g = dlopen(gl_libs[i], RTLD_LAZY | RTLD_LOCAL);
     }
     if (!egl || !g) {
-        error_report("msm-adreno: no libEGL%s on this host",
-                     egl ? "" : " or libGLES3");
+        error_report("msm-adreno: no %s on this host",
+                     !egl ? "libEGL" : "libGLESv3 or libGLESv2");
         return false;
     }
     lib = egl;
@@ -762,10 +770,16 @@ static bool gles_init(const char *what)
                      "(eglInitialize: 0x%x)", what, gl.EglGetError());
         return false;
     }
+    /* gles_teardown() needs the display we made the context on */
+    gl.dpy = dpy;
     /*
      * A pbuffer to draw into, if the host wants one: surfaceless contexts are
      * the general case, but a driver whose shader compiler needs a drawable
-     * is happier with one (ADRENO_GLES_PBUFFER=1 asks for it).
+     * is happier with one (ADRENO_GLES_PBUFFER=1 asks for it).  Nothing is
+     * ever rendered into it - the shaders write GMEM through an image, not
+     * into a surface - so it only has to exist, and a small one is enough:
+     * one the size of the window space would have the driver reserve a
+     * screen's worth of memory for a target that is never touched.
      */
     static const EGLint cfg_attr[] = {
         EGL_SURFACE_TYPE_, EGL_PBUFFER_BIT_,
@@ -773,20 +787,25 @@ static bool gles_init(const char *what)
         EGL_NONE_
     };
     static const EGLint pb_attr[] = {
-        EGL_WIDTH_, FB_SIZE, EGL_HEIGHT_, FB_SIZE, EGL_NONE_
+        EGL_WIDTH_, 256, EGL_HEIGHT_, 256, EGL_NONE_
     };
     EGLConfig cfg = NULL;
     EGLint ncfg = 0;
     bool want_pbuffer = getenv("ADRENO_GLES_PBUFFER") != NULL;
 
-    if (want_pbuffer && gl.ChooseConfig &&
+    if (want_pbuffer && gl.ChooseConfig && gl.CreatePbufferSurface &&
         gl.ChooseConfig(dpy, cfg_attr, &cfg, 1, &ncfg) && ncfg > 0) {
         gl.surf = gl.CreatePbufferSurface(dpy, cfg, pb_attr);
         if (gl.surf == EGL_NO_SURFACE_) {
             gl.surf = NULL;
         }
     }
-    gl.ctx = gl.CreateContext(dpy, want_pbuffer ? cfg : EGL_NO_DISPLAY_,
+    /*
+     * A context made with a config can only be made current on a surface of
+     * that config, so a host that would not give us the pbuffer gets a
+     * surfaceless context rather than one that can never become current.
+     */
+    gl.ctx = gl.CreateContext(dpy, gl.surf ? cfg : EGL_NO_CONFIG_,
                               EGL_NO_CONTEXT_, ctx_attr);
     if (gl.ctx == EGL_NO_CONTEXT_) {
         error_report("msm-adreno: no OpenGL ES 3 context for the %s backend "
@@ -807,12 +826,15 @@ static bool gles_init(const char *what)
             "GL_EXT_shader_framebuffer_fetch",     /* read the framebuffer */
             "GL_ARM_shader_framebuffer_fetch",
             "GL_OES_shader_image_atomic",         /* GMEM read-modify-write */
+            "GL_EXT_clip_cull_distance",          /* the guest's clip planes */
             "GL_EXT_texture_buffer",
             "GL_EXT_clip_control",
             "GL_EXT_depth_clamp",
             "GL_EXT_multisampled_render_to_texture",
+            "GL_OES_texture_float_linear",
             NULL
         };
+        GLint units = 0;
 
         for (int i = 0; want[i]; i++) {
             info_report("msm-adreno:   %s: %s",
@@ -825,7 +847,44 @@ static bool gles_init(const char *what)
             info_report("msm-adreno:   %d extensions by index, first: %s",
                         count, extension_n(0) ? extension_n(0) : "(none)");
         }
+        /*
+         * Where GMEM's image and the two stages' textures go.  The pixel
+         * shader takes units 0..15 and the vertex shader 16..31, so GMEM
+         * needs a unit outside both - and a host with fewer units than that
+         * shares the vertex shader's with the pixel shader's, which only
+         * costs a vertex shader that samples something different from the
+         * pixel shader.
+         */
+        glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS_, &units);
+        if (units >= 2 * ADRENO_GL_MAX_UNITS + 1) {
+            g_gmem_unit = 2 * ADRENO_GL_MAX_UNITS;
+            g_vs_unit_base = ADRENO_GL_MAX_UNITS;
+        } else {
+            g_gmem_unit = ADRENO_GL_MAX_UNITS;
+            g_vs_unit_base = 0;
+            if (units <= ADRENO_GL_MAX_UNITS) {
+                error_report("msm-adreno: only %d texture units: GMEM's image "
+                             "has to share one with a guest texture", units);
+            }
+        }
+        {
+            GLint images = 0;
+
+            glGetIntegerv(GL_MAX_IMAGE_UNITS_, &images);
+            info_report("msm-adreno:   %d texture units (%d image units): "
+                        "GMEM on texture unit %d, the guest's vertex shader "
+                        "textures on %d", units, images, g_gmem_unit,
+                        g_vs_unit_base);
+        }
     }
+    /*
+     * gl_ClipDistance needs the extension even in GLSL ES 3.20.  Without it
+     * the guest's clip planes cannot go into the vertex shader at all, and
+     * the primitives are already clipped on the CPU, so carry on without
+     * them rather than lose every program that has a vertex shader.
+     */
+    g_clip_dist = has_extension("GL_EXT_clip_cull_distance");
+    g_float_linear = has_extension("GL_OES_texture_float_linear");
     renderer = (const char *)glGetString(GL_RENDERER_);
     version = (const char *)glGetString(GL_VERSION_);
     glsl = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION_);
@@ -839,6 +898,9 @@ static bool gles_init(const char *what)
 /* let go of the context; the renderer makes a new one when it needs it */
 static void gles_teardown(void)
 {
+    if (!g_ctx_up) {
+        return;
+    }
     gl.MakeCurrent(gl.dpy, EGL_NO_SURFACE_, EGL_NO_SURFACE_, EGL_NO_CONTEXT_);
     gl.DestroyContext(gl.dpy, gl.ctx);
     gl.ctx = EGL_NO_CONTEXT_;
@@ -945,6 +1007,12 @@ static const char glsl_gm_px[] =
  * GMEM through an image, with the atomic read-modify-write where the host
  * has it (the renderer needs it) and without where it does not (so a host
  * can still be asked whether the render backend compiles at all).
+ *
+ * The image unit is 0 and the texture unit GMEM's texture is bound to is
+ * not: an image's binding names an image unit, of which a host has far
+ * fewer than it has texture units, and glUniform1i() below is what points
+ * the sampler at the texture.  The guest's textures take texture units 0..15
+ * and its vertex shader's 16..31, so GMEM's is g_gmem_unit.
  */
 static void gles_gm_source(GString *o, bool atomics)
 {
@@ -982,15 +1050,18 @@ static void interp_decls_gles(GString *o, int ninterp, const char *dir)
 /*
  * The vertex shader for a draw whose vertices the CPU shaded: the positions
  * arrive already in window coordinates, so this only passes them on.
+ *
+ * The "#version" line is not in the source: gles_compile() puts it in front,
+ * so these builders must not.
  */
 static GString *vs_source_cpu_gles(int ninterp)
 {
     GString *o = g_string_new(NULL);
 
-    g_string_append(o, gles_version_line());
     g_string_append(o, glsl_precision);
     g_string_append(o, glsl_common);
     g_string_append(o, adreno_glsl_helpers);
+    interp_decls_gles(o, ninterp, "out");
     g_string_append_printf(o,
         "layout(std430, binding = 1) readonly buffer Verts { vec4 vd[]; };\n"
         "void main() {\n"
@@ -1018,20 +1089,25 @@ static GString *vs_source_cpu_gles(int ninterp)
 static GString *vs_source_gles(const GlProgKey *k, const AdrenoProgram *vs,
                                AdrenoGlslInfo *info)
 {
-    GString *o = g_string_new(gles_version_line());
+    GString *o = g_string_new(NULL);
     bool points = k->geom == GEOM_POINTS;
 
-    /* the clip planes the guest's VS clips with, as clip distances */
-    if (has_extension("GL_EXT_clip_cull_distance")) {
-        g_string_append(o, "#extension GL_EXT_clip_cull_distance : enable\n");
+    /*
+     * The clip planes the guest's VS clips with, as clip distances.  They
+     * need GL_EXT_clip_cull_distance, which GLSL ES 3.20 has not folded in;
+     * a host without it goes without the distances - the primitives have
+     * already been clipped on the CPU - rather than losing every program.
+     */
+    if (g_clip_dist) {
+        g_string_append(o,
+            "#extension GL_EXT_clip_cull_distance : enable\n");
     }
 
     g_string_append(o, glsl_precision);
     g_string_append(o, glsl_common);
     g_string_append(o, glsl_vfetch);
     g_string_append(o, "#define CONST(i) u_c[((i) + u_cb.y) & 511]\n");
-    adreno_glsl_translate(vs, false, k->vs_cube_mask, ADRENO_GL_MAX_UNITS, o,
-                          info);
+    adreno_glsl_translate(vs, false, k->vs_cube_mask, g_vs_unit_base, o, info);
     interp_decls_gles(o, k->ninterp, "out");
     g_string_append_printf(o,
         "void main() {\n"
@@ -1044,16 +1120,22 @@ static GString *vs_source_gles(const GlProgKey *k, const AdrenoProgram *vs,
         "    r[0].x = float(gl_VertexID);\n"
         "    sq_main();\n"
         "    vec4 p = o_pos;\n"
-        "    uint vte = u_vte.x, clip = u_vte.y;\n"
-        "    bool cl = %s && (clip & 0x10000u) == 0u;\n"
-        "    gl_ClipDistance[0] = cl ? p.w : 1.0;\n"
-        "    gl_ClipDistance[1] = cl ? p.w + p.x : 1.0;\n"
-        "    gl_ClipDistance[2] = cl ? p.w - p.x : 1.0;\n"
-        "    gl_ClipDistance[3] = cl ? p.w + p.y : 1.0;\n"
-        "    gl_ClipDistance[4] = cl ? p.w - p.y : 1.0;\n"
-        "    gl_ClipDistance[5] = cl ? p.w - p.z : 1.0;\n"
-        "    gl_ClipDistance[6] = !cl ? 1.0 : (clip & 0x80000u) != 0u ? p.z "
-        ": p.z + p.w;\n"
+        "    uint vte = u_vte.x;\n");
+    if (g_clip_dist) {
+        g_string_append_printf(o,
+            "    uint clip = u_vte.y;\n"
+            "    bool cl = %s && (clip & 0x10000u) == 0u;\n"
+            "    gl_ClipDistance[0] = cl ? p.w : 1.0;\n"
+            "    gl_ClipDistance[1] = cl ? p.w + p.x : 1.0;\n"
+            "    gl_ClipDistance[2] = cl ? p.w - p.x : 1.0;\n"
+            "    gl_ClipDistance[3] = cl ? p.w + p.y : 1.0;\n"
+            "    gl_ClipDistance[4] = cl ? p.w - p.y : 1.0;\n"
+            "    gl_ClipDistance[5] = cl ? p.w - p.z : 1.0;\n"
+            "    gl_ClipDistance[6] = !cl ? 1.0 : (clip & 0x80000u) != 0u ? p.z "
+            ": p.z + p.w;\n",
+            points ? "false" : "true");
+    }
+    g_string_append_printf(o,
         "    float sx = (vte & 1u) != 0u ? u_vp0.x : 1.0;\n"
         "    float ox = ((vte & 2u) != 0u ? u_vp0.y : 0.0) + u_vp2.x + "
         "u_vp2.z;\n"
@@ -1077,7 +1159,7 @@ static GString *vs_source_gles(const GlProgKey *k, const AdrenoProgram *vs,
         "        gl_Position = vec4(((sx * x + ox) * k - 1.0) * wp,\n"
         "                           ((sy * y + oy) * k - 1.0) * wp,\n"
         "                           (sz * z + oz) * wp, wp);\n"
-        "    }\n", points ? "false" : "true", FB_SIZE / 2);
+        "    }\n", FB_SIZE / 2);
     if (points) {
         /* PA_SU_POINT_SIZE holds half the size; the shader's is the size */
         g_string_append(o,
@@ -1107,7 +1189,6 @@ static GString *fs_source_gles(const AdrenoProgram *ps, uint32_t cube_mask,
                                AdrenoGlslInfo *info)
 {
     GString *o = g_string_new(NULL);
-    g_string_append(o, gles_version_line());
     g_string_append(o, glsl_precision);
     g_string_append(o, glsl_common);
     g_string_append(o, "#define CONST(i) u_c[((i) + u_cb.x) & 511]\n");
@@ -1165,7 +1246,8 @@ static GString *fs_source_gles(const AdrenoProgram *ps, uint32_t cube_mask,
 static void gles_rop_smoke_test(void)
 {
     GString *o = g_string_new(NULL);
-    bool gatomics_gles = false;      /* any host can answer this one */
+    /* the plain read-modify-write, so any host can answer this one */
+    const bool no_atomics = false;
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER_);
     GLint ok = 0;
     char log[1024];
@@ -1174,7 +1256,7 @@ static void gles_rop_smoke_test(void)
     g_string_append(o, glsl_common);
     g_string_append(o, adreno_glsl_helpers);
     g_string_append_printf(o, "#define CONST(i) u_c[((i) + u_cb.x) & 511]\n");
-    gles_gm_source(o, gatomics_gles);
+    gles_gm_source(o, no_atomics);
     g_string_append(o, glsl_rop_mid);
     g_string_append(o, glsl_rop_tail);
     g_string_append(o,
@@ -1242,10 +1324,24 @@ typedef struct GlesTex {
 
 #define GlesTexCacheMax   768
 
+/*
+ * The framebuffer the draws go to.  It has no attachment of GMEM: the
+ * shaders write GMEM themselves, through an image, and a texture that is
+ * both an attachment and bound for imageLoad() and imageStore() is a
+ * feedback loop the spec leaves undefined.  What the attachment is for is
+ * the window the fragments are clipped to: it has to be at least as large
+ * as the scissor box a draw sets, or everything outside it - most of the
+ * screen - is dropped before a shader ever runs.  A dummy the size of the
+ * window space the scissor can name does it; nothing is ever written to
+ * it, so one byte per texel is enough.
+ */
+#define GLES_FB_DIM      2048
+#define GLES_R8_         0x8229
+
 typedef struct AdrenoGles {
     GLuint vao;
     GLuint consts, draw, verts, vdata, idx;
-    GLuint gmem_tex, fbo;
+    GLuint gmem_tex, fbo, gmem_fbo, target_tex;
     GLuint dummy2d, dummy_arr;
     GHashTable *progs, *texes;
     AdrenoTlb tlb;
@@ -1368,8 +1464,16 @@ static GlesProg *gles_program(MsmAdrenoState *s, const AdrenoGlDraw *g)
                         key.param_gen, key.param_gen_reg,
                         p->exports_depth, &p->info);
     if (getenv("ADRENO_GLES_DEBUG")) {
-        g_file_set_contents("adreno-gles.vs.glsl", vs->str, -1, NULL);
-        g_file_set_contents("adreno-gles.fs.glsl", fs->str, -1, NULL);
+        /* the whole source, as the driver was given it */
+        GString *dv = g_string_new(gles_version_line());
+        GString *df = g_string_new(gles_version_line());
+
+        g_string_append_len(dv, vs->str, vs->len);
+        g_string_append_len(df, fs->str, fs->len);
+        g_file_set_contents("adreno-gles.vs.glsl", dv->str, dv->len, NULL);
+        g_file_set_contents("adreno-gles.fs.glsl", df->str, df->len, NULL);
+        g_string_free(dv, true);
+        g_string_free(df, true);
     }
     v = gles_compile(GL_VERTEX_SHADER_, vs->str);
     f = gles_compile(GL_FRAGMENT_SHADER_, fs->str);
@@ -1487,7 +1591,6 @@ static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
         size_t texel = im.is_float ? 16 : 4;
         void *buf = gles_scratch((size_t)im.w * im.h * texel);
         GLenum type = im.is_float ? GL_FLOAT_ : GL_UNSIGNED_BYTE_;
-        unsigned mag = im.mag, min = im.min, mip = im.mip;
 
         for (int layer = 0; layer < im.layers; layer++) {
             for (int level = 0; level < im.levels; level++) {
@@ -1505,20 +1608,35 @@ static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
             }
         }
         /* GL ES has no sampler objects: the filters live on the texture */
-        glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_,
-                        mag == 1 ? GL_LINEAR_ : GL_NEAREST_);
-        if (mip == 2 || im.levels <= 1) {
-            glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_,
-                            min == 1 ? GL_LINEAR_ : GL_NEAREST_);
-        } else {
-            glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_,
-                            min == 1 ? (mip == 1 ? GL_LINEAR_MIPMAP_LINEAR_
-                                                 : GL_LINEAR_)
-                                     : (mip == 1 ? GL_NEAREST_
-                                                : GL_NEAREST_MIPMAP_LINEAR_));
+        /*
+         * RGBA32F is not filterable without GL_OES_texture_float_linear, and
+         * an unfilterable texture with a LINEAR filter is incomplete: every
+         * fetch of it reads as (0, 0, 0, 1).
+         */
+        {
+            unsigned mag = im.mag, min = im.min, mip = im.mip;
+            bool linear = !im.is_float || g_float_linear;
+
+            glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_,
+                            linear && mag == 1 ? GL_LINEAR_ : GL_NEAREST_);
+            if (mip == 2 || im.levels <= 1) {
+                glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_,
+                                linear && min == 1 ? GL_LINEAR_ : GL_NEAREST_);
+            } else if (!linear) {
+                glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_,
+                                mip == 1 ? GL_NEAREST_ : GL_NEAREST_MIPMAP_LINEAR_);
+            } else {
+                glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_,
+                                min == 1 ? (mip == 1 ? GL_LINEAR_MIPMAP_LINEAR_
+                                                     : GL_LINEAR_)
+                                         : (mip == 1 ? GL_NEAREST_
+                                                    : GL_NEAREST_MIPMAP_LINEAR_));
+            }
         }
         glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, gles_wrap(im.clamp[0]));
         glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, gles_wrap(im.clamp[1]));
+        /* GL_CLAMP_TO_BORDER reads the texture's own border colour */
+        glTexParameterfv(GL_TEXTURE_2D_, GL_TEXTURE_BORDER_COLOR_, im.border);
         glTexParameterf(GL_TEXTURE_2D_, GL_TEXTURE_MIN_LOD_, im.min_level);
         glTexParameterf(GL_TEXTURE_2D_, GL_TEXTURE_MAX_LOD_, im.max_level);
         glTexParameterf(GL_TEXTURE_2D_, GL_TEXTURE_LOD_BIAS_, im.lod_bias);
@@ -1580,6 +1698,7 @@ static void gles_gmem_upload(MsmAdrenoState *s)
     AdrenoGles *gls = g_gles;
 
     if (gls->cpu_newer) {
+        glActiveTexture(GL_TEXTURE0_ + g_gmem_unit);
         glBindTexture(GL_TEXTURE_2D_, gls->gmem_tex);
         glPixelStorei(GL_UNPACK_ALIGNMENT_, 4);
         glTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, GMEM_TEXELS_W, GMEM_TEXELS_H,
@@ -1596,10 +1715,12 @@ void adreno_gles_gmem_to_cpu(MsmAdrenoState *s)
         return;
     }
     glFinish();
-    glBindFramebuffer(GL_FRAMEBUFFER_, gls->fbo);
+    /* GMEM as an attachment of its own: the draws' framebuffer has a dummy */
+    glBindFramebuffer(GL_FRAMEBUFFER_, gls->gmem_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT_, 4);
     glReadPixels(0, 0, GMEM_TEXELS_W, GMEM_TEXELS_H, GL_RED_INTEGER_,
                  GL_UNSIGNED_INT_, s->gmem);
+    glBindFramebuffer(GL_FRAMEBUFFER_, gls->fbo);
     gls->gpu_newer = false;
     gls->cpu_newer = true;
 }
@@ -1646,6 +1767,9 @@ void adreno_gles_snapshots_release(MsmAdrenoState *s)
 {
     AdrenoGles *gls = g_gles;
 
+    if (!gls) {
+        return;
+    }
     for (int i = 0; i < gls->snap_used; i++) {
         g_free(gls->snap[i]);
         gls->snap[i] = NULL;
@@ -1677,7 +1801,7 @@ static void gles_upload_vertices(MsmAdrenoState *s, const GlesProg *p,
         hi[i] = MIN(hi[i], lo[i] + (16 << 20));
         total += ROUND_UP(hi[i] - lo[i], 16);
     }
-    buf = g_malloc(total);
+    buf = g_malloc0(total);
     base = 0;
     at = 0;
     for (int i = 0; i < vi->nvtx; i++) {
@@ -1708,6 +1832,14 @@ static void gles_upload_vertices(MsmAdrenoState *s, const GlesProg *p,
 /* Draws                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * fixed 12.4 to float, as the register's own format says
+ */
+static float fx124(uint32_t v)
+{
+    return (v & 0xffff) / 16.0f;
+}
+
 void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
 {
     AdrenoGles *gls = g_gles;
@@ -1719,7 +1851,13 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     size_t vbytes;
     GLint loc;
 
-    if (!g->nverts || g->clip_x0 >= g->clip_x1 || g->clip_y0 >= g->clip_y1) {
+    /*
+     * With a vertex shader the primitives come as indices and the host GPU
+     * shades the vertices, so the vertex count is nidx; without one the CPU
+     * has already shaded them into verts.
+     */
+    if ((g->vs ? !g->nidx : !g->nverts) ||
+        g->clip_x0 >= g->clip_x1 || g->clip_y0 >= g->clip_y1) {
         return;
     }
     gls->ndraw++;
@@ -1732,6 +1870,15 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
 
     /* what the draw reads */
     memset(&du, 0, sizeof(du));
+    /*
+     * The vertex shader first: it asks for its textures from units 16..31,
+     * so it binds first and the pixel shader, whose units are 0..15, wins
+     * where the two overlap (only on a host with too few units for both).
+     */
+    if (p->key.geom != GEOM_CPU) {
+        gles_bind_textures(s, &p->vinfo, p->key.vs_cube_mask, g_vs_unit_base,
+                           &du);
+    }
     gles_bind_textures(s, &p->info, p->key.cube_mask, 0, &du);
     memcpy(du.bools, &r[A2_SQ_CF_BOOLEANS], sizeof(du.bools));
     memcpy(du.loops, &r[A2_SQ_CF_LOOP], sizeof(du.loops));
@@ -1765,10 +1912,37 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     du.misc[1] = g->win_x;
     du.misc[2] = g->win_y;
     du.misc[3] = g->pix_ofs;
+    if (p->key.geom != GEOM_CPU) {
+        /*
+         * The viewport transform and the clip control: what the guest's
+         * vertex shader computes with.  The window offsets are the ones
+         * that go into the position; misc[] carries them to the pixel
+         * shader, which wants the window's own origin.
+         */
+        uint32_t mm = r[A2_PA_SU_POINT_MINMAX];
+
+        du.vp0[0] = adreno_f(r[A2_PA_CL_VPORT_XSCALE]);
+        du.vp0[1] = adreno_f(r[A2_PA_CL_VPORT_XOFFSET]);
+        du.vp0[2] = adreno_f(r[A2_PA_CL_VPORT_YSCALE]);
+        du.vp0[3] = adreno_f(r[A2_PA_CL_VPORT_YOFFSET]);
+        du.vp1[0] = adreno_f(r[A2_PA_CL_VPORT_ZSCALE]);
+        du.vp1[1] = adreno_f(r[A2_PA_CL_VPORT_ZOFFSET]);
+        du.vp1[2] = fx124(r[A2_PA_SU_POINT_SIZE] >> 16);
+        du.vp2[0] = g->win_offset_vtx ? g->win_x : 0;
+        du.vp2[1] = g->win_offset_vtx ? g->win_y : 0;
+        du.vp2[2] = g->pix_ofs;
+        du.vte[0] = r[A2_PA_CL_VTE_CNTL];
+        du.vte[1] = r[A2_PA_CL_CLIP_CNTL];
+        du.psz[0] = fx124(mm);
+        du.psz[1] = fx124(mm >> 16);
+        du.psz[2] = g->prim == A2_PT_POINTLIST_PSIZE || g->vs->exports_psize;
+    }
 
     /*
      * GL ES 3.1 has no buffer ranges, so each of the three blocks a draw
-     * reads is written whole into a buffer of its own.
+     * reads is written whole into a buffer of its own.  The vertex fetch
+     * descriptors are part of du, so they have to be filled in before du
+     * goes up: gles_upload_vertices() writes into it.
      */
     if (s->const_dirty) {
         glBindBuffer(GL_UNIFORM_BUFFER_, gls->consts);
@@ -1776,8 +1950,6 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
                      GL_DYNAMIC_DRAW_);
         s->const_dirty = false;
     }
-    glBindBuffer(GL_UNIFORM_BUFFER_, gls->draw);
-    glBufferData(GL_UNIFORM_BUFFER_, sizeof(du), &du, GL_DYNAMIC_DRAW_);
     if (p->key.geom == GEOM_CPU) {
         vbytes = (size_t)g->nverts * ADRENO_GL_VTX_VEC4(g->ninterp) * 16;
         glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->verts);
@@ -1787,6 +1959,8 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     } else {
         gles_upload_vertices(s, p, g, &du);
     }
+    glBindBuffer(GL_UNIFORM_BUFFER_, gls->draw);
+    glBufferData(GL_UNIFORM_BUFFER_, sizeof(du), &du, GL_DYNAMIC_DRAW_);
 
     glUseProgram(p->prog);
     {
@@ -1803,12 +1977,12 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         }
     }
 
-    /* GMEM is both an image the shaders write and the attachment they read */
-    glActiveTexture(GL_TEXTURE0_);
+    /* GMEM, on a unit of its own: the guest's textures have the rest */
+    glActiveTexture(GL_TEXTURE0_ + g_gmem_unit);
     glBindTexture(GL_TEXTURE_2D_, gls->gmem_tex);
     loc = glGetUniformLocation(p->prog, "u_gmem");
     if (loc >= 0) {
-        glUniform1i(loc, 0);
+        glUniform1i(loc, g_gmem_unit);
     }
 
     glScissor(g->clip_x0, g->clip_y0, g->clip_x1 - g->clip_x0,
@@ -1842,7 +2016,34 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
 
         glDrawElements(mode, g->nidx, GL_UNSIGNED_INT_, (void *)0);
     }
+    /*
+     * Qualcomm's driver answers eglCreateContext() with an ES 3 context even
+     * when it could not make one, so a driver that is really running ES 1.1
+     * takes every ES 3 call as an error and quietly draws nothing.  Say so
+     * once, rather than leaving a blank screen with no explanation.
+     */
+    if (!g_gles_checked && gls->ndraw > 1) {
+        GLenum err = glGetError();
+
+        g_gles_checked = true;
+        if (err != GL_NO_ERROR_) {
+            error_report("msm-adreno: the host GPU rejected the ES 3 calls "
+                         "(glGetError 0x%x) after %" PRIu64 " draws: the "
+                         "driver gave us an ES 1 context.  Set "
+                         "ro.hardware.egl=1 to get rid of it, or render in "
+                         "software.", err, gls->ndraw);
+        }
+    }
     gls->gpu_newer = true;
+    /*
+     * Say once that draws really are going through here: a draw that finds
+     * the host GPU unusable falls back to the CPU, and a picture that comes
+     * out the same either way says nothing about which one did it.
+     */
+    if (gls->ndraw == 100) {
+        info_report("msm-adreno: the guest's draws are running on this host's "
+                    "GPU through OpenGL ES");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1858,9 +2059,12 @@ static GLuint gles_dummy(GLenum target, bool array)
     glGenTextures(1, &t);
     glBindTexture(target, t);
     if (array) {
-        glTexStorage3D(target, 1, GL_RGBA8_, 1, 1, 1);
-        glTexSubImage3D(target, 0, 0, 0, 0, 1, 1, 1, GL_RGBA_,
-                        GL_UNSIGNED_BYTE_, black);
+        /* six layers, so a cube fetch of it stays inside the texture */
+        glTexStorage3D(target, 1, GL_RGBA8_, 1, 1, 6);
+        for (int i = 0; i < 6; i++) {
+            glTexSubImage3D(target, 0, 0, 0, i, 1, 1, 1, GL_RGBA_,
+                            GL_UNSIGNED_BYTE_, black);
+        }
     } else {
         glTexStorage2D(target, 1, GL_RGBA8_, 1, 1);
         glTexSubImage2D(target, 0, 0, 0, 1, 1, GL_RGBA_,
@@ -1872,15 +2076,19 @@ static GLuint gles_dummy(GLenum target, bool array)
 }
 
 /*
- * Everything a draw needs, made once on the thread that draws.  GMEM is the
- * colour attachment of an empty framebuffer the size of the window space a
- * draw can reach, so the shaders can read what they wrote.
+ * Everything a draw needs, made once on the thread that draws.  The
+ * framebuffer the draws go to has a dummy attachment the size of the
+ * window space a draw can reach, so no fragment is clipped away before its
+ * shader has written GMEM, and a second one holds GMEM itself for the
+ * read-back.
  */
 static bool gles_render_init(MsmAdrenoState *s)
 {
-    AdrenoGles *gls = g_gles;
+    AdrenoGles *gls;
     GLuint dummy_arr = 0, dummy2d = 0;
 
+    g_gles = g_new0(AdrenoGles, 1);
+    gls = g_gles;
     gls->progs = g_hash_table_new(gles_prog_hash, gles_prog_equal);
     gls->texes = g_hash_table_new(gles_tex_hash, gles_tex_equal);
 
@@ -1896,15 +2104,42 @@ static bool gles_render_init(MsmAdrenoState *s)
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 4, GL_FLOAT_, GL_FALSE_, 0, (void *)0);
 
+    /* GMEM itself: an image the shaders read and write, never an attachment */
     glGenTextures(1, &gls->gmem_tex);
     glBindTexture(GL_TEXTURE_2D_, gls->gmem_tex);
     glTexStorage2D(GL_TEXTURE_2D_, 1, GL_R32UI_, GMEM_TEXELS_W, GMEM_TEXELS_H);
     glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
     glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
+    /* and the framebuffer it is read back through */
+    glGenFramebuffers(1, &gls->gmem_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER_, gls->gmem_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
+                           gls->gmem_tex, 0);
+    /*
+     * The framebuffer the draws go to.  Its only job is the window: nothing
+     * is written to it, so it gets one byte per texel, and it must be at
+     * least as large as the biggest scissor box a draw can set - the HD2's
+     * window is 480x800 and the window offset moves the bin by up to that
+     * much again.
+     */
+    glGenTextures(1, &gls->target_tex);
+    glBindTexture(GL_TEXTURE_2D_, gls->target_tex);
+    glTexStorage2D(GL_TEXTURE_2D_, 1, GLES_R8_, GLES_FB_DIM, GLES_FB_DIM);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
+    glTexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
     glGenFramebuffers(1, &gls->fbo);
     glBindFramebuffer(GL_FRAMEBUFFER_, gls->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_,
-                           gls->gmem_tex, 0);
+                           gls->target_tex, 0);
+    if (gl.CheckFramebufferStatus &&
+        gl.CheckFramebufferStatus(GL_FRAMEBUFFER_) != 0x8CD5 /* COMPLETE */) {
+        error_report("msm-adreno: the OpenGL ES draw framebuffer is not "
+                     "complete (0x%x); rendering in software",
+                     gl.CheckFramebufferStatus(GL_FRAMEBUFFER_));
+        glBindFramebuffer(GL_FRAMEBUFFER_, 0);
+        return false;
+    }
+    /* the guest's window coordinates, so gl_FragCoord is the window's own */
     glViewport(0, 0, FB_SIZE, FB_SIZE);
     glEnable(GL_SCISSOR_TEST_);
     glDisable(GL_DEPTH_TEST_);
@@ -2102,6 +2337,25 @@ void adreno_gles_probe(MsmAdrenoState *s)
     gles_smoke_test();
     gatomics_gles = g_smoke_atomics;
     gles_rop_smoke_test();
+    /*
+     * GMEM's read-modify-write - the pixels of a three-byte format share a
+     * word - has to stay in primitive order.  Desktop OpenGL has fragment
+     * shader interlock for that; here the atomics do it, and a host with
+     * neither is a software renderer, so say so once and say no.
+     */
+    if (!gatomics_gles &&
+        !has_extension("GL_EXT_shader_framebuffer_fetch") &&
+        !has_extension("GL_ARM_shader_framebuffer_fetch")) {
+        error_report("msm-adreno: this host GPU can neither read the "
+                     "framebuffer in a fragment shader nor do image atomics: "
+                     "GMEM's read-modify-write would not stay in order, so "
+                     "the draws go through the CPU");
+    }
+    if (!g_clip_dist) {
+        info_report("msm-adreno:   no GL_EXT_clip_cull_distance: the "
+                    "guest's clip planes are dropped (they are already "
+                    "clipped on the CPU)");
+    }
     /* the real context belongs to the thread that draws */
     gles_teardown();
     /*
@@ -2124,9 +2378,10 @@ bool adreno_gles_available(MsmAdrenoState *s)
     /*
      * GMEM's per-pixel read-modify-write has to stay in primitive order.
      * Desktop OpenGL does that with fragment shader interlock; here it is
-     * framebuffer fetch, and a host with neither is a software renderer.
+     * framebuffer fetch, or the image atomics the smoke test found - a host
+     * with neither of those is a software renderer.
      */
-    if (g_ctx_up &&
+    if (!gatomics_gles && g_ctx_up &&
         !has_extension("GL_EXT_shader_framebuffer_fetch") &&
         !has_extension("GL_ARM_shader_framebuffer_fetch") &&
         !has_extension("GL_OES_shader_framebuffer_fetch")) {
@@ -2146,8 +2401,11 @@ bool adreno_gles_available(MsmAdrenoState *s)
     if (!gles_render_ready) {
         return false;
     }
-    if (!g_gles_ready && !gles_render_init(s)) {
-        return false;
+    /* g_gles only appears once gles_render_init() has been tried and said yes */
+    if (!g_gles_ready) {
+        if (g_gles || !gles_render_init(s)) {
+            return false;
+        }
     }
     /* the context lives on the thread that made it */
     return qemu_thread_is_self(&gles_owner);

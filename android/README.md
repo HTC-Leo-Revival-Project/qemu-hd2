@@ -126,9 +126,7 @@ What is in place:
   write, blending, the surface addressing - the desktop backend's own GLSL
   with GMEM read and written through a `uimage2D` instead of an SSBO, and
   without the interlock.  The check runs on whatever host has a GLES 3
-  context, and `ADRENO_GLES_DEBUG=1` writes the assembled shader out, which is
-  how it was brought up against a desktop GLES 3.1 driver without waiting for
-  a phone to be plugged in.
+  context, and `ADRENO_GLES_DEBUG=1` writes the assembled shader out.
 
 The renderer itself is written: the program cache, the texture cache, the
 guest's vertex and pixel shaders as GLSL ES, GMEM as an image with read-back
@@ -138,14 +136,36 @@ before it takes a draw, and a host that cannot is a software renderer:
 | needs | for | this phone |
 |---|---|---|
 | image atomics | GMEM's read-modify-write, where neighbours share a word | yes |
-| framebuffer fetch | the draws in primitive order, without interlock | yes |
 | `GL_EXT_clip_cull_distance` | the guest's vertex shader's clip planes | yes |
 | GL ES 3 | everything | 3.2 |
 
-A desktop GLES driver usually has none of the first three - Mesa's has none -
-so there the setting falls back to software and that laptop cannot run it.
-It was still the right place to write it: it compiles and links the same
-shaders and says what is missing, which is most of the work.
+It **runs**: the log says `the guest's draws are running on this host's GPU
+through OpenGL ES` once the hundredth draw has gone through it, and a boot
+to the lock screen comes out right - clock, wallpaper, icons, carrier and
+all, the same picture the software renderer draws.
+
+Three things it needs that the desktop backend does not, all of them the
+reason it drew nothing at all before:
+
+* **GMEM's texture unit.**  The pixel shader takes units 0..15 and the
+  vertex shader 16..31, so GMEM's image gets a unit of its own - 32 on a
+  phone with 96 units; a host with fewer shares the two stages' units, which
+  only costs a vertex shader that samples something of its own.  Its *image*
+  unit stays 0: an image's `layout(binding=)` names an image unit, of which
+  there are far fewer than texture units, and it is `glUniform1i` that points
+  the sampler at the texture.
+* **A framebuffer big enough, and not GMEM.**  A fragment outside the
+  framebuffer's attachment is dropped before its shader runs, so the draws go
+  to a dummy attachment the size of the window space the scissor can name -
+  with GMEM itself as the attachment it would also be a feedback loop, the
+  texture being bound for `imageLoad`/`imageStore` while it is being drawn
+  to.  A second framebuffer holds GMEM, for the read-back.
+* **`gl_ClipDistance`** needs `GL_EXT_clip_cull_distance` even in GLSL ES
+  3.20, so the guest's clip planes only go into the vertex shader when the
+  host has it; the primitives are clipped on the CPU either way.
+
+A host with neither image atomics nor framebuffer fetch draws in software,
+and says which it was in the log.
 
 ## Booting is not reliable yet
 
