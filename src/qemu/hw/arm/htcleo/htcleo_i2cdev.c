@@ -114,12 +114,37 @@ struct HtcleoTs {
     uint8_t buf[9];
     int pos;
     QEMUTimer *repeat;
+    /* TOUCH_DEBUG=1: how the guest is getting on with reading reports */
+    uint64_t n_touch, n_irq, n_read, n_report, n_repeat, last_x, last_y;
+    bool ts_debug;
 };
+
+static bool ts_debug_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("TOUCH_DEBUG") != NULL;
+    }
+    return on;
+}
 
 static void ts_update_irq(HtcleoTs *s)
 {
-    /* the line is pulled low while a report waits to be read */
-    qemu_set_irq(s->irq, !(s->powered && s->data_pending));
+    /*
+     * The line is pulled low while a report waits to be read, which is what
+     * the driver watches (it asks for a low-level interrupt).  Power does not
+     * gate it: the controller stays on the I2C bus and keeps answering even
+     * with its reset line asserted, and the guest's suspend path leaves that
+     * line asserted without ever restoring it, so gating on it here would
+     * leave the touchscreen dead after the first suspend.
+     */
+    if (s->ts_debug && s->n_irq++ < 40) {
+        fprintf(stderr, "touch: irq %s (pending %d down %d %ux%u)\n",
+                s->data_pending ? "low " : "high",
+                s->data_pending, s->down, s->x, s->y);
+    }
+    qemu_set_irq(s->irq, !s->data_pending);
 }
 
 static void ts_build_report(HtcleoTs *s)
@@ -138,6 +163,10 @@ static int ts_event(I2CSlave *i2c, enum i2c_event ev)
 {
     HtcleoTs *s = HTCLEO_TS(i2c);
 
+    if (s->ts_debug) {
+        fprintf(stderr, "touch: i2c event %d (cmd %02x %02x %02x %02x)\n",
+                ev, s->cmd[0], s->cmd[1], s->cmd[2], s->cmd[3]);
+    }
     if (ev == I2C_START_SEND) {
         s->cmd_len = 0;
         s->pos = 0;
@@ -177,11 +206,18 @@ static int ts_event(I2CSlave *i2c, enum i2c_event ev)
             s->reply = false;
         } else if (!s->enabled) {
             /* until it is enabled the controller answers with its ID */
+            if (s->ts_debug && s->n_read < 40) {
+                fprintf(stderr, "touch: read -> device id (not enabled yet)\n");
+            }
             memset(s->buf, 0, sizeof(s->buf));
             s->buf[0] = 0x55;
         } else {
             /* the current contact state; no contact is a valid report */
             ts_build_report(s);
+            if (s->ts_debug && s->n_read++ < 40) {
+                fprintf(stderr, "touch: read report, down %d, %ux%u\n",
+                        s->down, s->x, s->y);
+            }
         }
     } else if (ev == I2C_FINISH && s->pos > 0) {
         s->data_pending = false;
@@ -193,7 +229,8 @@ static int ts_event(I2CSlave *i2c, enum i2c_event ev)
                       20 * SCALE_MS);
         }
     }
-    return s->powered ? 0 : -1;
+    /* on the bus either way: see ts_update_irq() */
+    return 0;
 }
 
 static int ts_send(I2CSlave *i2c, uint8_t data)
@@ -219,6 +256,9 @@ static void ts_repeat(void *opaque)
 {
     HtcleoTs *s = opaque;
 
+    if (s->ts_debug && s->n_repeat++ < 40) {
+        fprintf(stderr, "touch: repeat %d,%d down %d\n", s->x, s->y, s->down);
+    }
     if (s->down || s->was_down) {
         s->data_pending = true;
         ts_update_irq(s);
@@ -229,6 +269,10 @@ void htcleo_ts_set_power(I2CSlave *d, bool on)
 {
     HtcleoTs *s = HTCLEO_TS(d);
 
+    if (s->ts_debug) {
+        fprintf(stderr, "touch: power %s (was %d, pending %d)\n",
+                on ? "on" : "off", s->powered, s->data_pending);
+    }
     if (on && !s->powered) {
         /* controller signals readiness by pulling its IRQ low */
         s->data_pending = false;
@@ -248,6 +292,10 @@ void htcleo_ts_touch(I2CSlave *d, bool down, int x, int y)
 {
     HtcleoTs *s = HTCLEO_TS(d);
 
+    if (s->ts_debug && s->n_touch++ < 40) {
+        fprintf(stderr, "touch: %s to %d,%d\n",
+                down ? "down" : (s->down ? "move" : "up"), x, y);
+    }
     s->down = down;
     s->x = x;
     s->y = y;
@@ -259,6 +307,7 @@ static void ts_realize(DeviceState *dev, Error **errp)
 {
     HtcleoTs *s = HTCLEO_TS(dev);
     s->repeat = timer_new_ns(QEMU_CLOCK_VIRTUAL, ts_repeat, s);
+    s->ts_debug = ts_debug_on();
 }
 
 static void ts_init(Object *obj)

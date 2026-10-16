@@ -1348,6 +1348,13 @@ typedef struct AdrenoGles {
     uint8_t *scratch;
     size_t scratch_size;
     uint64_t ndraw;
+    /*
+     * Why a draw would come out wrong, counted so the log can say: a texture
+     * the guest's memory cannot be turned into one (so every fetch of it
+     * reads the dummy), a program that would not build, a draw that found
+     * no host GPU at all.
+     */
+    uint64_t n_tex_fail, n_prog_fail, n_nogpu, n_dummy;
     bool cpu_newer;          /* the CPU changed s->gmem */
     bool gpu_newer;          /* the GPU has drawn since the last copy back */
     /* GMEM snapshots for resolves done later */
@@ -1480,6 +1487,9 @@ static GlesProg *gles_program(MsmAdrenoState *s, const AdrenoGlDraw *g)
     if (!v || !f) {
         if (v) glDeleteShader(v);
         if (f) glDeleteShader(f);
+        if (gls) {
+            gls->n_prog_fail++;
+        }
         return NULL;
     }
     p->prog = glCreateProgram();
@@ -1496,6 +1506,7 @@ static GlesProg *gles_program(MsmAdrenoState *s, const AdrenoGlDraw *g)
         error_report("msm-adreno: GLSL ES program did not link: %s", log);
         glDeleteProgram(p->prog);
         p->prog = 0;
+        gls->n_prog_fail++;
         return NULL;
     }
     return p;
@@ -1559,6 +1570,9 @@ static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
     t->stamp.writes = s->gpu_writes;
     t->used = gls->ndraw;
     if (!adreno_tex_image(s, idx, &im)) {
+        if (g_gles) {
+            g_gles->n_tex_fail++;
+        }
         if (t->tex) {
             glDeleteTextures(1, &t->tex);
             t->tex = 0;
@@ -1664,6 +1678,7 @@ static void gles_bind_textures(MsmAdrenoState *s, const AdrenoGlslInfo *info,
             /* no such texture: (0, 0, 0, 1), as the software sampler */
             glBindTexture(cube ? GL_TEXTURE_2D_ARRAY_ : GL_TEXTURE_2D_,
                           cube ? gls->dummy_arr : gls->dummy2d);
+            gls->n_dummy++;
             x->size[0] = x->size[1] = x->size[2] = x->size[3] = 1.0f;
             x->scale[0] = 1.0f;
             for (int k = 0; k < 4; k++) {
@@ -2038,11 +2053,20 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
     /*
      * Say once that draws really are going through here: a draw that finds
      * the host GPU unusable falls back to the CPU, and a picture that comes
-     * out the same either way says nothing about which one did it.
+     * out the same either way says nothing about which one did it.  The
+     * counters come with it: a picture with holes in it is nearly always one
+     * of the textures that could not be made, and that is worth saying.
      */
     if (gls->ndraw == 100) {
         info_report("msm-adreno: the guest's draws are running on this host's "
                     "GPU through OpenGL ES");
+    }
+    if (gls->ndraw % 2000 == 0) {
+        info_report("msm-adreno:   %" PRIu64 " draws: %" PRIu64 " could not "
+                    "make a texture, %" PRIu64 " could not build a program, "
+                    "%" PRIu64 " had no host GPU, %" PRIu64 " fetched the "
+                    "dummy", gls->ndraw, gls->n_tex_fail, gls->n_prog_fail,
+                    gls->n_nogpu, gls->n_dummy);
     }
 }
 
