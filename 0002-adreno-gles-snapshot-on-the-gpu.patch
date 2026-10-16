@@ -1,0 +1,190 @@
+diff --git a/src/qemu/hw/arm/htcleo/msm_adreno_gles.c b/src/qemu/hw/arm/htcleo/msm_adreno_gles.c
+index c8e753b..670f6c6 100644
+--- a/src/qemu/hw/arm/htcleo/msm_adreno_gles.c
++++ b/src/qemu/hw/arm/htcleo/msm_adreno_gles.c
+@@ -89,6 +89,8 @@ typedef long            GLsizeiptr;
+ #define GL_TEXTURE_2D_ARRAY_            0x8C1A
+ #define GL_UNIFORM_BUFFER_              0x8A11
+ #define GL_SHADER_STORAGE_BUFFER_       0x90D2
++#define GL_COPY_READ_BUFFER_             0x8F36
++#define GL_COPY_WRITE_BUFFER_            0x8F37
+ #define GL_MAP_READ_BIT_                 0x0001
+ #define GL_RGBA32F_                     0x8814
+ #define GL_RGBA8_                       0x8058
+@@ -186,6 +188,8 @@ typedef void (*GlesGenBuffersFn)(GLsizei, GLuint *);
+ typedef void (*GlesBindBufferFn)(GLenum, GLuint);
+ typedef void (*GlesBufferDataFn)(GLenum, GLsizeiptr, const void *, GLenum);
+ typedef void (*GlesBufferSubDataFn)(GLenum, GLintptr, GLsizeiptr, const void *);
++typedef void (*GlesCopyBufferSubDataFn)(GLenum, GLenum, GLintptr, GLintptr,
++                                       GLsizeiptr);
+ typedef void (*GlesDeleteBuffersFn)(GLsizei, const GLuint *);
+ typedef GLuint (*GlesGenVertexArraysFn)(GLsizei, GLuint *);
+ typedef void (*GlesBindVertexArrayFn)(GLuint);
+@@ -347,6 +351,7 @@ static struct {
+     GlesBindBufferFn BindBuffer;
+     GlesBufferDataFn BufferData;
+     GlesBufferSubDataFn BufferSubData;
++    GlesCopyBufferSubDataFn CopyBufferSubData;
+     GlesDeleteBuffersFn DeleteBuffers;
+     GlesGenVertexArraysFn GenVertexArrays;
+     GlesBindVertexArrayFn BindVertexArray;
+@@ -443,6 +448,7 @@ static struct {
+ #define glBindBuffer              gl.BindBuffer
+ #define glBufferData              gl.BufferData
+ #define glBufferSubData           gl.BufferSubData
++#define glCopyBufferSubData       gl.CopyBufferSubData
+ #define glDeleteBuffers           gl.DeleteBuffers
+ #define glGenVertexArrays         gl.GenVertexArrays
+ #define glBindVertexArray         gl.BindVertexArray
+@@ -598,6 +604,7 @@ static bool gles_load(void)
+     LOAD(BindBuffer, "glBindBuffer");
+     LOAD(BufferData, "glBufferData");
+     LOAD(BufferSubData, "glBufferSubData");
++    LOAD(CopyBufferSubData, "glCopyBufferSubData");
+     LOAD(DeleteBuffers, "glDeleteBuffers");
+     LOAD(GenVertexArrays, "glGenVertexArrays");
+     LOAD(BindVertexArray, "glBindVertexArray");
+@@ -1349,8 +1356,18 @@ typedef struct AdrenoGles {
+     uint64_t n_tex_fail, n_prog_fail, n_nogpu, n_dummy;
+     bool cpu_newer;          /* the CPU changed s->gmem */
+     bool gpu_newer;          /* the GPU has drawn since the last copy back */
+-    /* GMEM snapshots for resolves done later */
++    /*
++     * A bin read-out is deferred to the end of the kick, and it needs GMEM as
++     * it was when the bin was issued, so a snapshot is taken then.  The copy
++     * is made *on the GPU*: reading GMEM back to do it costs a glFinish per
++     * bin, and there are several bins per kick, which drains the pipeline
++     * every time and leaves the guest drawing at a third of the rate the
++     * software renderer manages.  So each slot is a buffer the GPU copies
++     * into, and the CPU fetches from it once, when the kick ends.
++     */
++    GLuint snapbuf[32];
+     uint8_t *snap[32];
++    bool snap_read[32];
+     int nsnap, snap_used;
+ } AdrenoGles;
+ 
+@@ -1775,26 +1792,90 @@ void adreno_gles_gmem_from_cpu(MsmAdrenoState *s)
+ bool adreno_gles_gmem_snapshot(MsmAdrenoState *s, int *slot)
+ {
+     AdrenoGles *gls = g_gles;
++    int n;
+ 
+     if (!gls || gls->snap_used >= ARRAY_SIZE(gls->snap)) {
+         return false;
+     }
+-    adreno_gles_gmem_to_cpu(s);
+-    gls->snap[gls->snap_used] = g_malloc(ADRENO_GMEM_SIZE);
+-    memcpy(gls->snap[gls->snap_used], s->gmem, ADRENO_GMEM_SIZE);
++    n = gls->snap_used;
++    /*
++     * The GPU's copy of GMEM has to be current before it is copied from: a
++     * software draw or an earlier read-back will have left s->gmem ahead of
++     * it.  After that this is a copy between two buffers, which the driver
++     * does on its own time - no wait for the pipeline.
++     */
++    gles_gmem_upload(s);
++    glGetError();                      /* so the check below is about the copy */
++    glBindBuffer(GL_COPY_READ_BUFFER_, gls->gmem);
++    glBindBuffer(GL_COPY_WRITE_BUFFER_, gls->snapbuf[n]);
++    glCopyBufferSubData(GL_SHADER_STORAGE_BUFFER_, GL_SHADER_STORAGE_BUFFER_,
++                        0, 0, ADRENO_GMEM_SIZE);
++    glBindBuffer(GL_COPY_READ_BUFFER_, 0);
++    glBindBuffer(GL_COPY_WRITE_BUFFER_, 0);
++    if (getenv("ADRENO_SNAP_DEBUG")) {
++        fprintf(stderr, "touch: snap %d: glGetError after copy 0x%x\n", n,
++                glGetError());
++    }
++    gls->snap_read[n] = false;
+     *slot = gls->snap_used++;
+     return true;
+ }
+ 
++/*
++ * Once per kick, before any of the deferred bins are read: the copies the GPU
++ * was given still have to land.  One wait for the whole kick is the point -
++ * waiting per bin is what made this path slow.
++ */
+ void adreno_gles_snapshots_wait(MsmAdrenoState *s)
+ {
++    if (g_gles) {
++        glFinish();
++    }
+ }
+ 
++/*
++ * The CPU's copy of a snapshot, fetched now rather than when it was taken.
++ * adreno_gles_snapshots_wait() has already let the copies land, so this is a
++ * map and a memcpy with nothing left to wait for.
++ */
+ uint8_t *adreno_gles_snapshot_ptr(MsmAdrenoState *s, int slot)
+ {
+     AdrenoGles *gls = g_gles;
+ 
+-    return gls && slot >= 0 && slot < gls->snap_used ? gls->snap[slot] : NULL;
++    if (!gls || slot < 0 || slot >= gls->snap_used) {
++        return NULL;
++    }
++    if (!gls->snap_read[slot]) {
++        void *p;
++
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->snapbuf[slot]);
++        p = glMapBufferRange(GL_SHADER_STORAGE_BUFFER_, 0, ADRENO_GMEM_SIZE,
++                             GL_MAP_READ_BIT_);
++        if (p) {
++            if (!gls->snap[slot]) {
++                gls->snap[slot] = g_malloc(ADRENO_GMEM_SIZE);
++            }
++            memcpy(gls->snap[slot], p, ADRENO_GMEM_SIZE);
++            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER_);
++            if (getenv("ADRENO_SNAP_DEBUG")) {
++                static int nz_n;
++                size_t nz = 0;
++
++                for (size_t i = 0; i < ADRENO_GMEM_SIZE / 4; i++) {
++                    nz += gls->snap[slot][i] != 0;
++                }
++                if (nz_n++ < 8) {
++                    fprintf(stderr, "touch: snap read %d: %zu non-zero words, "
++                            "glGetError 0x%x\n", slot, nz, glGetError());
++                }
++            }
++        } else if (getenv("ADRENO_SNAP_DEBUG")) {
++            fprintf(stderr, "touch: snap read %d: MAP FAILED, glGetError "
++                    "0x%x\n", slot, glGetError());
++        }
++        gls->snap_read[slot] = true;
++    }
++    return gls->snap[slot];
+ }
+ 
+ void adreno_gles_snapshots_release(MsmAdrenoState *s)
+@@ -1807,6 +1888,7 @@ void adreno_gles_snapshots_release(MsmAdrenoState *s)
+     for (int i = 0; i < gls->snap_used; i++) {
+         g_free(gls->snap[i]);
+         gls->snap[i] = NULL;
++        gls->snap_read[i] = false;
+     }
+     gls->snap_used = 0;
+ }
+@@ -2144,6 +2226,20 @@ static bool gles_render_init(MsmAdrenoState *s)
+     glBufferData(GL_SHADER_STORAGE_BUFFER_, ADRENO_GMEM_SIZE, s->gmem,
+                  GL_DYNAMIC_DRAW_);
+     glBindBufferBase(GL_SHADER_STORAGE_BUFFER_, 0, gls->gmem);
++    /*
++     * One buffer per deferred bin, all copied into on the GPU.  Each is left
++     * unbound afterwards: GL ES refuses a buffer copy whose *write* buffer is
++     * also bound to GL_SHADER_STORAGE_BUFFER, and creating them that way
++     * leaves exactly that.  The desktop backend gets away with it because
++     * glCopyNamedBufferSubData() does not go through bindings.
++     */
++    for (int i = 0; i < ARRAY_SIZE(gls->snapbuf); i++) {
++        glGenBuffers(1, &gls->snapbuf[i]);
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->snapbuf[i]);
++        glBufferData(GL_SHADER_STORAGE_BUFFER_, ADRENO_GMEM_SIZE, NULL,
++                     GL_DYNAMIC_DRAW_);
++    }
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER_, gls->gmem);
+     /*
+      * The framebuffer the draws go to.  Its only job is the window: nothing
+      * is written to it, so it gets one byte per texel, and it must be at

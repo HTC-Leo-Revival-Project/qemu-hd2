@@ -96,6 +96,16 @@ Where the desktop version runs the adb bridge on TCP, the app keeps the same
   28: that is where bionic starts declaring `<iconv.h>`, which glib requires.
   QEMU also runs on far slower hardware than a 2017 phone.
 
+## Debugging
+
+* **[HEADLESS.md](HEADLESS.md)** - running the emulator on the phone with no
+  app and no screen, and getting at it over `adb`.  Read the traps first: a
+  headless run can silently test an old build, and the bootloader waits for a
+  key press that nothing tells you about.
+* **[adreno-divider.md](adreno-divider.md)** - the one artifact left in the
+  OpenGL ES backend: a divider above the dock that draws solid in software
+  and patchy on the GPU.  What has been ruled out, and where to look next.
+
 ## OpenGL ES on the phone's GPU
 
 The desktop backend (`gl`) needs desktop OpenGL; an Adreno 8xx gives us GLES
@@ -111,61 +121,86 @@ What is in place:
 * A surfaceless (or pbuffer, `ADRENO_GLES_PBUFFER=1`) EGL context, asked for
   OpenGL ES 3, with the extension list checked for what a renderer needs.
 * A smoke test at device init that compiles a GLSL ES pixel shader, draws with
-  a vertex array, writes GMEM through an `imageStore` and an
-  `imageAtomicOr`, and reads it back.  All of it in `qemu.out`:
+  a vertex array, writes GMEM and reads **GMEM itself** back.  Reading the
+  buffer and not a framebuffer matters: a colour attachment only shows that
+  the draw landed, so a driver that quietly drops every store passes it.  All
+  of it in `qemu.out`:
 
       msm-adreno: GLES 3 backend on Adreno (TM) 830 (EGL 1.5, OpenGL ES 3.2 ...)
+      msm-adreno:   smoke test: GMEM storage buffer gave 000000c0 000000c0
+                    000000c0 000000c0 (want 000000c0 each)
       msm-adreno:   smoke test: OK, the host GPU runs the translated shaders
-                    and writes GMEM
+                    and writes GMEM, with atomics
 
   On this phone it passes, so the Adreno 830 has everything the desktop
-  backend's design needs: image atomics for GMEM's read-modify-write and
-  framebuffer fetch in place of fragment shader interlock.
+  backend's design needs: storage buffer atomics for GMEM's read-modify-write
+  and framebuffer fetch in place of fragment shader interlock.
 
 * The **render backend compiles as GLSL ES**: `depth_stencil()`, the colour
   write, blending, the surface addressing - the desktop backend's own GLSL
-  with GMEM read and written through a `uimage2D` instead of an SSBO, and
   without the interlock.  The check runs on whatever host has a GLES 3
   context, and `ADRENO_GLES_DEBUG=1` writes the assembled shader out.
 
 The renderer itself is written: the program cache, the texture cache, the
-guest's vertex and pixel shaders as GLSL ES, GMEM as an image with read-back
-for the resolves, and the draws.  What it needs from the host it asks for
+guest's vertex and pixel shaders as GLSL ES, GMEM as a shader storage buffer
+with read-back for the resolves, and the draws.  What it needs from the host it asks for
 before it takes a draw, and a host that cannot is a software renderer:
 
 | needs | for | this phone |
 |---|---|---|
-| image atomics | GMEM's read-modify-write, where neighbours share a word | yes |
+| storage buffer atomics | GMEM's read-modify-write, where neighbours share a word | yes |
 | `GL_EXT_clip_cull_distance` | the guest's vertex shader's clip planes | yes |
 | GL ES 3 | everything | 3.2 |
 
 It **runs**: the log says `the guest's draws are running on this host's GPU
 through OpenGL ES` once the hundredth draw has gone through it, and a boot
-to the lock screen comes out right - clock, wallpaper, icons, carrier and
-all, the same picture the software renderer draws.
+to the launcher comes out right - clock, wallpaper, search widget, icons,
+dock and all, the same picture the software renderer draws.
 
 Three things it needs that the desktop backend does not, all of them the
 reason it drew nothing at all before:
 
-* **GMEM's texture unit.**  The pixel shader takes units 0..15 and the
-  vertex shader 16..31, so GMEM's image gets a unit of its own - 32 on a
-  phone with 96 units; a host with fewer shares the two stages' units, which
-  only costs a vertex shader that samples something of its own.  Its *image*
-  unit stays 0: an image's `layout(binding=)` names an image unit, of which
-  there are far fewer than texture units, and it is `glUniform1i` that points
-  the sampler at the texture.
-* **A framebuffer big enough, and not GMEM.**  A fragment outside the
-  framebuffer's attachment is dropped before its shader runs, so the draws go
-  to a dummy attachment the size of the window space the scissor can name -
-  with GMEM itself as the attachment it would also be a feedback loop, the
-  texture being bound for `imageLoad`/`imageStore` while it is being drawn
-  to.  A second framebuffer holds GMEM, for the read-back.
+* **GMEM as a storage buffer, not an image.**  An R32UI image is the obvious
+  way to write it, and it is what this backend did first; the phone's driver
+  reports `GL_MAX_IMAGE_UNITS` as 0 and drops every `imageStore`, so the
+  shaders ran and every resolve copied an empty GMEM.  A storage buffer is
+  what the desktop backend uses and what the vertex path here already used,
+  so it is known to work.  Reading it back is a mapped buffer, because
+  `libGLESv3.so` has no `glGetBufferSubData`.
+* **Texture units split between the stages.**  The pixel shader takes units
+  0..15 and the vertex shader 16..31; a host with fewer shares the two
+  stages' units, which only costs a vertex shader that samples something of
+  its own.  GMEM is a buffer and takes no texture unit at all.
+* **A framebuffer big enough.**  A fragment outside the framebuffer's
+  attachment is dropped before its shader runs, so the draws go to a dummy
+  attachment the size of the window space the scissor can name; nothing is
+  ever written to it, so one byte per texel is enough.
 * **`gl_ClipDistance`** needs `GL_EXT_clip_cull_distance` even in GLSL ES
   3.20, so the guest's clip planes only go into the vertex shader when the
   host has it; the primitives are clipped on the CPU either way.
 
-A host with neither image atomics nor framebuffer fetch draws in software,
-and says which it was in the log.
+A host with neither storage buffer atomics nor framebuffer fetch draws in
+software, and says which it was in the log.
+
+Two things GL ES cannot do at all, worked around rather than emulated:
+
+* **A border colour.**  `GL_TEXTURE_BORDER_COLOR` is desktop-only, and GL ES
+  fixes the border at `(0, 0, 0, 0)`, so `GL_CLAMP_TO_BORDER` samples
+  transparent black instead of the guest's colour.  Clamping to the edge is
+  the closest GL ES can do, and is right wherever the border colour matches
+  the edge texel.
+* **`GL_TEXTURE_LOD_BIAS`.**  Also desktop-only, and not needed: the shader
+  already gets the bias as a scale.  Asking for it was an error on every
+  texture that left GL ES with a sticky `GL_INVALID_ENUM`.
+
+### Tracing a boot
+
+`ADRENO_TRACE=FILE` turns on the existing draw-and-vertex trace from the
+environment, because on a phone there is no monitor to reach
+(`qom-set /machine/gpu trace FILE`).  `ADRENO_TRACE_ALL=1` asks for every
+draw's vertices rather than the next 2000, which on a boot is the
+difference between catching the launcher and only catching the boot
+animation.  `ADRENO_STATS=<seconds>` adds the per-draw counters.
 
 ## Booting is not reliable yet
 
