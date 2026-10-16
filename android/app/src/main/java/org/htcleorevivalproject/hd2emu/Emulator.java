@@ -171,8 +171,18 @@ public class Emulator {
          * connects, so the USB/IP stream vhci_hcd would have carried goes there
          * instead.  No vhci_hcd, and no root in QEMU.
          */
-        boolean passthrough = cfg.usbPassthrough && Root.status() == Root.Status.GRANTED;
+        /*
+         * Asked for but not available is a failure, not a quiet fallback: the
+         * UDC, configfs and FunctionFS are all root-only, so without root the
+         * passthrough cannot work at all, and carrying on as if it were off would
+         * leave the phone's USB alone and the PC seeing nothing, with nothing in
+         * the log to say why.
+         */
+        boolean passthrough = cfg.usbPassthrough;
         if (passthrough) {
+            if (Root.status() != Root.Status.GRANTED) {
+                throw new IOException(ctx.getString(R.string.emu_usb_needs_root));
+            }
             if (!paths.hasUsbBridge()) {
                 throw new IOException(ctx.getString(R.string.emu_usbffs_missing));
             }
@@ -540,7 +550,8 @@ public class Emulator {
     }
 
     private void cleanSockets() {
-        for (File f : new File[]{paths.qmpSocket(), paths.vncSocket(), paths.q6LinkSocket()}) {
+        for (File f : new File[]{paths.qmpSocket(), paths.vncSocket(), paths.q6LinkSocket(),
+                paths.usbIpSocket()}) {
             if (f.exists()) f.delete();
         }
     }

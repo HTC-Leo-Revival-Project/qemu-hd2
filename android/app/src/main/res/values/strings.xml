@@ -302,6 +302,7 @@
     <!-- the emulator\'s own messages -->
     <string name="emu_already_running">The emulator is already running</string>
     <string name="emu_launching">Launching QEMU</string>
+    <string name="emu_usb_needs_root">USB passthrough is on but this app has no root: the USB controller, configfs and FunctionFS are all root-only. Grant it in Root &amp; USB first.</string>
     <string name="emu_usbffs_missing">usbffs is not in this build, so USB passthrough cannot run</string>
     <string name="emu_usb_starting">Starting the USB bridge…</string>
     <string name="emu_usb_on_port">The emulated HD2 is on this phone\'s USB port</string>
