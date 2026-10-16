@@ -223,6 +223,15 @@ It needs **root**: `vhci_hcd`'s `attach` attribute is root-only *and* the kernel
 
 From QEMU it is the same switch as everything else, `usb-host=lle`, and `USB=lle tools/start.sh` is what the wrapper runs. `QEMU_D=unimp,guest_errors,trace tools/start.sh` logs the USB/IP traffic to `images/qemu.log` under `msm-usbip:` — every setup packet in, every URB out, which is the quickest way to see what the host and the gadget each think is going on.
 
+Without `vhci_hcd` — on a phone, where it is not in the kernel — the same
+USB/IP stream can go to a bridge over a unix socket instead, with
+`usb-ip-socket=PATH`: QEMU listens there and the far end owns a host
+controller of its own. That is how the Android app puts the emulated HD2 on the
+phone's own USB port, so a PC plugged into the phone sees an HD2 and its
+`fastboot` and `adb` talk to it (`android/README.md`, **Root and USB**;
+`docs/usb-passthrough.md` for how it works). Nothing else changes: the gadget
+side is the same `htcleo_usbip.c` either way.
+
 <a name="gpu-adreno-200"></a>
 <h2><img src="docs/holo/h-gpu-adreno-200.png" width="196" height="40" alt="GPU (Adreno 200)"></h2>
 

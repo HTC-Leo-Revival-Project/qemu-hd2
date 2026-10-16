@@ -112,6 +112,7 @@ struct HtcleoMachineState {
     char *q6_link_id;           /* chardev to the qemu-system-hexagon one */
     DeviceState *q6_link;
     bool usb_lle;               /* the gadget goes on this host's bus (usb=lle) */
+    char *usb_ip_socket;        /* ... over this unix socket, if given */
     CPUClusterState apps_cluster;
     DeviceState *lle;
     gchar *fw_data;             /* -bios image, copied to RAM on reset */
@@ -1164,9 +1165,15 @@ static void htcleo_init(MachineState *machine)
     htcleo_regfile("msm-sdc4", MSM_SDC4_PHYS, 0x1000);
     dev = qdev_new(TYPE_MSM_HSUSB);
     sbd = SYS_BUS_DEVICE(dev);
-    /* usb=lle: the gadget is exposed to this machine through vhci_hcd */
+    /*
+     * usb=lle: the gadget is exposed to this machine through vhci_hcd, or
+     * to the app's bridge over a unix socket when usb-ip-socket is given.
+     */
     if (s->usb_lle) {
         qdev_prop_set_string(dev, "mode", "lle");
+        if (s->usb_ip_socket) {
+            qdev_prop_set_string(dev, "usb-ip-socket", s->usb_ip_socket);
+        }
     }
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, MSM_HSUSB_PHYS);
@@ -1319,7 +1326,12 @@ static void htcleo_set_modem_trace(Object *obj, bool v, Error **errp)
 
 static char *htcleo_get_usb(Object *obj, Error **errp)
 {
-    return g_strdup(HTCLEO_MACHINE(obj)->usb_lle ? "lle" : "hle");
+    HtcleoMachineState *s = HTCLEO_MACHINE(obj);
+
+    if (s->usb_ip_socket) {
+        return g_strdup("socket");
+    }
+    return g_strdup(s->usb_lle ? "lle" : "hle");
 }
 
 static void htcleo_set_usb(Object *obj, const char *v, Error **errp)
@@ -1333,6 +1345,16 @@ static void htcleo_set_usb(Object *obj, const char *v, Error **errp)
     } else {
         error_setg(errp, "usb must be 'hle' or 'lle'");
     }
+}
+
+static char *htcleo_get_usb_ip(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_MACHINE(obj)->usb_ip_socket);
+}
+
+static void htcleo_set_usb_ip(Object *obj, const char *v, Error **errp)
+{
+    HTCLEO_MACHINE(obj)->usb_ip_socket = g_strdup(v);
 }
 
 static char *htcleo_get_q6(Object *obj, Error **errp)
@@ -1398,9 +1420,18 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
                                   htcleo_set_usb);
     object_class_property_set_description(oc, "usb-host",
         "who plays USB host: hle (built in, adb is bridged to TCP, the "
-        "default) or lle (this machine's own stack enumerates the emulated "
+        "default), lle (this machine's own stack enumerates the emulated "
         "gadget over vhci_hcd, so lsusb/adb/fastboot see a real device; "
-        "needs root and vhci_hcd)");
+        "needs root and vhci_hcd) or socket (the same USB/IP stream on a "
+        "unix socket, for a bridge that owns the host controller - see "
+        "usb-ip-socket)");
+    object_class_property_add_str(oc, "usb-ip-socket", htcleo_get_usb_ip,
+                                  htcleo_set_usb_ip);
+    object_class_property_set_description(oc, "usb-ip-socket",
+        "a unix socket to speak USB/IP on instead of attaching to vhci_hcd: "
+        "the Android app's bridge, which puts the emulated HD2 on the "
+        "phone's own USB port through FunctionFS.  Needs usb-host=lle. "
+        "QEMU listens, the bridge connects; no root needed here");
     object_class_property_add_str(oc, "qdsp6-link", htcleo_get_q6_link,
                                   htcleo_set_q6_link);
     object_class_property_add_str(oc, "baseband-firmware", htcleo_get_modem_fw,

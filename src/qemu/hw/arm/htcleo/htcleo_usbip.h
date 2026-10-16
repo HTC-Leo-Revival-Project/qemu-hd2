@@ -89,12 +89,20 @@ struct UsbipLink {
     const UsbipOps *ops;
     void *opaque;
 
-    int fd;                     /* the end vhci_hcd was handed */
+    int fd;                     /* the end vhci_hcd was handed, or our listener */
     int peer;                   /* ... and the end we speak on */
     bool attached;
     uint8_t port;
     uint8_t speed;
     uint8_t devid;
+    /*
+     * Speak USB/IP on a unix socket instead of handing it to vhci_hcd, when
+     * set.  The far end is a bridge that owns a USB host controller somewhere
+     * else -- the app's FunctionFS gadget, which puts the emulated phone on
+     * this machine's own USB port.  Nothing here is different but the peer:
+     * the same 48-byte frames, and the same rules about who submits what.
+     */
+    char *path;
 
     QEMUTimer *timer;
     uint8_t inbuf[USBIP_BUF];
@@ -115,6 +123,8 @@ struct UsbipLink {
 
 void usbip_link_init(UsbipLink *l, const UsbipOps *ops, void *opaque,
                      uint8_t port, uint8_t speed, Error **errp);
+/* take the USB/IP stream on a unix socket instead of vhci_hcd (before init) */
+void usbip_link_set_path(UsbipLink *l, const char *path);
 void usbip_link_cleanup(UsbipLink *l);
 /* the gadget just primed an endpoint or stalled one: look for an answer */
 void usbip_link_kick(UsbipLink *l);

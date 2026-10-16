@@ -288,10 +288,51 @@ the emulated HD2's USB on real USB:
   and a free UDC), so a PC's flash tools, adb and fastboot see a real HD2;
 * **to this phone** through `vhci_hcd`, what `usb-host=lle` does on a PC.
 
-Neither is switched on yet.  The gadget bridge needs QEMU to hand the USB/IP
-stream `htcleo_usbip.c` speaks to `vhci_hcd` to the app over a unix socket
-instead; the app then serves the HD2's descriptors and endpoints through
-FunctionFS, with the phone's own gadget unbound from the UDC meanwhile.
+### USB passthrough to a PC
+
+With **Root & USB -> USB passthrough** on, the app runs QEMU with
+`usb-host=lle,usb-ip-socket=<run>/usbip.sock` and starts `usbffs` (built from
+`android/native/usbffs.c` into `jniLibs`, run as root through the same `su`
+shell) against that socket.  `usbffs` walks the emulated gadget for its
+descriptors over USB/IP, mirrors them into a FunctionFS gadget of its own, and
+proxies every transfer between the two, so a PC plugged into this phone sees the
+emulated HD2 and talks to it with its own `adb` and `fastboot`.  It is the same
+USB/IP stream `vhci_hcd` would have carried on a PC -- `vhci_hcd` is *not* used
+and *not* needed, and the probe does not require it.
+
+```
+fastboot devices                      ????????????  fastboot
+fastboot getvar product               product: HTCLEO
+fastboot flash recovery twrp.img      Writing 'recovery'   OKAY
+```
+
+What it takes from the phone, all of it undone when it stops
+(`usbffs` gives the UDC back and restarts `vendor.usb-hal`):
+
+* **the UDC**, so this phone stops being what the PC sees;
+* **`vendor.usb-hal`**, stopped for the duration -- and *only* the service: it is
+  never told to change `sys.usb.config`, because that restarts `adbd` and takes
+  wireless adb down with it;
+* **the USB gadget**, created as `hd2` if the kernel allows it, so the phone's
+  own gadget is left alone rather than rebuilt.
+
+Three things about it are not obvious and are written down where they cost time
+(`docs/usb-passthrough.md` has the long version):
+
+* **`max_speed` is `high-speed`** on that gadget, and has to be written after
+  the HAL is stopped and before the UDC is bound.  The emulated HD2 is an EHCI
+  device; at super speed the host insists on SS endpoint companion descriptors
+  that FunctionFS will not take, and `SET_CONFIGURATION` fails with EPIPE.
+* **`SET_CONFIGURATION` is replayed to the emulated guest**, on the ffs `ENABLE`
+  event.  The phone's UDC answers that request itself, out of the descriptor
+  copy `usbffs` gave it, so without the replay cLK never enables its bulk
+  endpoints and the emulated phone enumerates and then sits there mute.
+* **Unbinding a gadget needs a newline**: `echo "" > .../UDC` unbinds,
+  `write(fd, "", 0)` does not.
+
+`UsbBridge.probe()` reports what is missing when the switch stays off: root, the
+configfs gadget tree, functionfs, a free UDC, and whether the USB HAL can be
+stopped.  `vhci_hcd` is deliberately not one of the checks.
 
 ## Languages
 

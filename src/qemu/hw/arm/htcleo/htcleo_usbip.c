@@ -78,6 +78,8 @@
 #include "qemu/main-loop.h"
 #include "qapi/error.h"
 
+#include <sys/un.h>
+
 #include "hw/arm/htcleo/htcleo_usbip.h"
 
 #define USBIP_ATTACH     "/sys/bus/platform/devices/vhci_hcd.0/attach"
@@ -406,6 +408,17 @@ static void usbip_service(UsbipLink *l)
         }
     }
 
+    /*
+     * The poll timer and the re-attach timer are the same timer, so leave it
+     * alone while a re-attach is pending: usbip_link_reset() has just armed it
+     * to call usbip_link_open() again, and deleting it here (the URB queue is
+     * empty, so this looks like the ordinary idle case) means we never listen
+     * for the host again.
+     */
+    if (l->retry) {
+        return;
+    }
+
     if (l->nurb) {
         timer_mod(l->timer, now + POLL_NS);
     } else {
@@ -578,7 +591,17 @@ static void usbip_read(void *opaque)
             break;
         }
         if (n == 0) {
-            qemu_log_mask(LOG_TRACE, "msm-usbip: host closed the port\n");
+            qemu_log_mask(LOG_TRACE, "msm-usbip: the host closed the port\n");
+            /*
+             * With usb-ip-socket the peer *is* the host and it is not coming
+             * back, so leave the dead socket and listen again -- otherwise the
+             * next bridge finds nothing to connect to.  The gadget reset that
+             * goes with it is what the host would see anyway: the device fell
+             * off the bus and comes back to be enumerated afresh.
+             */
+            if (l->path) {
+                usbip_link_reset(l);
+            }
         } else {
             qemu_log_mask(LOG_TRACE, "msm-usbip: recv: %s\n",
                           strerror(errno));
@@ -648,11 +671,75 @@ static int usbip_sysfs(const char *path, const char *buf, size_t len,
     return 0;
 }
 
+/*
+ * The bridge on the other end of the socket has arrived: the device appears on
+ * the host's bus now, and the host enumerates it.
+ */
+static void usbip_accept(void *opaque)
+{
+    UsbipLink *l = opaque;
+    int fd = accept(l->fd, NULL, NULL);
+
+    if (fd < 0) {
+        return;
+    }
+    qemu_set_fd_handler(l->fd, NULL, NULL, NULL);
+    close(l->fd);
+    l->fd = -1;
+    l->peer = fd;
+    l->attached = true;
+    l->head = l->nurb = 0;
+    l->inlen = 0;
+    l->seen_setup = false;
+    qemu_set_fd_handler(l->peer, usbip_read, NULL, l);
+    qemu_log_mask(LOG_TRACE, "msm-usbip: the host connected\n");
+}
+
 /* claim a port and start speaking USB/IP on it */
 static int usbip_link_open(UsbipLink *l, Error **errp)
 {
     int sv[2];
     char buf[64];
+
+    if (l->path) {
+        /*
+         * USB/IP on a unix socket (usb-ip-socket): the far end is the bridge,
+         * which owns the host controller.  We listen and let it connect,
+         * because it is started after us and there is nothing to attach to
+         * until the gadget is ready anyway.
+         */
+        struct sockaddr_un un;
+        int fd;
+
+        if (l->fd >= 0 || l->attached) {
+            return 0;            /* already listening, or the host is here */
+        }
+        if (strlen(l->path) >= sizeof(un.sun_path)) {
+            error_setg(errp, "usb-ip-socket: the path is too long");
+            return -1;
+        }
+        fd = qemu_socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            error_setg(errp, "usb-ip-socket: socket: %s", strerror(errno));
+            return -1;
+        }
+        un.sun_family = AF_UNIX;
+        strcpy(un.sun_path, l->path);
+        unlink(l->path);            /* a stale socket from a killed run */
+        if (bind(fd, (struct sockaddr *)&un, sizeof(un)) < 0 ||
+            listen(fd, 1) < 0) {
+            error_setg(errp, "usb-ip-socket: %s: %s", l->path,
+                       strerror(errno));
+            close(fd);
+            unlink(l->path);
+            return -1;
+        }
+        l->fd = fd;
+        qemu_set_fd_handler(fd, usbip_accept, NULL, l);
+        qemu_log_mask(LOG_TRACE,
+                      "msm-usbip: listening on %s for the host\n", l->path);
+        return 0;
+    }
 
     if (geteuid() != 0) {
         error_setg(errp, "usb=lle needs root: vhci_hcd's attach attribute is "
@@ -698,22 +785,38 @@ static int usbip_link_open(UsbipLink *l, Error **errp)
 /* give the port back */
 static void usbip_link_close(UsbipLink *l)
 {
-    if (!l->attached) {
-        return;
+    if (l->attached) {
+        qemu_set_fd_handler(l->peer, NULL, NULL, NULL);
+        /*
+         * Closing our end is what really frees the port: vhci's rx thread is
+         * parked in a blocking recv on it and only unwinds when the read
+         * returns, so the attribute below and the close are both needed and
+         * neither is enough on its own.
+         */
+        if (!l->path) {
+            usbip_sysfs(USBIP_DETACH, "0", 1, NULL);
+        }
+        close(l->peer);
+        close(l->fd);
+        l->peer = l->fd = -1;
+        l->attached = false;
     }
-    qemu_set_fd_handler(l->peer, NULL, NULL, NULL);
+    if (l->fd >= 0) {
+        /* still listening for the bridge (usb-ip-socket) */
+        qemu_set_fd_handler(l->fd, NULL, NULL, NULL);
+        close(l->fd);
+        l->fd = -1;
+    }
+    if (l->path) {
+        unlink(l->path);
+    }
     timer_del(l->timer);
-    /*
-     * Closing our end is what really frees the port: vhci's rx thread is
-     * parked in a blocking recv on it and only unwinds when the read returns,
-     * so the attribute below and the close are both needed and neither is
-     * enough on its own.
-     */
-    usbip_sysfs(USBIP_DETACH, "0", 1, NULL);
-    close(l->peer);
-    close(l->fd);
-    l->peer = l->fd = -1;
-    l->attached = false;
+}
+
+void usbip_link_set_path(UsbipLink *l, const char *path)
+{
+    g_free(l->path);
+    l->path = path ? g_strdup(path) : NULL;
 }
 
 void usbip_link_init(UsbipLink *l, const UsbipOps *ops, void *opaque,
@@ -753,11 +856,14 @@ void usbip_link_init(UsbipLink *l, const UsbipOps *ops, void *opaque,
  */
 void usbip_link_reset(UsbipLink *l)
 {
-    if (l->attached && !l->seen_setup) {
+    if (l->attached && !l->seen_setup && !l->path) {
         /*
          * Attached but the host has not asked us anything yet: it has already
          * started enumerating, so leave it alone.  Tearing the port down here
          * is what parks it as inactive for good.
+         *
+         * A socket has no such thing: nobody is enumerating anything, so a
+         * closed peer is released however little was said on it.
          */
         return;
     }
@@ -775,4 +881,6 @@ void usbip_link_cleanup(UsbipLink *l)
     usbip_link_close(l);
     timer_free(l->timer);
     l->timer = NULL;
+    g_free(l->path);
+    l->path = NULL;
 }

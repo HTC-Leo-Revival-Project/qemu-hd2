@@ -157,6 +157,7 @@ struct MsmHsusbState {
     bool adb_connected;
 
     bool usb_lle;                   /* mode=lle: the host is this machine */
+    char *usb_ip_socket;            /* usb-ip-socket: speak USB/IP here */
     UsbipLink usbip;
 };
 
@@ -995,7 +996,14 @@ static void msm_hsusb_realize(DeviceState *dev, Error **errp)
          * happen now, while we are still the process that owns the socket:
          * vhci_hcd resolves the fd against the writing task's fd table, and
          * the attribute is root-only.
+         *
+         * usb-ip-socket hands the same USB/IP stream to a bridge instead,
+         * which is how the app gets at it: it owns a host controller we
+         * cannot reach (a FunctionFS gadget on this phone's own USB port).
          */
+        if (s->usb_ip_socket) {
+            usbip_link_set_path(&s->usbip, s->usb_ip_socket);
+        }
         usbip_link_init(&s->usbip, &hsusb_lle_ops, s, USBIP_PORT,
                         USBIP_SPEED_HIGH, errp);
         if (*errp) {
@@ -1020,6 +1028,7 @@ static void msm_hsusb_init(Object *obj)
 
 static const Property hsusb_props[] = {
     DEFINE_PROP_CHR("adb", MsmHsusbState, adb),
+    DEFINE_PROP_STRING("usb-ip-socket", MsmHsusbState, usb_ip_socket),
 };
 
 static char *hsusb_get_mode(Object *obj, Error **errp)
