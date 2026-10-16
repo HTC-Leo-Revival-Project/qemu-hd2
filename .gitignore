@@ -26,3 +26,5 @@ android/app/build
 android/build
 android/.gradle
 android/local.properties
+*libhtcleo*.so
+android/app/src/main/jniLibs/arm64-v8a/libhtcleo*
