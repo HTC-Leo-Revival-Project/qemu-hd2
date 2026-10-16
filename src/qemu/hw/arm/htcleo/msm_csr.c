@@ -25,6 +25,7 @@
 #include "qemu/timer.h"
 #include "qemu/module.h"
 #include "htcleo.h"
+#include "msm_modem.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmCsrState, MSM_CSR)
 
@@ -49,6 +50,7 @@ struct MsmCsrState {
     uint32_t dgt_div;
     uint32_t regs[0x400];   /* everything we do not model, readback only */
     qemu_irq a2m[CSR_NUM_A2M];
+    DeviceState *modem;     /* msm-modem: it may answer proc_comm itself */
 };
 
 static uint64_t timer_freq(MsmTimer *t)
@@ -220,7 +222,14 @@ static void csr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     }
     if (off >= 0x400 && off < 0x400 + 4 * CSR_NUM_A2M) {
         int n = (off - 0x400) >> 2;
+
         if (val) {
+            /* proc_comm (n=6): the modem may answer it without the modem
+             * core's help (see msm_modem_pcom_answer) */
+            if (n == 6 && s->modem &&
+                msm_modem_pcom_answer(MSM_MODEM(s->modem))) {
+                return;
+            }
             qemu_irq_pulse(s->a2m[n]);
         }
         return;
@@ -254,6 +263,16 @@ static void csr_reset(DeviceState *dev)
      * SCPLL (sel field = 1); acpuclock-scorpion.c BUG()s otherwise.
      */
     s->regs[0x104 >> 2] = 1 << 1;
+}
+
+/*
+ * Give the block the modem, so it can have the modem answer a proc_comm
+ * command itself (msm_modem_pcom_answer).  Set after the modem is made,
+ * which is later than this device's realize, so it is not a link property.
+ */
+void msm_csr_set_modem(DeviceState *csr, DeviceState *modem)
+{
+    MSM_CSR(csr)->modem = modem;
 }
 
 static void csr_init(Object *obj)

@@ -895,6 +895,7 @@ static void htcleo_init(MachineState *machine)
 
     /* Modem (AMSS shared-memory protocols) */
     s->modem = qdev_new(TYPE_MSM_MODEM);
+    msm_csr_set_modem(DEVICE(s->csr), DEVICE(s->modem));
     {
         g_autofree char *img = object_property_get_str(OBJECT(s->modem),
                                                        "smem-image", NULL);

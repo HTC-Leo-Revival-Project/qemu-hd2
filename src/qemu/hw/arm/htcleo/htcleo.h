@@ -158,6 +158,7 @@
 #define TYPE_MSM_VIC        "msm-vic"
 #define TYPE_MSM_SIRC       "msm-sirc"
 #define TYPE_MSM_CSR        "msm-csr"
+void msm_csr_set_modem(DeviceState *csr, DeviceState *modem);
 #define TYPE_MSM_GPIO       "msm-gpio"
 #define TYPE_MSM_UART       "msm-uart"
 #define TYPE_MSM_NAND       "msm-nand"

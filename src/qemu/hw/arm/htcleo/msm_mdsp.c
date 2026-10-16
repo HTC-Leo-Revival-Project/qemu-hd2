@@ -268,6 +268,13 @@ static void gsm_rx_data(MsmMdspState *s, uint32_t dat, uint16_t seq,
  * a slot's metrics (byte 4: the first's word address, the others' 0x28
  * words apart): 14 halfwords set here (traffic channels have 18; AMSS
  * keeps values of its own in the rest, which L1 tracking relies on)
+ *
+ * Word 2 (byte 4) is the slot's number, the same index the decoded block's
+ * status carries in bits 15-13: AMSS checks it against the timeslot it asked
+ * for (gl1_hw_gprs.c, the halfword at 0xc85d32: "Rx metrics tn mismatch:
+ * got=%d, exp=%d").  Left at zero it rejected every burst of a multislot
+ * downlink, the transfer never completed and GMAC leaked its static message
+ * buffers until AMSS hit err_fatal.
  */
 static void gsm_metrics(MsmMdspState *s, uint16_t seq, const uint8_t *cmd,
                         unsigned slot)
@@ -279,6 +286,7 @@ static void gsm_metrics(MsmMdspState *s, uint16_t seq, const uint8_t *cmd,
     }
     memset(s->mem + met, 0, 28);
     stw_le_p(s->mem + met + 2, seq);
+    stw_le_p(s->mem + met + 4, slot);
     stw_le_p(s->mem + met + 6, 0x100);
     stw_le_p(s->mem + met + 8, 0x100);
     stw_le_p(s->mem + met, 1);

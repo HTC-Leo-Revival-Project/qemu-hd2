@@ -66,6 +66,8 @@
 #define PCOM_GET_HW_ENTROPY 18
 #define PCOM_CLKCTL_RPC_RATE 27
 #define PCOM_CLKCTL_RPC_ENABLED 29
+#define PCOM_CLK_REGIME_SEC_DISABLE 0x33
+#define PCOM_CLK_REGIME_SEC_ENABLE  0x32
 #define PCOM_GPIO_IN        39
 #define PCOM_RESET_CHIP_IMM 42
 #define PCOM_GET_MODEM_VERSION 45
@@ -396,6 +398,34 @@ static void modem_take_over(MsmModemState *s, uint32_t target)
     physical_memory_write(AMSS_HOOK_STATUS_PA, &done, sizeof(done));
     timer_mod(s->park_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               SCALE_MS);
+}
+
+/*
+ * Diagnostic for the LLE boot hang: answer the secondary clock regime
+ * commands here instead of letting AMSS's clock regime resource manager
+ * (clkrgm_rm.c) do it.  The apps core toggles ADM_CLK once per datamover
+ * command, so the YAFFS2 scan is thousands of these round trips; on the phone
+ * AMSS keeps up, here it livelocks in clkrgm_rm.c and never writes the answer,
+ * leaving proc_comm_wait_for spinning with no timeout.
+ *
+ * Called from the CSR doorbell for proc_comm (A2M 6), after the apps core has
+ * stored cmd/data1/data2.  Returns true if it answered, so the caller can skip
+ * ringing the modem for these commands.
+ */
+bool msm_modem_pcom_answer(MsmModemState *s)
+{
+    uint32_t cmd;
+
+    if (!s->smem || !s->clk_regime_fake) {
+        return false;
+    }
+    cmd = smem_rd(s, 0x00);
+    if (cmd != PCOM_CLK_REGIME_SEC_ENABLE && cmd != PCOM_CLK_REGIME_SEC_DISABLE) {
+        return false;
+    }
+    smem_wr(s, 0x04, PCOM_CMD_SUCCESS);
+    smem_wr(s, 0x00, PCOM_CMD_DONE);
+    return true;
 }
 
 static void proc_comm_handle(MsmModemState *s)
@@ -1092,6 +1122,7 @@ static void modem_init(Object *obj)
 
 static const Property modem_props[] = {
     DEFINE_PROP_STRING("smem-image", MsmModemState, smem_image),
+    DEFINE_PROP_BOOL("clk-regime-fake", MsmModemState, clk_regime_fake, false),
     DEFINE_PROP_UINT32("boot-reason", MsmModemState, boot_reason, 1),
     DEFINE_PROP_BOOL("trace", MsmModemState, trace, false),
     DEFINE_AUDIO_PROPERTIES(MsmModemState, audio_be),

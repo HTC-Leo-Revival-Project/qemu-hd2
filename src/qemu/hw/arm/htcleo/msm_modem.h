@@ -38,6 +38,7 @@ struct MsmModemState {
     DeviceState parent_obj;
     uint8_t *smem;
     char *smem_image;
+    bool clk_regime_fake;   /* answer clock regime proc_comm here (LLE test) */
     uint32_t boot_reason;
     bool trace;
     qemu_irq m2a[M2A_NUM];
@@ -91,6 +92,7 @@ uint32_t smem_item(MsmModemState *s, unsigned id, uint32_t *size);
 
 void msm_modem_set_smem(MsmModemState *s, uint8_t *smem);
 void msm_modem_boot(MsmModemState *s);
+bool msm_modem_pcom_answer(MsmModemState *s);
 /* baseband=lle: the real AMSS owns SMEM; bring up only the QDSP6 side */
 void msm_modem_qdsp6_boot(MsmModemState *s);
 /* USB/charger power plugged in or out: HTC's VBUS word and a DEX notify */
