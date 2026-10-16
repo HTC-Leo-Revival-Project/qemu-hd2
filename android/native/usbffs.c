@@ -123,6 +123,18 @@
 /* one read asks for at most this much; a bulk IN ends at the first short packet */
 #define XFER_MAX       65536
 
+/*
+ * How much of what the host sent we hold while the emulator catches up.
+ *
+ * A megabyte: the emulator moves the guest 4 KB at a time and a poll round is
+ * up to 100 ms of its own clock, so a host sending a flash image hands over far
+ * more than the emulator can take in the time the host is willing to wait.  With
+ * nowhere to put the difference it piles up inside the phone's UDC, and that
+ * endpoint stops accepting data -- which shows up as fastboot hung on
+ * "Sending" with no error anywhere.
+ */
+#define RING_BYTES     (1024 * 1024)
+
 static uint32_t get32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -160,7 +172,21 @@ struct ep {
     int num;                    /* the endpoint number, as the gadget numbered it */
     bool in;                    /* device -> host */
     char name[8];               /* "ep1", "ep2", in configuration order */
-    uint8_t *buf;               /* the transfer buffer, owned by its worker */
+    uint8_t *buf;               /* IN: the transfer buffer, owned by its worker */
+
+    /*
+     * OUT: a ring of what has come off the phone but not gone to the emulator
+     * yet.  It is there because the emulator is much slower than the phone's
+     * UDC -- it hands the guest's 4 KB descriptors over one poll round at a
+     * time -- and a bridge that stopped reading while a transfer was in flight
+     * let that difference pile up in the UDC's own buffers until the endpoint
+     * stopped accepting anything and the host's transfer hung for good.  The
+     * ring keeps the phone drained while the emulator catches up.
+     */
+    uint8_t *ring;
+    uint32_t ring_cap;
+    uint32_t ring_head;         /* bytes the worker has read in */
+    uint32_t ring_tail;         /* bytes handed to the emulator */
 
     int slot;                   /* its urb slot; slot 0 is ep0 */
     pthread_t thread;
@@ -170,8 +196,7 @@ struct ep {
     bool stop;
     bool done;                  /* its worker has returned */
     bool joined;                /* ...and so its fd and buffer are ours again */
-    bool have;                  /* OUT: the buffer holds what arrived */
-    uint32_t len;               /* OUT: how much; IN: how much to write */
+    uint32_t len;               /* IN: how much the worker still has to write */
     bool writing;               /* the worker owns buf, or is inside write() */
 };
 
@@ -1332,6 +1357,28 @@ static int wait_for_io_timed(int fd, short events, int ms, int *timed_out)
  * The buffer is the worker's until the loop has copied it out, which is what
  * `writing` says here.
  */
+/* what the OUT ring can still take, and what is waiting to go to the emulator */
+static uint32_t ring_room(const struct ep *e)
+{
+    return e->ring_cap - (e->ring_head - e->ring_tail);
+}
+
+static uint32_t ring_held(const struct ep *e)
+{
+    return e->ring_head - e->ring_tail;
+}
+
+/*
+ * How much of `want` can be taken from offset `at` in one go: the ring is not
+ * linear memory, and a read that runs past the end of the buffer is EFAULT.
+ */
+static uint32_t ring_slice(const struct ep *e, uint32_t at, uint32_t want)
+{
+    uint32_t left = e->ring_cap - (at % e->ring_cap);
+
+    return want > left ? left : want;
+}
+
 static void *out_worker(void *arg)
 {
     struct ep *e = arg;
@@ -1340,23 +1387,37 @@ static void *out_worker(void *arg)
     for (;;) {
         ssize_t n;
         int timed_out = 0;
+        uint32_t room;
 
+        /*
+         * The only thing this waits for now is the phone.  It used to also wait
+         * for the emulator to take the previous transfer, which is the whole
+         * difference: a megabyte of flash image arrives in a few milliseconds
+         * and the emulator takes it at its own pace, so the phone's UDC was
+         * being asked to hold the difference, and holding it is what breaks.
+         */
         pthread_mutex_lock(&e->lock);
-        while (!e->stop && e->writing) {
+        while (!e->stop && ring_room(e) == 0) {
             pthread_cond_wait(&e->cv, &e->lock);
         }
         if (e->stop) {
             pthread_mutex_unlock(&e->lock);
             break;
         }
-        e->writing = true;
+        room = ring_room(e);
+        /*
+         * One read at a transfer's worth, whatever the ring has room for.  This
+         * ffs blocks inside read(2) until it has data, so a count of a whole
+         * megabyte is a request to sit there for a megabyte -- and asking for
+         * more than the endpoint's packets add up to is what it answers EFAULT.
+         */
+        if (room > XFER_MAX) {
+            room = XFER_MAX;
+        }
+        room = ring_slice(e, e->ring_head, room);
         pthread_mutex_unlock(&e->lock);
 
         if (wait_for_io_timed(e->fd, POLLIN, 5000, &timed_out) != 0) {
-            pthread_mutex_lock(&e->lock);
-            e->writing = false;
-            pthread_cond_signal(&e->cv);
-            pthread_mutex_unlock(&e->lock);
             break;
         }
         if (timed_out) {
@@ -1374,7 +1435,7 @@ static void *out_worker(void *arg)
             continue;
         }
         quiet_rounds = 0;
-        n = read(e->fd, e->buf, XFER_MAX);
+        n = read(e->fd, e->ring + (e->ring_head % e->ring_cap), room);
         if (verbose && n > 0) {
             note("ffs: read %zd bytes on %s", n, e->name);
         }
@@ -1391,19 +1452,14 @@ static void *out_worker(void *arg)
 
         pthread_mutex_lock(&e->lock);
         if (n > 0) {
-            e->have = true;
-            e->len = (uint32_t)n;
-            wake_the_loop();          /* stays `writing`: the loop has it now */
-        } else {
-            e->writing = false;
-            pthread_cond_signal(&e->cv);
-            if (n < 0 && errno != EAGAIN && errno != EINTR) {
-                note("ffs: %s read: %s", e->name, strerror(errno));
-                pthread_mutex_unlock(&e->lock);
-                break;
-            }
+            e->ring_head += (uint32_t)n;
+            wake_the_loop();
         }
         pthread_mutex_unlock(&e->lock);
+        if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            note("ffs: %s read: %s", e->name, strerror(errno));
+            break;
+        }
     }
     /* tell stop_workers() this one is out, so it need not wait the full time */
     pthread_mutex_lock(&e->lock);
@@ -1491,8 +1547,14 @@ static int start_workers(void)
         if (e->fd < 0) {
             continue;
         }
-        e->buf = malloc(XFER_MAX);
-        if (!e->buf) {
+        if (e->in) {
+            e->buf = malloc(XFER_MAX);
+        } else {
+            e->ring_cap = RING_BYTES;
+            e->ring = malloc(e->ring_cap);
+        }
+        if (!e->in ? !e->ring : !e->buf) {
+            fail("out of memory for %s", e->name);
             return -1;
         }
         pthread_mutex_init(&e->lock, NULL);
@@ -1742,30 +1804,28 @@ static void pump(void)
     for (int i = 0; i < b.nep; i++) {
         struct ep *e = &b.eps[i];
         struct urb *u = &pending[i + 1];
-        bool have;
+        uint32_t held;
+        uint32_t len = 0;
+        uint8_t out[XFER_MAX];
 
         if (e->fd < 0) {
             continue;
         }
         pthread_mutex_lock(&e->lock);
-        have = !e->in && e->have;
-        pthread_mutex_unlock(&e->lock);
-        if (have && !u->used) {
-            uint8_t out[XFER_MAX];
-            uint32_t len;
-
+        held = e->in ? 0 : ring_held(e);
+        if (held && !u->used && !u->ready) {
             /*
-             * Copy under the lock and only then hand the buffer back: the
-             * worker may read the next transfer into it as soon as we let go,
-             * and submit_urb() wants the bytes for as long as it takes.
+             * One transfer at a time per endpoint, but whatever else has come
+             * off the phone stays in the ring meanwhile, so the UDC keeps being
+             * drained at its own pace instead of ours.
              */
-            pthread_mutex_lock(&e->lock);
-            len = e->len > XFER_MAX ? XFER_MAX : e->len;
-            memcpy(out, e->buf, len);
-            e->have = false;
-            e->writing = false;               /* the worker may read again */
-            pthread_cond_signal(&e->cv);
-            pthread_mutex_unlock(&e->lock);
+            len = ring_slice(e, e->ring_tail, held > XFER_MAX ? XFER_MAX : held);
+            memcpy(out, e->ring + (e->ring_tail % e->ring_cap), len);
+            e->ring_tail += len;           /* submit_urb() writes it out itself */
+            pthread_cond_signal(&e->cv);  /* room in the ring again */
+        }
+        pthread_mutex_unlock(&e->lock);
+        if (len) {
             submit_urb(u, e->num, false, NULL, 0, out, len, NULL);
             note("emu: <- submit seq %u ep %d out (%u)", u->seq, e->num, len);
             continue;
@@ -1839,6 +1899,8 @@ static void teardown(void)
         }
         free(b.eps[i].buf);
         b.eps[i].buf = NULL;
+        free(b.eps[i].ring);
+        b.eps[i].ring = NULL;
     }
     if (b.mount_dir[0]) {
         umount(b.mount_dir);
