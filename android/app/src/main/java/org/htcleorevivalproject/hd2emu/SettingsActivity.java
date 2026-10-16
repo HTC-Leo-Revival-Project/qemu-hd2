@@ -273,6 +273,16 @@ public class SettingsActivity extends HoloActivity {
                 });
 
         page.category(getString(R.string.set_cat_debugging));
+        if (lle) {
+            page.switchRow(getString(R.string.set_clk_regime), getString(R.string.set_clk_regime_sum),
+                    config.clkRegimeFake, new Holo.OnToggle() {
+                        @Override
+                        public void onToggle(boolean on) {
+                            config.clkRegimeFake = on;
+                            save();
+                        }
+                    });
+        }
         page.switchRow(getString(R.string.set_show_fps), getString(R.string.set_show_fps_sum), config.showFps,
                 new Holo.OnToggle() {
                     @Override

@@ -109,7 +109,7 @@
     <string name="set_gpu_threads">GPU threads</string>
     <string name="set_one_thread">1 thread</string>
     <string name="set_threads">%1$d threads</string>
-    <string name="set_gles_note">The host GPU is asked for an OpenGL ES 3 context and checked for what the renderer needs; the answer is in the emulator log. Software until the ES renderer lands. GPU threads: 0 leaves it to QEMU.</string>
+    <string name="set_gles_note">The host GPU is asked for an OpenGL ES 3 context and checked for what the renderer needs; the answer is in the emulator log. The Adreno 200\'s draws run on this phone\'s own GPU through it.</string>
     <string name="set_soft_note">GPU threads: 0 leaves the choice to QEMU; more threads make the software renderer faster on a phone with big cores.</string>
     <string name="set_audio">Audio output</string>
     <string name="set_audio_phone">This phone</string>
@@ -139,6 +139,8 @@
     <string name="set_show_fps">Show the frame rate</string>
     <string name="set_show_fps_sum">Frames per second, over the screen</string>
     <string name="set_extra_args">Extra QEMU arguments</string>
+    <string name="set_clk_regime">Answer the clock-regime commands</string>
+    <string name="set_clk_regime_sum">QEMU replies to the ADM_CLK proc_comm itself instead of the real AMSS, which livelocks on them and wedges the boot in the YAFFS2 mount. Turn off to see that stall; can go away once the kernel stops toggling the clock per datamover command.</string>
     <string name="set_usb_lle_note">USB LLE is not here: it hands the emulated phone to the host\'s own USB stack through vhci_hcd, which needs root that an app can never have.</string>
 
     <!-- sensors -->

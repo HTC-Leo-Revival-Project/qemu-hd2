@@ -9,8 +9,12 @@ import subprocess
 import sys
 import tempfile
 
-OBJDUMP = os.path.join(os.path.dirname(__file__),
-                       '../toolchains/arm-eabi-4.8/bin/arm-eabi-objdump')
+OBJDUMP = next((o for o in (
+    os.path.join(os.path.dirname(__file__),
+                 '../toolchains/arm-eabi-4.8/bin/arm-eabi-objdump'),
+    os.path.expanduser('~/toolchain47/bin/arm-eabi-objdump'),
+    '/home/j0sh1x/qsd8k/arm-2009q3/bin/arm-none-eabi-objdump',
+    'arm-none-eabi-objdump', 'objdump') if os.path.exists(o)), 'objdump')
 
 
 def segments(e):

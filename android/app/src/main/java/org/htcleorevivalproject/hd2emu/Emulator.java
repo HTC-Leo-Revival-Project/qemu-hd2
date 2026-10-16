@@ -182,6 +182,19 @@ public class Emulator {
         args.add("msm-modem.audiodev=snd0");
         args.add("-global");
         args.add("msm-adreno.backend=" + ("gles".equals(cfg.gpu) ? "gles" : "soft"));
+        if (Config.LLE.equals(cfg.baseband) && cfg.clkRegimeFake) {
+            /*
+             * Workaround: the apps core toggles ADM_CLK once per datamover
+             * command, so the YAFFS2 mount is thousands of clock-regime
+             * proc_comm round trips.  AMSS's clkrgm_rm.c livelocks on them
+             * and never answers, and proc_comm_wait_for() has no timeout, so
+             * the boot wedges in the mount.  Answering these two commands
+             * here instead keeps the stock kernel booting.  Turn it off to
+             * watch the stall, or once the kernel stops toggling the clock.
+             */
+            args.add("-global");
+            args.add("msm-modem.clk-regime-fake=on");
+        }
         if (cfg.gpuThreads > 0) {
             args.add("-global");
             args.add("msm-adreno.threads=" + cfg.gpuThreads);

@@ -28,6 +28,7 @@ public class Config {
     public boolean mobileData = true;
     public int adbPort = 5555;
     public boolean amssLog = false;
+    public boolean clkRegimeFake = true; // answer the ADM_CLK proc_comm in QEMU, not AMSS (LLE)
     public int dspShift = -1;
     public int gpuThreads = 0;            // 0 = QEMU's own choice
     public float volume = 1.0f;
@@ -86,6 +87,7 @@ public class Config {
         mobileData = prefs.getBoolean("mobileData", mobileData);
         adbPort = prefs.getInt("adbPort", adbPort);
         amssLog = prefs.getBoolean("amssLog", amssLog);
+        clkRegimeFake = prefs.getBoolean("clkRegimeFake", clkRegimeFake);
         dspShift = prefs.getInt("dspShift", dspShift);
         gpuThreads = prefs.getInt("gpuThreads", gpuThreads);
         volume = prefs.getFloat("volume", volume);
@@ -107,6 +109,7 @@ public class Config {
                 .putBoolean("mobileData", mobileData)
                 .putInt("adbPort", adbPort)
                 .putBoolean("amssLog", amssLog)
+                .putBoolean("clkRegimeFake", clkRegimeFake)
                 .putInt("dspShift", dspShift)
                 .putInt("gpuThreads", gpuThreads)
                 .putFloat("volume", volume)
