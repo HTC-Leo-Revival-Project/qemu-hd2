@@ -16,6 +16,11 @@
 *.log
 *.ppm
 qmp.sock
+# QEMU's configure test dir / a firmware ELF written into the repo root by
+# running tools/hd2_radio.py from the wrong directory (it wants images/)
+/config-temp/
+/amss.elf
+/dsp1.elf
 # root-only, so it cannot swallow a source file like ImagesActivity.java
 # (it did on a case-insensitive filesystem)
 /images*
@@ -26,6 +31,11 @@ android/app/build
 android/build
 android/.gradle
 android/local.properties
+# the web UI's install and build output
+web/node_modules
+web/.next
+web/next-env.d.ts
+web/*.tsbuildinfo
 *libhtcleo*.so
 android/app/src/main/jniLibs/arm64-v8a/libhtcleo*
 tools/ph

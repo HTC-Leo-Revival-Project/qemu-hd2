@@ -9,10 +9,8 @@ npm run dev          # http://127.0.0.1:3000  (HOST=0.0.0.0 PORT=… to change)
 npm run build && npm start   # production
 ```
 
-QEMU must be built with VNC (the server reads the screen and the sound through it):
-```bash
-cd src/qemu/build && meson configure . -Dvnc=enabled && ninja qemu-system-arm qemu-system-hexagon
-```
+QEMU is always built with VNC — the server reads the screen and the sound
+through it ([docs/building.md](../docs/building.md)).
 
 ## How it works
 

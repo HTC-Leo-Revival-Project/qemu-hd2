@@ -19,8 +19,8 @@ Three steps, all of them resumable:
 nohup android/scripts/fetch-toolchain.sh > /tmp/fetch.log 2>&1 &
 
 # 2. QEMU, cross-compiled with the NDK (~15 min, downloads ~15 MB of sources)
-android/scripts/build-native.sh                 # both ABIs
-android/scripts/build-native.sh arm64-v8a       # or just one
+android/scripts/build-native.sh                 # arm64-v8a (the only ABI)
+android/scripts/build-native.sh arm64-v8a       # the same, explicitly
 
 # 3. the APK
 cd android && ./gradlew assembleDebug
@@ -28,10 +28,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 `build-native.sh` builds zlib, pcre2, glib, pixman, libslirp and libfdt into
-`android/build/prefix/<abi>` (all static, so the app ships two binaries and no
-shared libraries), then QEMU itself with `--target-list=arm-softmmu,
+`android/build/prefix/<abi>` (all static, so the app ships only its own
+binaries and no shared libraries), then QEMU itself with `--target-list=arm-softmmu,
 hexagon-softmmu`, and copies the stripped `qemu-system-arm` and
-`qemu-system-hexagon` into `app/src/main/jniLibs/<abi>/`.  Everything is
+`qemu-system-hexagon` into `app/src/main/jniLibs/<abi>/` (plus the `usbffs`
+bridge).  Everything is
 stamped, so an interrupted run continues where it stopped; `--clean` starts
 over.
 
@@ -346,26 +347,22 @@ the Python tools and the desktop print.
 
 ## Layout
 
-    android/scripts/build-native.sh    deps + QEMU, for both ABIs
+    android/scripts/build-native.sh    deps + QEMU (arm64-v8a)
     android/scripts/fetch-toolchain.sh  JDK, Gradle, SDK, NDK
     android/scripts/make-icon.py        the launcher icon, no PIL needed
-    app/src/main/java/org/qemu/htcleo/
+    app/src/main/java/org/htcleorevivalproject/hd2emu/
         MainActivity      the screen, the key bar, the machine in the action bar
         Emulator          the QEMU processes, the state machine, QMP
         EmuService        the foreground service that keeps it alive
-        Qmp VncClient     the two protocols, in Java
+        Qmp VncClient Adb the three protocols, in Java
         PcmPlayer         AudioTrack
         ScreenView        the screen: frames drawn in onDraw, touches
-        Holo              the hand-drawn Holo kit: switch, radio, field, dialogs,
-                          rows and the scrolling preference Page; insets
-        HoloIcons         the action bar and key glyphs, as Paths (no PNGs)
-        HoloActivity      the sub-screens' base: up caret, black bars
-        ImagesActivity    the images folder, and the radio firmware out of an image
-        Root UsbBridge    the root shell, and the USB passthrough probe
-        RootActivity      Root & USB
-        Config Images     the settings, and the files in the images folder
+        Holo HoloIcons HoloActivity       the hand-drawn Holo kit and sub-screens
+        Images ImagesActivity             the images folder
+        Config SettingsActivity NandActivity SensorsActivity Link
+        RootActivity Root UsbBridge       Root & USB, root shell, the probe
         LogsActivity      the four logs, and QEMU's monitor
-        Nand NandBuilder Yaffs2 Radio   the NAND builder (Android, MAGLDR, WinMo)
+        Nand NandBuilder Yaffs2 Radio Paths   the NAND builder (Android, MAGLDR, WinMo)
 
 ## Notes
 

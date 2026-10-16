@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "NODE_ENV=production node server/index.ts",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "next typegen && tsc --noEmit"
   },
   "dependencies": {
     "lucide-react": "^1.56.0",

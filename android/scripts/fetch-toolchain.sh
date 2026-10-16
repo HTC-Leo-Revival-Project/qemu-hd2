@@ -71,5 +71,5 @@ log "done"
 du -sh "$SDK" "$HOME/toolchain" 2>/dev/null
 echo
 echo "Next:"
-echo "  android/scripts/build-native.sh      # QEMU for both ABIs"
+echo "  android/scripts/build-native.sh      # QEMU for arm64-v8a"
 echo "  cd android && ./gradlew assembleDebug"

@@ -69,7 +69,7 @@ node_ok=$(printf '22.18\n%s\n' "$NV" | sort -V | head -1)
 for b in qemu-system-arm qemu-system-hexagon; do
   [ -x "src/qemu/build/$b" ] || continue
   strings "src/qemu/build/$b" | grep -q vnc_set_share_mode ||
-    die "$b has no VNC: run 'meson configure . -Dvnc=enabled && ninja' in src/qemu/build (README, Build)"
+    die "$b has no VNC: every build here has it, so this one is stale; rebuild with tools/build-linux.sh (docs/building.md)"
 done
 [ -d src/qemu/pc-bios/keymaps ] || die "src/qemu/pc-bios/keymaps is missing: VNC needs its keymaps from there (-L)"
 command -v ffmpeg >/dev/null || die "ffmpeg not found: the server pipes the screen through it (libx264, or h264_nvenc)"

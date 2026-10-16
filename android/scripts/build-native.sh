@@ -3,8 +3,8 @@
 # Cross-compiles QEMU (the htcleo machine) and the few libraries it needs
 # for Android, with the NDK, and drops the result into the app's jniLibs.
 #
-#   android/scripts/build-native.sh                 both ABIs
-#   android/scripts/build-native.sh arm64-v8a       just one
+#   android/scripts/build-native.sh                 arm64-v8a (the only ABI)
+#   android/scripts/build-native.sh arm64-v8a       the same, explicitly
 #   android/scripts/build-native.sh --clean         start over
 #   android/scripts/build-native.sh --stage-only    skip building, just install
 #
@@ -112,7 +112,6 @@ endian = 'little'
 
 [built-in options]
 c_args = ['-D_FORTIFY_SOURCE=2', '-fno-stack-protector', '-ffunction-sections', '-fdata-sections', '-Wno-unused-command-line-argument']
-c_link_args = ['-Wl,--gc-sections', '-Wl,--as-needed', '-static-libstdc++']
 # a static QEMU with bionic behind it is one file the app can just exec
 b_lto = false
 b_pie = true
@@ -223,6 +222,10 @@ qemu_configure() { # qemu_configure <abi> <prefix>
     esac
     mkdir -p "$bdir"
     pkgconfig_wrappers "$prefix"
+    # Note: downloads are left enabled.  A fresh checkout has no
+    # subprojects/keycodemapdb, dtc or berkeley-softfloat-3 (they are
+    # git-ignored), so QEMU fetches them as meson wraps here; a dev tree that
+    # already built the host emulator has them and nothing is downloaded.
     ( cd "$bdir" && \
       PATH="$BUILD/hostbin:$PATH" \
       CC="$LLVM/bin/$triple-clang" \
@@ -256,7 +259,7 @@ qemu_configure() { # qemu_configure <abi> <prefix>
         --disable-vhost-user-blk-server \
         --disable-vhost-user --disable-vhost-kernel --disable-vhost-net --disable-virtfs \
         --disable-install-blobs --disable-modules \
-        --disable-download --disable-plugins \
+        --disable-plugins \
         -Dwerror=false -Db_lto=false -Drust=disabled -Ddbus_display=disabled ) >"$bdir/configure.log" 2>&1 ||
         { echo "--- configure failed ---" >&2; tail -60 "$bdir/configure.log" >&2; exit 1; }
     ( cd "$bdir" && ninja -j "$JOBS" ) >"$bdir/build.log" 2>&1 ||

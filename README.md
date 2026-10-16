@@ -26,22 +26,32 @@
 
 A QEMU machine (`-M htcleo`) that emulates the HTC HD2 (Qualcomm QSD8250) hardware. It boots whatever is in its NAND, unmodified, the way the phone would.
 
+Everything written down lives under [docs/](docs/README.md): the [build guide](docs/building.md), the [tools reference](docs/tools.md), the per-OS guides and the subsystem write-ups.
+
 <a name="build"></a>
 <h2><img src="docs/holo/h-build.png" width="86" height="40" alt="Build"></h2>
 
+One script does it all (see [docs/building.md](docs/building.md) for the
+options); by hand it is:
+
 ```bash
-sudo apt install libslirp-dev libpixman-1-dev   # slirp = -nic user, pixman = VNC
+sudo apt install libslirp-dev libpixman-1-dev flex bison   # flex/bison: the Hexagon idef-parser
 mkdir -p src/qemu/build && cd src/qemu/build
-../configure --target-list=arm-softmmu,hexagon-softmmu --enable-sdl \
+../configure --target-list=arm-softmmu,hexagon-softmmu --enable-sdl --enable-vnc \
     --disable-docs --disable-werror --disable-gtk --disable-xen --disable-kvm \
     --disable-tools --disable-guest-agent
 ninja qemu-system-arm qemu-system-hexagon
 ```
 
-The machine is in `src/qemu/hw/arm/htcleo/`. Two more builds, both optional:
+`tools/build-linux.sh` is that, plus the `amsslog` plugin, and it configures
+only the first time. It needs `meson >= 1.5`, which Ubuntu's package is not:
+`pip install --user meson`.
+
+The machine is in `src/qemu/hw/arm/htcleo/`. VNC is always built — the web UI
+and the Android app both draw the screen and play sound through it. One
+optional extra:
 
 ```bash
-meson configure . -Dvnc=enabled && ninja     # VNC server: only the web UI needs it
 ninja contrib/plugins/libamsslog.so          # only for AMSSLOG=1
 ```
 
@@ -85,7 +95,7 @@ to pick BOOT FROM NAND in the cLK menu.
 |---|---|---|
 | **Headless**, no UI (HLE, the default) | `tools/start.sh` | – |
 | **An SDL window** | `tools/start.sh -display sdl` | – |
-| **The browser UI** | `cd web && npm install && npm run dev` | the `-Dvnc=enabled` build |
+| **The browser UI** | `cd web && npm install && npm run dev` | – |
 | **The real radio** (LLE) | `tools/start-lle.sh` | `images/amss.elf`, `images/nand-lle.img` ([below](#real-baseband-firmware)) |
 | **LLE + the real DSP** | `tools/start-q6.sh` | `images/dsp1.elf` ([below](#qdsp6-firmware)) |
 | **USB on the real host stack** (LLE) | `tools/start-usb-lle.sh` | root, `vhci_hcd` ([below](#usb-on-the-host-stack)) |
@@ -96,27 +106,15 @@ Stop it with `python3 tools/qmon.py images/qmp.sock quit`.
 
 **An SDL window.** Add `-display sdl` — GTK is not built. It opens on the host's `$DISPLAY`, so without one it fails; with sound: `AUDIODEV="-audiodev pa,id=snd0" tools/start.sh -display sdl`.
 
-**The browser UI** draws the screen inside a picture of a real HD2 and adds touch, keys, typing, sound and switches for HLE/LLE, the DSP firmware, the images, the GPU and the audio backend. It starts and stops QEMU itself over the VNC socket, hence the `-Dvnc=enabled` build; `web/README.md` has the details.
+**The browser UI** draws the screen inside a picture of a real HD2 and adds touch, keys, typing, sound and switches for HLE/LLE, the DSP firmware, the images, the GPU and the audio backend. It starts and stops QEMU itself over the VNC socket (which every build has); `web/README.md` has the details.
 
 To put it on a server, `sudo tools/deploy-web.sh` copies what it needs into `/opt/htcleo-web`, builds it, adds `htcleo-web.service` and, with `--domain NAME`, an nginx site with a certificate. It is not a static site: the server runs QEMU, so the machine needs the emulator's own files, and the UI has **no login** — it can start the emulator with any extra QEMU arguments — so it stays on `127.0.0.1` behind TLS by default.
 
 Whatever follows the script name goes to QEMU, so `tools/start.sh -vnc :1`, `-S` (do not start the CPUs) and `-snapshot` work as usual. `NAND=` picks another image, `CLK_KEYS=` presses no key at all (leave the bootloader alone) and `CLK_KEYS="pgdn pgdn f2"` picks RECOVERY instead.
 
-<a name="releases"></a>
-<h3><img src="docs/holo/n-tools.png" width="62" height="30" alt="Releases"></h3>
-
-`tools/release.sh` builds the three things this project ships — the QEMU machine (with VNC and the plugins), the web UI and the NAND images — packs them into `build/release/` and, with `--upload`, puts them in a GitHub release through the `gh` CLI:
-
-```bash
-tools/release.sh --clk lk.bin --rom NexusHD2-ICS-CM9-HWA_V3.0b.zip \
-    --recovery HD2_TWRP_2.4.0.0-nanddump.img --upload
-```
-
-- **sources**: `--clk`, `--rom`, `--radio`, `--recovery` take a path or a URL, and default to public downloads: the ROM (`NexusHD2-ICS-CM9-HWA_V3.0b.zip`), the bootloader (`cLK.nbh`) and the radio all live in [HTC-HD7-Internals](https://github.com/HTC-Leo-Revival-Project/HTC-HD7-Internals/tree/main/roms), so `tools/release.sh` with no arguments builds everything; `--recovery` has no default. A `mega.nz` link works too but needs megatools (`megaget`), a plain `https` one just curl. Which of cLK's two partition schemes the bootloader uses is decided by looking inside it: an NBH wrapping a 1.4 LK (a `PTABLE-MB` table compiled in) is unpacked and handed to `hd2_mknand.py` as `--lk`, because `--nbh` would lay it out the 1.5 way, with a `VPTABLE` the 1.4 bootloader never reads. The radio's download is a zip inside a zip; the script digs the NBH out. A ROM that is not a NAND ROM is rejected before the long build, not after.
-- **assets**: `nand.img.zst` and `nand-lle.img.zst` (528 MiB each, mostly erased flash, so zstd gets them to ~135 MiB), `htcleo-web-<tag>.tar.zst` (the tree the web server wants, without the images) and `SHA256SUMS`.
-- **CI**: `.github/workflows/release.yml` runs exactly this on a `v*` tag or by hand. Needs no secrets and no configuration — the release is written with the automatic `GITHUB_TOKEN`, and the sources come from the defaults above. `--no-download` reuses what is already in `build/sources`.
-
-To install a bundle: extract `htcleo-web-*.tar.zst` to `/opt/htcleo-web`, unpack the NAND image into its `images/`, and `sudo tools/deploy-web.sh --dest /opt/htcleo-web --skip-copy`.
+The emulator, the Android app and the web UI are built with the scripts in
+[docs/building.md](docs/building.md); the NAND and SD images with the tools in
+[docs/tools.md](docs/tools.md).
 
 | Key | HD2 button |
 |---|---|
@@ -249,13 +247,15 @@ On an RTX 3080, `gl` draws 8 full-screen blended layers in ~5 ms (`soft`: ~150 m
 <a name="tools"></a>
 <h2><img src="docs/holo/h-tools.png" width="90" height="40" alt="Tools"></h2>
 
+Every script and helper has its own entry in the [tools reference](docs/tools.md).
+
 | Tool | Purpose |
 |---|---|
 | `hd2_mknand.py`, `hd2_wmnand.py`, `hd2_mkmagldr.py`, `hd2_setmac.py`, `mksdcard.sh`, `fat_put.py` | NAND and SD images |
 | `start.sh`, `start-lle.sh`, `start-q6.sh`, `start-wm.sh`, `ios-boot.sh` | Launch |
 | `qmon.py`, `keys.py`, `touch.py`, `magnav.py` | Monitor commands, input, MAGLDR's menus |
 | `deploy-web.sh` | Install the web UI on a server (systemd, nginx, TLS) |
-| `release.sh` | Build everything and put it in a GitHub release |
+| `build-linux.sh` | Configure and build the host QEMU (the emulator) |
 | `capture.py`, `waitscreen.py`, `waitlog.sh` | Screendumps, logs |
 | `yaffs_check.py`, `logcat.sh` | Read a NAND image's files, guest logs from RAM |
 | `hd2_radio.py`, `amss_*.py` | Radio firmware |
