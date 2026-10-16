@@ -267,13 +267,15 @@
     <string name="root_check_again">Check again</string>
     <string name="root_check_again_sum">Look at the kernel\'s USB support once more</string>
     <string name="root_cat_features">Root features</string>
-    <string name="root_gadget">Expose the HD2 to a PC</string>
-    <string name="root_gadget_sum">Through this phone\'s USB port, so a PC\'s flash tools, adb and fastboot see a real HTC HD2</string>
-    <string name="root_gadget_needs">configfs, FunctionFS and a USB device controller</string>
+    <string name="root_gadget">USB passthrough to a PC</string>
+    <string name="root_gadget_sum">Puts the emulated HD2 on this phone\'s own USB port, so a PC plugged into it sees an HTC HD2 and its own fastboot and adb talk to the emulated one. Takes the phone\'s USB while the emulator runs.</string>
+    <string name="root_gadget_needs">root: the UDC, configfs and FunctionFS are all root-only</string>
+    <string name="root_gadget_lacks">This phone lacks something the bridge needs — see the checks above</string>
+    <string name="root_gadget_holding">The bridge is holding the phone\'s USB port now</string>
     <string name="root_host">Attach the HD2 to this phone</string>
     <string name="root_host_sum">On this phone\'s own USB stack through vhci_hcd, for adb and fastboot in a terminal</string>
     <string name="root_host_needs">vhci_hcd in the kernel</string>
-    <string name="root_planned_note">Both are planned and not switched on yet. The gadget bridge needs the emulator to hand its USB/IP stream (what usb-host=lle gives vhci_hcd on a PC) to the app, which then serves it through FunctionFS.</string>
+    <string name="root_planned_note">The passthrough above is switched on and starts with the emulator. Attaching the HD2 to this phone itself needs vhci_hcd, which few phone kernels build.</string>
     <string name="root_later">Coming later</string>
     <string name="root_later_ready">Coming later · this phone has what it needs</string>
     <string name="root_later_lacks">Coming later · this phone lacks %1$s</string>
@@ -288,14 +290,21 @@
     <string name="usb_udc_no">No UDC in /sys/class/udc</string>
     <string name="usb_raw_yes">/dev/raw-gadget: a simpler way to drive the UDC than FunctionFS</string>
     <string name="usb_raw_no">Not built (optional: FunctionFS does the same job)</string>
-    <string name="usb_vhci_yes">The HD2 could be attached to this phone\'s own USB stack</string>
-    <string name="usb_vhci_no">Not built: the HD2 cannot be attached to this phone itself</string>
+    <string name="usb_vhci_yes">In this kernel: the HD2 could also be attached to this phone\'s own USB stack</string>
+    <string name="usb_vhci_unused">Not built — and not needed: the bridge owns its own host controller</string>
+    <string name="usb_hal">USB service</string>
+    <string name="usb_hal_yes">%1$s (%2$s): the bridge stops it while it holds the port</string>
+    <string name="usb_hal_no">No init service for USB: the bridge cannot take the port away from the phone\'s own gadget</string>
+    <string name="usb_bridge_no">Not in this build</string>
     <string name="usb_unknown">unknown</string>
     <string name="usb_selinux_enforcing">%1$s: the bridge will need a policy rule for the emulator\'s socket</string>
 
     <!-- the emulator\'s own messages -->
     <string name="emu_already_running">The emulator is already running</string>
     <string name="emu_launching">Launching QEMU</string>
+    <string name="emu_usbffs_missing">usbffs is not in this build, so USB passthrough cannot run</string>
+    <string name="emu_usb_starting">Starting the USB bridge…</string>
+    <string name="emu_usb_on_port">The emulated HD2 is on this phone\'s USB port</string>
     <string name="emu_nand_missing">%1$s is not in the app\'s images folder</string>
     <string name="emu_amss_missing">amss.elf is missing (unpack it from the radio ROM)</string>
     <string name="emu_dsp_missing">dsp1.elf is missing (unpack it from the radio ROM)</string>

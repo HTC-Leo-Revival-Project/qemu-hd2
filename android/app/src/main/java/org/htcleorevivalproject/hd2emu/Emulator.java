@@ -57,6 +57,8 @@ public class Emulator {
     private volatile VncClient vnc, q6vnc;
     private PcmPlayer audio;
     private Thread sensors, bootKeys;
+    /** Whether the USB passthrough bridge is ours to stop; see {@link #killAll()}. */
+    private volatile boolean bridgeRunning;
     /** Whether anyone is looking at the screen; see {@link #setVideo}. */
     private volatile boolean videoOn = true;
 
@@ -162,6 +164,20 @@ public class Emulator {
             machine += ",baseband=lle,baseband-firmware=" + paths.image("amss.elf").getAbsolutePath()
                     + ",baseband-trace=off";
         }
+        /*
+         * USB passthrough: the host is not us but a bridge, which owns a host
+         * controller we cannot reach -- a FunctionFS gadget on this phone's own
+         * USB port (see UsbBridge).  QEMU listens on the socket and the bridge
+         * connects, so the USB/IP stream vhci_hcd would have carried goes there
+         * instead.  No vhci_hcd, and no root in QEMU.
+         */
+        boolean passthrough = cfg.usbPassthrough && Root.status() == Root.Status.GRANTED;
+        if (passthrough) {
+            if (!paths.hasUsbBridge()) {
+                throw new IOException(ctx.getString(R.string.emu_usbffs_missing));
+            }
+            machine += ",usb-host=lle,usb-ip-socket=" + paths.usbIpSocket().getAbsolutePath();
+        }
         args.add("-M");
         args.add(machine);
         args.add("-drive");
@@ -211,7 +227,7 @@ public class Emulator {
         if (cfg.mobileData) {
             args.addAll(java.util.Arrays.asList("-nic", "user,model=msm-modem,net=10.0.3.0/24"));
         }
-        if (cfg.adbPort > 0) {
+        if (cfg.adbPort > 0 && !passthrough) {
             args.add("-chardev");
             args.add("socket,id=adb,host=127.0.0.1,port=" + cfg.adbPort + ",server=on,wait=off");
             args.add("-global");
@@ -298,6 +314,18 @@ public class Emulator {
         watch();
         startSensors();
         if (!"menu".equals(cfg.boot)) startBootKeys(cfg);
+        if (passthrough) {
+            /*
+             * Now that QEMU is listening: the bridge waits for the socket, and
+             * then for the guest to answer, which is the better part of a boot.
+             * It stops the USB HAL and takes the UDC; if it cannot bind, it
+             * exits rather than limping along, so this is where that surfaces.
+             */
+            note(ctx.getString(R.string.emu_usb_starting));
+            UsbBridge.start(paths);
+            bridgeRunning = true;
+            note(ctx.getString(R.string.emu_usb_on_port));
+        }
     }
 
     /**
@@ -469,6 +497,12 @@ public class Emulator {
     private void killAll() {
         if (bootKeys != null) bootKeys.interrupt();
         if (sensors != null) sensors.interrupt();
+        /* the bridge first: it gives the UDC back and restarts the USB HAL, and
+         * the emulator should not be yanking the USB out from under it */
+        if (bridgeRunning) {
+            bridgeRunning = false;
+            UsbBridge.stop();
+        }
         Qmp[] ms = {qmp, q6qmp};
         for (Qmp m : ms) {
             if (m == null) continue;

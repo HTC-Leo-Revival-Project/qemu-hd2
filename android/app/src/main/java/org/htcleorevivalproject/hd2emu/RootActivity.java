@@ -14,9 +14,12 @@ import java.io.IOException;
  */
 public class RootActivity extends HoloActivity {
     private Holo.Page page;
+    private Config config;
     private UsbBridge.Probe probe;
     private String probeError;
     private boolean busy;
+    /** Whether the passthrough bridge is up on the phone right now. */
+    private boolean bridgeUp;
 
     private final Runnable build = new Runnable() {
         @Override
@@ -31,6 +34,7 @@ public class RootActivity extends HoloActivity {
         page = new Holo.Page(this);
         setContentView(page.scroll);
         Holo.apply(page.scroll);
+        config = new Config(this);
         page.rebuild(build);
         /* already granted in an earlier visit: look again without a prompt */
         if (Root.status() == Root.Status.GRANTED) check(false);
@@ -85,11 +89,55 @@ public class RootActivity extends HoloActivity {
         }
 
         page.category(getString(R.string.root_cat_features));
-        feature(getString(R.string.root_gadget), getString(R.string.root_gadget_sum),
-                probe == null ? null : probe.gadgetPossible(), getString(R.string.root_gadget_needs));
+        passthrough(s == Root.Status.GRANTED);
         feature(getString(R.string.root_host), getString(R.string.root_host_sum),
                 probe == null ? null : probe.hostPossible(), getString(R.string.root_host_needs));
         page.note(getString(R.string.root_planned_note));
+    }
+
+    /**
+     * The USB passthrough switch.  Off unless root is granted and the probe says
+     * this phone's kernel has everything the bridge needs -- vhci_hcd is not one
+     * of those things, which is the whole point: the bridge owns its own host
+     * controller.  While the emulator runs, the bridge is already up, so the row
+     * says so instead of offering to change it.
+     */
+    private void passthrough(boolean root) {
+        String what = getString(R.string.root_gadget_sum);
+        if (!root) {
+            row(what + "\n" + getString(R.string.root_gadget_needs), false);
+            return;
+        }
+        if (probeError != null) {
+            row(what + "\n" + getString(R.string.root_check_failed, probeError), false);
+            return;
+        }
+        if (probe == null) {
+            row(what + "\n" + getString(busy ? R.string.root_looking : R.string.root_not_checked), false);
+            return;
+        }
+        if (!probe.gadgetPossible()) {
+            row(what + "\n" + getString(R.string.root_gadget_lacks), false);
+            return;
+        }
+        if (bridgeUp) {
+            row(getString(R.string.root_gadget_holding), true);
+            return;
+        }
+        Holo.Row r = page.switchRow(getString(R.string.root_gadget), what, config.usbPassthrough,
+                new Holo.OnToggle() {
+                    @Override
+                    public void onToggle(boolean on) {
+                        config.usbPassthrough = on;
+                        config.save();
+                    }
+                });
+        r.addWidget(mark(config.usbPassthrough));
+    }
+
+    private void row(String text, boolean on) {
+        Holo.Row r = page.switchRow("", text, on, null);
+        r.setEnabled(false);
     }
 
     private void feature(String title, String what, Boolean possible, String needs) {
@@ -123,21 +171,25 @@ public class RootActivity extends HoloActivity {
                 if (ask || Root.status() != Root.Status.GRANTED) Root.request();
                 UsbBridge.Probe p = null;
                 String err = null;
+                boolean up = false;
                 if (Root.status() == Root.Status.GRANTED) {
                     try {
                         p = UsbBridge.probe(RootActivity.this);
+                        up = UsbBridge.running();
                     } catch (IOException e) {
                         err = e.getMessage();
                     }
                 }
                 final UsbBridge.Probe found = p;
                 final String error = err;
+                final boolean running = up;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
                         busy = false;
                         probe = found;
                         probeError = error;
+                        bridgeUp = running;
                         if (bar != null) bar.dismiss();
                         if (!isFinishing()) page.rebuild(build);
                     }

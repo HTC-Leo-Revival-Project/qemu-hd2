@@ -62,6 +62,16 @@ public class Paths {
         return new File(runDir, "q6link.sock");
     }
 
+    /** Where QEMU listens for the USB/IP stream the bridge connects to. */
+    public File usbIpSocket() {
+        return new File(runDir, "usbip.sock");
+    }
+
+    /** What the bridge writes, so the Logs screen can show it. */
+    public File usbBridgeLog() {
+        return new File(runDir, "usbffs.log");
+    }
+
     public File log(String name) {
         return new File(runDir, name + ".log");
     }
@@ -72,7 +82,9 @@ public class Paths {
 
     /** The name the emulator goes by inside the APK. */
     private static String packaged(String name) {
-        return "qemu-system-hexagon".equals(name) ? "libhtcleo-q6.so" : "libhtcleo-qemu.so";
+        if ("qemu-system-hexagon".equals(name)) return "libhtcleo-q6.so";
+        if ("usbffs".equals(name)) return "libhtcleo-usbffs.so";
+        return "libhtcleo-qemu.so";
     }
 
     /**
@@ -109,6 +121,24 @@ public class Paths {
     public boolean hasQemu() {
         try {
             return qemu("qemu-system-arm").canExecute();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * The FunctionFS bridge (android/native/usbffs.c), or throws if this build
+     * does not have it.  Same trick as the QEMU binaries: it rides in the jniLibs
+     * as libhtcleo-usbffs.so, which the installer leaves executable in
+     * nativeLibraryDir, and is unpacked from the APK when that is missing.
+     */
+    public File usbffs() throws IOException {
+        return qemu("usbffs");
+    }
+
+    public boolean hasUsbBridge() {
+        try {
+            return usbffs().canExecute();
         } catch (IOException e) {
             return false;
         }

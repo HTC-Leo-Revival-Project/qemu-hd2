@@ -296,7 +296,7 @@ stage() { # stage <abi>
         while IFS= read -r so; do cp -f "$so" "$out/"; done <<< "$installed"
     fi
     # Only lib/<abi>/lib*.so survives into the APK: the installer unpacks
-    # nothing else, so the two executables go in under those names and
+    # nothing else, so the executables go in under those names and
     # Paths.qemu() finds them again.  See Paths.java.
     for pair in "qemu-system-arm:libhtcleo-qemu.so" "qemu-system-hexagon:libhtcleo-q6.so"; do
         local bin="${pair%%:*}" lib="${pair##*:}"
@@ -304,7 +304,28 @@ stage() { # stage <abi>
         "$LLVM/bin/llvm-strip" --strip-all "$out/$lib" 2>/dev/null || true
         chmod 755 "$out/$lib"
     done
+    # the FunctionFS bridge (android/native/usbffs.c), the same trick: it is not
+    # a library, it just has to arrive executable, and Paths.usbffs() looks for
+    # exactly this name
+    build_bridge "$abi" "$out/libhtcleo-usbffs.so"
     note "staged $(du -sh "$out" | cut -f1) into app/src/main/jniLibs/$abi"
+}
+
+# usbffs, for usb-ip-socket: small, plain C, and nothing from the NDK but libc
+# and pthreads, so it does not need the QEMU build tree at all.
+build_bridge() { # build_bridge <abi> <output>
+    local abi="$1" out="$2" dir="$ANDROID_DIR/native"
+    local cc
+    case "$abi" in
+        arm64-v8a)   cc="aarch64-linux-android$API" ;;
+        armeabi-v7a) cc="armv7a-linux-androideabi$API" ;;
+    esac
+    "$LLVM/bin/$cc-clang" -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
+        -o "$out" "$dir/usbffs.c" || {
+            echo "--- usbffs failed ---" >&2; exit 1; }
+    "$LLVM/bin/llvm-strip" --strip-all "$out" 2>/dev/null || true
+    chmod 755 "$out"
+    note "built usbffs ($abi)"
 }
 
 downloads() {

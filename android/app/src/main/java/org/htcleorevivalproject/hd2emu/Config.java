@@ -29,6 +29,12 @@ public class Config {
     public int adbPort = 5555;
     public boolean amssLog = false;
     public boolean clkRegimeFake = true; // answer the ADM_CLK proc_comm in QEMU, not AMSS (LLE)
+    /**
+     * Put the emulated HD2 on this phone's own USB port, so a PC plugged into it
+     * sees an HD2 and its fastboot and adb talk to the emulated one.  Needs root,
+     * and takes the phone's USB away while the emulator runs; see UsbBridge.
+     */
+    public boolean usbPassthrough = false;
     public int dspShift = -1;
     public int gpuThreads = 0;            // 0 = QEMU's own choice
     public float volume = 1.0f;
@@ -88,6 +94,7 @@ public class Config {
         adbPort = prefs.getInt("adbPort", adbPort);
         amssLog = prefs.getBoolean("amssLog", amssLog);
         clkRegimeFake = prefs.getBoolean("clkRegimeFake", clkRegimeFake);
+        usbPassthrough = prefs.getBoolean("usbPassthrough", usbPassthrough);
         dspShift = prefs.getInt("dspShift", dspShift);
         gpuThreads = prefs.getInt("gpuThreads", gpuThreads);
         volume = prefs.getFloat("volume", volume);
@@ -110,6 +117,7 @@ public class Config {
                 .putInt("adbPort", adbPort)
                 .putBoolean("amssLog", amssLog)
                 .putBoolean("clkRegimeFake", clkRegimeFake)
+                .putBoolean("usbPassthrough", usbPassthrough)
                 .putInt("dspShift", dspShift)
                 .putInt("gpuThreads", gpuThreads)
                 .putFloat("volume", volume)
