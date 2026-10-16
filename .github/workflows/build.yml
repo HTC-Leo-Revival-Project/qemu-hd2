@@ -126,6 +126,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub's runner ships its own Android SDK and exports ANDROID_HOME,
+      # ANDROID_SDK_ROOT and the NDK variables pointing at it.  fetch-toolchain.sh
+      # honours ANDROID_SDK_ROOT, so without this it installs the SDK and NDK
+      # into the runner's SDK and ~/Android/Sdk - which the APK step and the
+      # cache below use - is never created.  Pin every step to the scripts'
+      # default path; the NDK path is taken from the version fetch-toolchain.sh
+      # installs so the two cannot drift.
+      - name: pin the SDK location
+        run: |
+          echo "ANDROID_HOME=$HOME/Android/Sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/Android/Sdk" >> "$GITHUB_ENV"
+          ndk=$(sed -n 's/^NDK_VERSION="\(.*\)"/\1/p' android/scripts/fetch-toolchain.sh)
+          echo "ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$HOME/Android/Sdk/ndk/$ndk" >> "$GITHUB_ENV"
+
       # The cross build runs on the host too: meson/ninja/pkg-config for glib,
       # pixman, libslirp and dtc; flex/bison for dtc; python3 (with packaging,
       # which glib's meson insists on) and a venv for QEMU's configure.
@@ -145,8 +160,9 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # The NDK and the SDK are the slow part; keep them across runs.  The
-      # install path is fetch-toolchain.sh's default (~/Android/Sdk), so a
-      # local `act` run does not drop a multi-GB SDK into the checkout.
+      # install path is pinned to fetch-toolchain.sh's default (~/Android/Sdk)
+      # above, so a local `act` run does not drop a multi-GB SDK into the
+      # checkout.
       - name: cache the toolchain
         uses: actions/cache@v4
         with:
