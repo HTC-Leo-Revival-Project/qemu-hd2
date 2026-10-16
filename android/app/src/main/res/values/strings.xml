@@ -305,6 +305,7 @@
     <string name="emu_usb_needs_root">USB passthrough is on but this app has no root: the USB controller, configfs and FunctionFS are all root-only. Grant it in Root &amp; USB first.</string>
     <string name="emu_usbffs_missing">usbffs is not in this build, so USB passthrough cannot run</string>
     <string name="emu_usb_starting">Starting the USB bridge…</string>
+    <string name="emu_usb_stay_in_clk">USB passthrough: leaving the bootloader where it is, so the PC talks fastboot to it</string>
     <string name="emu_usb_on_port">The emulated HD2 is on this phone\'s USB port</string>
     <string name="emu_nand_missing">%1$s is not in the app\'s images folder</string>
     <string name="emu_amss_missing">amss.elf is missing (unpack it from the radio ROM)</string>

@@ -20,6 +20,8 @@ public class RootActivity extends HoloActivity {
     private boolean busy;
     /** Whether the passthrough bridge is up on the phone right now. */
     private boolean bridgeUp;
+    /** Where the emulator's files are, for talking to the bridge. */
+    private Paths paths;
 
     private final Runnable build = new Runnable() {
         @Override
@@ -35,9 +37,16 @@ public class RootActivity extends HoloActivity {
         setContentView(page.scroll);
         Holo.apply(page.scroll);
         config = new Config(this);
+        paths = new Paths(this);
         page.rebuild(build);
-        /* already granted in an earlier visit: look again without a prompt */
-        if (Root.status() == Root.Status.GRANTED) check(false);
+        /*
+         * Ask on entry, so the screen is usable when it opens rather than after
+         * a tap: the manager has usually granted root already (this is the screen
+         * that asks for it), and then this is instant and shows no prompt.  It
+         * also means the passthrough switch below is live, and the probe behind
+         * it has run, without the user having to find the row above.
+         */
+        check(Root.status() != Root.Status.GRANTED);
     }
 
     private void build() {
@@ -96,48 +105,44 @@ public class RootActivity extends HoloActivity {
     }
 
     /**
-     * The USB passthrough switch.  Off unless root is granted and the probe says
-     * this phone's kernel has everything the bridge needs -- vhci_hcd is not one
-     * of those things, which is the whole point: the bridge owns its own host
-     * controller.  While the emulator runs, the bridge is already up, so the row
-     * says so instead of offering to change it.
+     * The USB passthrough switch.  Always there, so the setting is visible and
+     * can be turned off again; greyed out, with the reason on it, until root and
+     * the probe say this phone's kernel has everything the bridge needs --
+     * vhci_hcd is not one of those things, which is the whole point: the bridge
+     * owns its own host controller.  While the bridge is up it says so rather
+     * than offering to change a setting that is already in force.
      */
     private void passthrough(boolean root) {
         String what = getString(R.string.root_gadget_sum);
+        String state;
+        boolean can = false;
+
         if (!root) {
-            row(what + "\n" + getString(R.string.root_gadget_needs), false);
-            return;
+            state = getString(R.string.root_gadget_needs);
+        } else if (probeError != null) {
+            state = getString(R.string.root_check_failed, probeError);
+        } else if (probe == null) {
+            state = getString(busy ? R.string.root_looking : R.string.root_not_checked);
+        } else if (!probe.gadgetPossible()) {
+            state = getString(R.string.root_gadget_lacks);
+        } else if (bridgeUp) {
+            state = getString(R.string.root_gadget_holding);
+        } else {
+            state = "";
+            can = true;
         }
-        if (probeError != null) {
-            row(what + "\n" + getString(R.string.root_check_failed, probeError), false);
-            return;
-        }
-        if (probe == null) {
-            row(what + "\n" + getString(busy ? R.string.root_looking : R.string.root_not_checked), false);
-            return;
-        }
-        if (!probe.gadgetPossible()) {
-            row(what + "\n" + getString(R.string.root_gadget_lacks), false);
-            return;
-        }
-        if (bridgeUp) {
-            row(getString(R.string.root_gadget_holding), true);
-            return;
-        }
-        Holo.Row r = page.switchRow(getString(R.string.root_gadget), what, config.usbPassthrough,
-                new Holo.OnToggle() {
+        Holo.Row r = page.switchRow(getString(R.string.root_gadget),
+                state.isEmpty() ? what : what + "\n" + state, config.usbPassthrough,
+                can ? new Holo.OnToggle() {
                     @Override
                     public void onToggle(boolean on) {
                         config.usbPassthrough = on;
                         config.save();
                     }
-                });
-        r.addWidget(mark(config.usbPassthrough));
-    }
-
-    private void row(String text, boolean on) {
-        Holo.Row r = page.switchRow("", text, on, null);
-        r.setEnabled(false);
+                } : null);
+        if (!can) {
+            r.setEnabled(false);
+        }
     }
 
     private void feature(String title, String what, Boolean possible, String needs) {
@@ -175,7 +180,7 @@ public class RootActivity extends HoloActivity {
                 if (Root.status() == Root.Status.GRANTED) {
                     try {
                         p = UsbBridge.probe(RootActivity.this);
-                        up = UsbBridge.running();
+                        up = UsbBridge.running(paths);
                     } catch (IOException e) {
                         err = e.getMessage();
                     }

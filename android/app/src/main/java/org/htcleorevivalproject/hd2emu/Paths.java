@@ -72,6 +72,18 @@ public class Paths {
         return new File(runDir, "usbffs.log");
     }
 
+    /**
+     * Where the bridge writes its pid.
+     *
+     * <p>The only handle we have on it: it runs as libhtcleo-usbffs.so out of
+     * the APK, so {@code pidof usbffs} finds nothing and {@code pkill -x usbffs}
+     * kills nothing, and it is started through a root shell that is long gone by
+     * the time anything wants to stop it.
+     */
+    public File usbBridgePid() {
+        return new File(runDir, "usbffs.pid");
+    }
+
     public File log(String name) {
         return new File(runDir, name + ".log");
     }

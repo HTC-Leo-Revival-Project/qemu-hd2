@@ -35,6 +35,11 @@ public final class UsbBridge {
     /** The service the bridge stops while it holds the UDC, and starts again after. */
     public static final String USB_HAL = "vendor.usb-hal";
 
+    /** What the bridge prints once it holds the port; see {@link #start}. */
+    private static final String UP_LINE = "the emulated HD2 is on the USB port";
+    /** Long enough for a guest to boot on a phone, short enough to not hang the UI. */
+    private static final int UP_TIMEOUT_MS = 180000;
+
     /** One thing the probe looked at. */
     public static final class Check {
         public final String title;
@@ -156,24 +161,38 @@ public final class UsbBridge {
     /* ---- running it -------------------------------------------------------- */
 
     /**
-     * Starts the bridge against QEMU's USB/IP socket.  QEMU has to be listening
-     * first; the bridge waits for it anyway, since the guest needs a moment to
-     * boot before it answers anything.  Returns when the bridge is running, or
-     * throws with what it said -- it exits rather than limping along if it
-     * cannot bind the UDC.
+     * Starts the bridge against QEMU's USB/IP socket and waits until it is up.
+     *
+     * <p>"Up" is the bridge's own line saying it holds the port, not merely the
+     * process existing: it waits for QEMU's socket, then for the guest to answer
+     * its first descriptor requests, and that is however long the guest takes to
+     * boot -- thirty seconds or so, and much longer on a phone.  Waiting on the
+     * process instead reported a bridge that was working perfectly as a failure,
+     * and then tore the emulator down.
+     *
+     * <p>Throws with the tail of its log if it stops instead.
      */
     public static void start(Paths paths) throws IOException {
         final File bin = paths.usbffs();
         final File sock = paths.usbIpSocket();
         final File log = paths.usbBridgeLog();
 
-        stop();
+        stop(paths);
         log.delete();
+        paths.usbBridgePid().delete();
         /* setsid so it outlives this shell; its own output goes to the log, so
          * it never holds the root shell's stdout open */
         Root.run("setsid " + bin.getAbsolutePath() + " --usbip " + sock.getAbsolutePath()
+                + " --pidfile " + paths.usbBridgePid().getAbsolutePath()
                 + " --verbose > " + log.getAbsolutePath() + " 2>&1 &");
-        for (int i = 0; i < 60 && !running(); i++) {
+        for (int waited = 0; waited < UP_TIMEOUT_MS; waited += 500) {
+            String seen = tail(log, 40);
+            if (seen.contains(UP_LINE)) {
+                return;
+            }
+            if (!running(paths) && waited > 2000) {
+                throw new IOException(seen.isEmpty() ? "usbffs did not stay running" : seen);
+            }
             try {
                 Thread.sleep(500);
             } catch (InterruptedException e) {
@@ -181,58 +200,103 @@ public final class UsbBridge {
                 break;
             }
         }
-        if (!running()) {
-            throw new IOException(log(paths));
-        }
+        throw new IOException(log(paths));
     }
 
     /**
-     * Stops the bridge.  SIGTERM, so it gives the UDC back and restarts the USB
-     * HAL on the way out; anything still holding the port after that is a bug,
-     * and gets a SIGKILL.
+     * Stops the bridge, by the pid it wrote down.
+     *
+     * <p>SIGTERM, so it gives the UDC back and restarts the USB HAL on the way
+     * out; anything still holding the port after that is a bug, and gets a
+     * SIGKILL.  Going by the pid rather than by name is not a nicety: the
+     * bridge runs as {@code libhtcleo-usbffs.so} out of the APK, so
+     * {@code pkill -x usbffs} matched nothing at all -- and this stop, used by
+     * every start, silently did nothing.  Bridges piled up, each taking the UDC
+     * from the one before it, and the phone's USB HAL stayed stopped.
      */
-    public static void stop() {
+    public static void stop(Paths paths) {
+        final String pid = pid(paths);
         try {
-            Root.run("pkill -x usbffs || true", 10000);
-            for (int i = 0; i < 20 && running(); i++) {
+            if (pid == null) {
+                return;
+            }
+            Root.run("kill " + pid + " 2>/dev/null || true", 10000);
+            for (int i = 0; i < 20 && alive(pid); i++) {
                 Thread.sleep(250);
             }
-            if (running()) Root.run("pkill -9 -x usbffs || true", 10000);
+            if (alive(pid)) {
+                Root.run("kill -9 " + pid + " 2>/dev/null || true", 10000);
+            }
         } catch (IOException ignored) {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } finally {
+            paths.usbBridgePid().delete();
         }
     }
 
-    public static boolean running() {
+    /** Is the bridge we started still there? */
+    public static boolean running(Paths paths) {
+        final String pid = pid(paths);
+        if (pid == null) {
+            return false;
+        }
         try {
-            return Root.run("pidof usbffs 2>/dev/null || true", 5000).out.trim().length() > 0;
+            return alive(pid);
         } catch (IOException e) {
             return false;
         }
     }
 
+    private static boolean alive(String pid) throws IOException {
+        return Root.run("kill -0 " + pid + " 2>/dev/null && echo yes || true", 5000)
+                .out.trim().length() > 0;
+    }
+
+    /** The pid in the bridge's pidfile, or null if there is not one (yet). */
+    private static String pid(Paths paths) {
+        try {
+            String s = tail(paths.usbBridgePid(), 1).trim();
+            for (int i = 0; i < s.length(); i++) {
+                if (s.charAt(i) < '0' || s.charAt(i) > '9') {
+                    return null;
+                }
+            }
+            return s.isEmpty() ? null : s;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     /** The tail of the bridge's own log, for when it could not start. */
     public static String log(Paths paths) {
-        String tail = "";
+        String tail = tail(paths.usbBridgeLog(), 12);
+        return tail.isEmpty() ? "usbffs did not stay running" : tail;
+    }
+
+    /** The last {@code lines} lines of a file, or "" if it cannot be read yet. */
+    private static String tail(File f, int lines) {
+        List<String> kept = new ArrayList<String>();
         try {
-            List<String> lines = new ArrayList<String>();
-            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(paths.usbBridgeLog()));
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f));
             try {
                 String line;
                 while ((line = r.readLine()) != null) {
-                    lines.add(line);
-                    if (lines.size() > 12) lines.remove(0);
+                    kept.add(line);
+                    if (kept.size() > lines) {
+                        kept.remove(0);
+                    }
                 }
             } finally {
                 r.close();
             }
-            StringBuilder sb = new StringBuilder();
-            for (String line : lines) sb.append(line).append('\n');
-            tail = sb.toString().trim();
         } catch (IOException ignored) {
         }
-        return tail.isEmpty() ? "usbffs did not stay running" : tail;
+        StringBuilder sb = new StringBuilder();
+        for (String line : kept) {
+            sb.append(line).append('\n');
+        }
+        return sb.toString().trim();
     }
 
     /** Whether the phone's USB is the emulated HD2's right now. */

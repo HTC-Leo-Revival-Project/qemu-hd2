@@ -168,6 +168,8 @@ struct ep {
     pthread_cond_t cv;
     bool started;
     bool stop;
+    bool done;                  /* its worker has returned */
+    bool joined;                /* ...and so its fd and buffer are ours again */
     bool have;                  /* OUT: the buffer holds what arrived */
     uint32_t len;               /* OUT: how much; IN: how much to write */
     bool writing;               /* the worker owns buf, or is inside write() */
@@ -240,6 +242,14 @@ static void sleep_ms(int ms)
     nanosleep(&ts, NULL);
 }
 
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int write_all(int fd, const void *buf, size_t len, const char *what)
 {
     const uint8_t *p = buf;
@@ -266,6 +276,8 @@ static int write_all(int fd, const void *buf, size_t len, const char *what)
  * would make a temporary file and rename it over the target, which configfs
  * refuses, so write it by hand.
  */
+static bool quiet;                 /* a write we expect to fail: say nothing */
+
 static int put_attr(const char *path, const char *text)
 {
     int fd = open(path, O_WRONLY | O_CLOEXEC);
@@ -273,12 +285,16 @@ static int put_attr(const char *path, const char *text)
     size_t len = strlen(text);
 
     if (fd < 0) {
-        fail("%s: %s", path, strerror(errno));
+        if (!quiet) {
+            fail("%s: %s", path, strerror(errno));
+        }
         return -1;
     }
     n = write(fd, text, len);
     if (n != (ssize_t)len) {
-        fail("%s: %s", path, n < 0 ? strerror(errno) : "short write");
+        if (!quiet) {
+            fail("%s: %s", path, n < 0 ? strerror(errno) : "short write");
+        }
         close(fd);
         return -1;
     }
@@ -374,7 +390,7 @@ static int submit_urb(struct urb *u, int ep, bool in, const uint8_t setup[8],
     u->used = true;
     u->in = in;
     u->data = into;
-    u->wlength = wlength;
+    u->wlength = in ? wlength : out_len;       /* what we asked for, either way */
     /*
      * Zero the whole header first.  The SETUP field is only meaningful on
      * ep0, and leaving the leftovers of whatever was on the stack in there is
@@ -497,8 +513,21 @@ static void on_answer(uint32_t seq, const uint8_t *reply)
         u->used = false;
         u->ready = true;
         u->status = status;
+        /*
+         * An OUT's answer says how many of the bytes the emulated phone took.
+         * Fewer than we sent is the worst thing that can happen here and nothing
+         * else would say so: the host has already handed them over and will not
+         * hand them over again, so the guest is left waiting for data that went
+         * nowhere and the transfer hangs.
+         */
+        if (!u->in && actual != u->wlength) {
+            fail("emu: took %u of the %u bytes on ep %d (seq %u), "
+                 "the host sent those once",
+                 actual, u->wlength, i ? b.eps[i - 1].num : 0, seq);
+        }
         note("emu: -> seq %u ep %d %s %u bytes status %d", seq,
-             i ? b.eps[i - 1].num : 0, u->in ? "in" : "out", u->got, status);
+             i ? b.eps[i - 1].num : 0, u->in ? "in" : "out",
+             u->in ? u->got : actual, status);
         return;
     }
     for (int i = 0; i < (int)(sizeof(replayed) / sizeof(replayed[0])); i++) {
@@ -715,15 +744,24 @@ static unsigned char utf16_to_utf8(const uint8_t *in, uint8_t len,
 static int find_gadget(char *out, size_t max)
 {
     char path[160];
-    DIR *d;
+
+    snprintf(path, sizeof(path), "%s/%s/UDC", CONFIGFS_GADGETS, out);
+    return access(path, F_OK) == 0 ? 0 : -1;
+}
+
+/*
+ * Any gadget this kernel has, as a last resort.  We would rather have one of
+ * our own -- see main() -- but a kernel that will not give us a second gadget is
+ * better served by borrowing the phone's than by not working, and the USB HAL
+ * puts its own back on the way out.
+ */
+static int any_gadget(char *out, size_t max)
+{
+    char path[160];
+    DIR *d = opendir(CONFIGFS_GADGETS);
     struct dirent *e;
     int found = -1;
 
-    snprintf(path, sizeof(path), "%s/%s/UDC", CONFIGFS_GADGETS, out);
-    if (access(path, F_OK) == 0) {
-        return 0;
-    }
-    d = opendir(CONFIGFS_GADGETS);
     if (!d) {
         fail("%s: %s", CONFIGFS_GADGETS, strerror(errno));
         return -1;
@@ -1118,6 +1156,14 @@ static int take_udc(void)
     }
 
     /*
+     * Off the bus before anything else: max_speed can only be written while the
+     * gadget is unbound, and a gadget left bound by a run that was killed (or
+     * that failed later on) is exactly what is in the way.  The driver answers
+     * EINVAL rather than saying so, which reads like a phone that cannot do it.
+     */
+    set_udc(b.gadget, "");
+
+    /*
      * Now, with the HAL out of the way, pin the speed.  The emulated HD2 hangs
      * off an EHCI controller -- high speed, 512-byte bulk packets, no super
      * speed at all -- and it has to be said here because:
@@ -1241,6 +1287,42 @@ static int wait_for_io(int fd, short events)
 }
 
 /*
+ * The same, but it says how long it waited.
+ *
+ * Worth having on the OUT side: when a transfer stops in the middle, the one
+ * thing the log has to answer is whether the phone had the bytes for us and we
+ * did not take them, or the phone had nothing because the host stopped sending.
+ * Those are different faults with different fixes, and an infinite poll answers
+ * neither -- the log just stops, which looks the same as either.
+ */
+static int wait_for_io_timed(int fd, short events, int ms, int *timed_out)
+{
+    int64_t until = now_ms() + ms;
+
+    *timed_out = 0;
+    for (;;) {
+        struct pollfd p = { .fd = fd, .events = events };
+        int64_t left = until - now_ms();
+        int n;
+
+        if (left <= 0) {
+            *timed_out = 1;
+            return 0;
+        }
+        n = poll(&p, 1, left > 100 ? 100 : (int)left);
+        if (n > 0 && (p.revents & events)) {
+            return 0;
+        }
+        if (n < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (stop_now) {
+            return 1;
+        }
+    }
+}
+
+/*
  * OUT: the bytes arrive from the host at their own pace, so this reads as soon
  * as the endpoint has any and hands them to the loop, which passes them on to
  * the emulated gadget.  It must not wait for permission first: nothing has set
@@ -1253,9 +1335,11 @@ static int wait_for_io(int fd, short events)
 static void *out_worker(void *arg)
 {
     struct ep *e = arg;
+    int quiet_rounds = 0;
 
     for (;;) {
         ssize_t n;
+        int timed_out = 0;
 
         pthread_mutex_lock(&e->lock);
         while (!e->stop && e->writing) {
@@ -1268,13 +1352,28 @@ static void *out_worker(void *arg)
         e->writing = true;
         pthread_mutex_unlock(&e->lock);
 
-        if (wait_for_io(e->fd, POLLIN) != 0) {
+        if (wait_for_io_timed(e->fd, POLLIN, 5000, &timed_out) != 0) {
             pthread_mutex_lock(&e->lock);
             e->writing = false;
             pthread_cond_signal(&e->cv);
             pthread_mutex_unlock(&e->lock);
             break;
         }
+        if (timed_out) {
+            /*
+             * The phone had nothing for us for five seconds.  Say so, once and
+             * then every tenth time: the host has usually finished sending and
+             * is waiting for the reply the emulated phone owes it, and this is
+             * the line that says so instead of the log going quiet in the middle
+             * of a transfer.
+             */
+            if (quiet_rounds++ == 0 || quiet_rounds % 20 == 0) {
+                note("ffs: nothing from the host on %s for %d s", e->name,
+                     quiet_rounds < 20 ? 5 : 100);
+            }
+            continue;
+        }
+        quiet_rounds = 0;
         n = read(e->fd, e->buf, XFER_MAX);
         if (verbose && n > 0) {
             note("ffs: read %zd bytes on %s", n, e->name);
@@ -1306,6 +1405,11 @@ static void *out_worker(void *arg)
         }
         pthread_mutex_unlock(&e->lock);
     }
+    /* tell stop_workers() this one is out, so it need not wait the full time */
+    pthread_mutex_lock(&e->lock);
+    e->done = true;
+    pthread_cond_broadcast(&e->cv);
+    pthread_mutex_unlock(&e->lock);
     return NULL;
 }
 
@@ -1353,6 +1457,11 @@ static void *in_worker(void *arg)
         pthread_mutex_unlock(&e->lock);
         wake_the_loop();
     }
+    /* tell stop_workers() this one is out, so it need not wait the full time */
+    pthread_mutex_lock(&e->lock);
+    e->done = true;
+    pthread_cond_broadcast(&e->cv);
+    pthread_mutex_unlock(&e->lock);
     return NULL;
 }
 
@@ -1410,10 +1519,34 @@ static void stop_workers(void)
         pthread_cond_broadcast(&e->cv);
         pthread_mutex_unlock(&e->lock);
     }
+    /*
+     * Waiting for them has a deadline, because they cannot always be *asked* to
+     * stop: this ffs blocks inside read(2) whether the fd is O_NONBLOCK or not
+     * (it waits there for the UDC to queue more), so a worker caught by one
+     * stays until the endpoint is closed -- which is what the unbind in
+     * teardown(), before this, does.  Five seconds is generous for that, and a
+     * worker still stuck after it is a thread this process is about to exit
+     * anyway: a bridge that will not exit is one the phone's USB never gets
+     * back.  Bionic has no timed join, so it is the worker saying it is done.
+     */
     for (int i = 0; i < b.nep; i++) {
-        if (b.eps[i].started) {
-            pthread_join(b.eps[i].thread, NULL);
+        struct ep *e = &b.eps[i];
+        struct timespec until;
+
+        if (!e->started) {
+            continue;
         }
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += 5;
+        pthread_mutex_lock(&e->lock);
+        while (!e->done) {
+            if (pthread_cond_timedwait(&e->cv, &e->lock, &until) == ETIMEDOUT) {
+                fail("%s did not stop within 5 s; leaving it", e->name);
+                break;
+            }
+        }
+        e->joined = e->done;
+        pthread_mutex_unlock(&e->lock);
     }
 }
 
@@ -1668,18 +1801,38 @@ static void teardown(void)
 {
     char path[320];
 
-    stop_workers();
-
+    /*
+     * Off the bus first, and before the workers are waited for.
+     *
+     * Both halves matter.  Taking the UDC back is what we owe the phone anyway,
+     * and it is also what ends this ffs's endpoints: a worker sitting in
+     * read(2) when the port goes away is a worker that never comes back,
+     * because this driver waits for the UDC inside the read whether the fd is
+     * O_NONBLOCK or not.  Joining first and unbinding after is a bridge that
+     * takes the phone's USB down with it and never gives it back -- which is
+     * what stopping one used to do, silently, every time.
+     */
+    quiet = true;
+    set_udc(b.gadget, "");
+    quiet = false;
     if (b.bound) {
-        set_udc(b.gadget, "");
         b.bound = false;
         note("released the UDC");
     }
+    stop_workers();
     if (b.ep0 >= 0) {
         close(b.ep0);            /* this is what takes ffs out of FFS_ACTIVE */
         b.ep0 = -1;
     }
     for (int i = 0; i < b.nep; i++) {
+        /*
+         * Only where the worker is out of it: closing a file another thread is
+         * blocked in is its own kind of trouble, and this process is about to
+         * exit anyway, which closes them just as well.
+         */
+        if (b.eps[i].started && !b.eps[i].joined) {
+            continue;              /* the worker still owns all of this */
+        }
         if (b.eps[i].fd >= 0) {
             close(b.eps[i].fd);
             b.eps[i].fd = -1;
@@ -1800,7 +1953,68 @@ static void usage(void)
             "  --ffs-name NAME  the FunctionFS instance name (default: usb<pid>)\n"
             "  --gadget NAME    the configfs gadget to take (default: hd2)\n"
             "  --udc NAME       the UDC to bind (default: the only one)\n"
+            "  --pidfile PATH   where to write our pid, for whoever started us\n"
             "  --verbose        say what is going on\n");
+}
+
+/*
+ * Our pid, where the app can find it.
+ *
+ * The app ships this as libhtcleo-usbffs.so and runs it out of the APK's
+ * nativeLibraryDir, so its process name on the phone is *that*, not "usbffs":
+ * pidof usbffs and pkill -x usbffs never match it, and the app's own stop
+ * silently left every bridge it had ever started running -- still holding the
+ * UDC, with the phone's USB HAL stopped.  A pidfile is not a workaround for
+ * that, it is the only reliable handle on a process we do not spawn ourselves
+ * (the app starts us through a root shell, and the shell is gone by the time
+ * anything wants to stop us again).
+ */
+static char pidfile[320];
+
+static void write_pidfile(void)
+{
+    FILE *f = fopen(pidfile, "w");
+
+    if (!f) {
+        fail("pidfile %s: %s", pidfile, strerror(errno));
+        return;
+    }
+    fprintf(f, "%u\n", (unsigned)getpid());
+    fclose(f);
+    note("pid %u in %s", (unsigned)getpid(), pidfile);
+}
+
+/*
+ * Stop a bridge left over from a run that ended badly, so that two of us are
+ * never on the UDC at once: they take the port from each other, and the host's
+ * data ends up in whichever one won the last round.
+ */
+static void stop_the_last_one(void)
+{
+    long pid;
+    FILE *f = fopen(pidfile, "r");
+
+    if (!f) {
+        return;
+    }
+    if (fscanf(f, "%ld", &pid) != 1 || pid <= 0) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    if (pid == (long)getpid() || kill((pid_t)pid, 0) != 0) {
+        return;                     /* gone already, or it is us */
+    }
+    note("the last bridge (pid %ld) is still running; stopping it first", pid);
+    kill((pid_t)pid, SIGTERM);
+    for (int i = 0; i < 50 && kill((pid_t)pid, 0) == 0; i++) {
+        sleep_ms(100);
+    }
+    if (kill((pid_t)pid, 0) == 0) {
+        note("pid %ld did not stop; killing it", pid);
+        kill((pid_t)pid, SIGKILL);
+        sleep_ms(200);
+    }
 }
 
 int main(int argc, char **argv)
@@ -1823,6 +2037,8 @@ int main(int argc, char **argv)
             snprintf(b.gadget, sizeof(b.gadget), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--udc") && i + 1 < argc) {
             snprintf(b.udc, sizeof(b.udc), "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--pidfile") && i + 1 < argc) {
+            snprintf(pidfile, sizeof(pidfile), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
             verbose = 1;
         } else if (!strcmp(argv[i], "--selftest")) {
@@ -1847,16 +2063,30 @@ int main(int argc, char **argv)
         fail("this has to run as root: the UDC and configfs are");
         return 1;
     }
+    if (pidfile[0]) {
+        stop_the_last_one();
+        write_pidfile();
+    }
     if (find_gadget(b.gadget, sizeof(b.gadget)) < 0) {
-        /* create one: on most kernels this is always possible, and a second
-         * gadget is better than taking the phone's own to pieces */
+        /*
+         * A gadget of our own, so the phone's is left alone rather than
+         * rebuilt: we drop our function out of the configuration on the way out
+         * and the USB HAL puts its own back, which is a far smaller thing to ask
+         * of it than a second gadget appearing and disappearing underneath it.
+         * A kernel that will not give us one (ENOMEM/EEXIST when a gadget was
+         * removed earlier in this boot) gets the phone's instead, and says so.
+         */
         char path[320];
 
         snprintf(path, sizeof(path), "%s/%s", CONFIGFS_GADGETS, b.gadget);
-        if (make_dir(path) < 0) {
+        if (make_dir(path) == 0) {
+            note("created gadget %s", b.gadget);
+        } else if (any_gadget(b.gadget, sizeof(b.gadget)) < 0) {
             fail("no USB gadget in %s, and %s could not be created",
                  CONFIGFS_GADGETS, b.gadget);
             return 1;
+        } else {
+            note("using the phone's own gadget %s", b.gadget);
         }
     }
     if (!b.udc[0] && find_udc(b.udc, sizeof(b.udc)) < 0) {
@@ -1904,5 +2134,8 @@ int main(int argc, char **argv)
 
     serve();
     teardown();
+    if (pidfile[0]) {
+        unlink(pidfile);
+    }
     return 0;
 }

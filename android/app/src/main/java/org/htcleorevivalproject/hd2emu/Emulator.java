@@ -176,11 +176,14 @@ public class Emulator {
          * UDC, configfs and FunctionFS are all root-only, so without root the
          * passthrough cannot work at all, and carrying on as if it were off would
          * leave the phone's USB alone and the PC seeing nothing, with nothing in
-         * the log to say why.
+         * the log to say why.  Ask the manager first: it has usually granted it
+         * already (in Root & USB), and then this costs nothing and shows no
+         * prompt -- but a fresh install asks here rather than silently doing
+         * nothing.
          */
         boolean passthrough = cfg.usbPassthrough;
         if (passthrough) {
-            if (Root.status() != Root.Status.GRANTED) {
+            if (Root.status() != Root.Status.GRANTED && Root.request() != Root.Status.GRANTED) {
                 throw new IOException(ctx.getString(R.string.emu_usb_needs_root));
             }
             if (!paths.hasUsbBridge()) {
@@ -323,7 +326,19 @@ public class Emulator {
 
         watch();
         startSensors();
-        if (!"menu".equals(cfg.boot)) startBootKeys(cfg);
+        /*
+         * The cLK menu wants a key press to pick BOOT FROM NAND, which is what
+         * the keys below send.  With USB passthrough on, leave it alone instead:
+         * the PC on the other end of the cable is the thing that talks to the
+         * emulated phone, and fastboot is the bootloader itself -- pressing on
+         * would boot Android and the PC would find nothing to talk to.  This is
+         * the same choice tools/start.sh makes with CLK_KEYS= pressed nothing.
+         */
+        if (passthrough) {
+            note(ctx.getString(R.string.emu_usb_stay_in_clk));
+        } else if (!"menu".equals(cfg.boot)) {
+            startBootKeys(cfg);
+        }
         if (passthrough) {
             /*
              * Now that QEMU is listening: the bridge waits for the socket, and
@@ -511,7 +526,7 @@ public class Emulator {
          * the emulator should not be yanking the USB out from under it */
         if (bridgeRunning) {
             bridgeRunning = false;
-            UsbBridge.stop();
+            UsbBridge.stop(paths);
         }
         Qmp[] ms = {qmp, q6qmp};
         for (Qmp m : ms) {
