@@ -12,8 +12,10 @@ npm run build && npm start   # production
 QEMU is always built with VNC — the server reads the screen and the sound
 through it ([docs/building.md](../docs/building.md)).
 
-CI builds and packages the UI as the `hd2-web-ui` artifact: a `.tar.gz` you
-can unpack and run with `NODE_ENV=production node server/index.ts`.
+CI builds and packages the UI as the `hd2-web-ui` artifact: a `.tar.gz` holding
+just the built tree (`.next`, `server/`, `lib/`, `public/` and the production
+dependencies, no sources), which you unpack and run with
+`NODE_ENV=production node server/index.ts`.
 
 ## How it works
 

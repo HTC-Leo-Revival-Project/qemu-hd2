@@ -129,17 +129,23 @@ ls -la "$DEST/images/" 2>/dev/null | sed -n '2,$p' | awk '{printf "  %10s  %s\n"
 # ---------------------------------------------------------------- build
 step "building the web UI"
 cd "$DEST/web"
-if [ -n "$OFFLINE" ] && [ -d "$ROOT/web/node_modules" ]; then
-  echo "copying node_modules from $ROOT/web (--offline)"
-  cp -a "$ROOT/web/node_modules" .
-elif [ -d node_modules ] && [ -f node_modules/.package-lock.json ]; then
-  echo "node_modules is there, skipping npm ci"
+# the release bundle (the hd2-web-ui artifact) is already built and carries no
+# sources, so there is nothing to install or compile.
+if [ -d .next ] && [ ! -d app ]; then
+  echo "this tree is already built (.next but no sources): skipping npm ci and next build"
 else
-  npm ci
+  if [ -n "$OFFLINE" ] && [ -d "$ROOT/web/node_modules" ]; then
+    echo "copying node_modules from $ROOT/web (--offline)"
+    cp -a "$ROOT/web/node_modules" .
+  elif [ -d node_modules ] && [ -f node_modules/.package-lock.json ]; then
+    echo "node_modules is there, skipping npm ci"
+  else
+    npm ci
+  fi
+  [ -f next.config.ts ] || die "next.config.ts missing from the copy"
+  npm run build
 fi
-[ -f next.config.ts ] || die "next.config.ts missing from the copy"
-npm run build
-[ -d .next ] || die "next build produced no .next"
+[ -d .next ] || die "no .next in $DEST/web: build it first (npm ci && npm run build), or use the hd2-web-ui release bundle"
 
 # ---------------------------------------------------------------- service
 if [ "$SERVICE" = 1 ]; then

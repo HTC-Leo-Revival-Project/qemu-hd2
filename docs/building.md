@@ -125,9 +125,13 @@ artifact (see below).
 |---|---|
 | [build.yml](../.github/workflows/build.yml) | On every push and pull request: `lint` (shell/Python/YAML), `linux` (the emulator), `web` (the web UI) and `android` (the APK). |
 
-Each job uploads what it made: `htcleo-linux-x86_64` (the two emulator
-binaries), `hd2-web-ui` (the web UI, built and tarballed) and
-`htcleo-debug-apk` (the app).
+Each job uploads what it made, unzipped (actions/upload-artifact v7 with
+`archive: false`): `htcleo-linux-x86_64.tar.gz` (the two emulator binaries),
+`hd2-web-ui.tar.gz` (the web UI, built) and `htcleo-debug.apk` (the app).
+Uploading a tarball also keeps the executable bit, which a zipped artifact
+does not (everything comes back 644).  `act`'s artifact server predates that
+API, so a local run skips the three uploads (and checks what was packaged
+instead); on GitHub they are attached to the run.
 
 It can be run locally with [nektos/act](https://github.com/nektos/act)
 instead of pushing to GitHub, which is how the workflow file itself is checked:

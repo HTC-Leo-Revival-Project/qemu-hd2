@@ -110,12 +110,23 @@ jobs:
           # the plugin AMSSLOG=1 loads
           test -f src/qemu/build/contrib/plugins/libamsslog.so
 
-      - uses: actions/upload-artifact@v4
+      # A zipped artifact also loses the executable bit (files come back 644),
+      # so the two binaries go into a tarball and that is uploaded as-is:
+      # upload-artifact v7 ships a single file without wrapping it in a zip.
+      - name: package
+        run: |
+          tar -czf htcleo-linux-x86_64.tar.gz \
+            -C src/qemu/build qemu-system-arm qemu-system-hexagon
+          tar -tvzf htcleo-linux-x86_64.tar.gz
+
+      # act's artifact server predates v7's non-zipped API (it rejects the new
+      # mime_type field), so a local `act` run skips the upload; see
+      # docs/building.md.  GitHub does it.
+      - if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v7
         with:
-          name: htcleo-linux-x86_64
-          path: |
-            src/qemu/build/qemu-system-arm
-            src/qemu/build/qemu-system-hexagon
+          path: htcleo-linux-x86_64.tar.gz
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
@@ -202,12 +213,18 @@ jobs:
           unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-q6.so'
           unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-usbffs.so'
 
-      - uses: actions/upload-artifact@v4
+      # archive: false ships the APK itself instead of a zip around an APK, and
+      # with it the artifact name is the file's, so give it the repo's name.
+      - name: stage the APK
+        run: mv android/app/build/outputs/apk/debug/app-debug.apk htcleo-debug.apk
+
+      # act's artifact server predates v7's non-zipped API (it rejects the new
+      # mime_type field), so a local `act` run skips the upload (docs/building.md).
+      - if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v7
         with:
-          name: htcleo-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          # an APK is already a zip; do not have the runner recompress it
-          compression-level: 0
+          path: htcleo-debug.apk
+          archive: false
           if-no-files-found: error
           retention-days: 14
 
@@ -240,30 +257,57 @@ jobs:
         working-directory: web
         run: npm run build
 
-      # A tree that runs as-is: the Next build, the custom server (Node runs
-      # server/index.ts straight, no compile step) and its production
-      # dependencies.  Unpack it and `NODE_ENV=production node server/index.ts`;
-      # it still wants the NAND images and the two QEMU binaries beside it at
-      # runtime, which is the layout tools/deploy-web.sh installs.
+      # A tree that runs as-is, and nothing else: the Next build, the custom
+      # server (Node runs server/index.ts straight, no compile step), lib/
+      # (server/config.ts imports DEFAULT_CONFIG from it) and the production
+      # dependencies the server actually loads.  app/, components/ and the tool
+      # configs are compile-time only.  Unpack it and run
+      # `NODE_ENV=production node server/index.ts`; it still wants the NAND
+      # images and the two QEMU binaries beside it at runtime, which is the
+      # layout tools/deploy-web.sh installs.
       - name: package
         working-directory: web
         run: |
           npm prune --omit=dev
+          # the lockfile also brings the other-libc native builds and packages
+          # the server never loads: sharp/@img (nothing uses next/image),
+          # lucide-react (bundled into .next) and the type-only leftovers.
+          rm -rf node_modules/@next/swc-linux-x64-musl \
+                 node_modules/@img \
+                 node_modules/lucide-react \
+                 node_modules/@types \
+                 node_modules/@tailwindcss
           cd ..
           tar -czf hd2-web-ui.tar.gz \
-            --exclude='web/node_modules/.cache' \
             --exclude='web/.next/cache' \
-            --exclude='web/*.tsbuildinfo' \
-            --exclude='web/.emulator.json' \
-            --transform 's,^web,hd2-web-ui,' \
-            web
+            --exclude='web/node_modules/.cache' \
+            --exclude='*.map' \
+            web/.next web/lib web/public web/server \
+            web/node_modules web/next.config.ts web/package.json
           ls -lh hd2-web-ui.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      # what the tar command above is supposed to have picked, so `act` still
+      # checks the packaging even though it cannot do the upload.
+      - name: check the bundle
+        run: |
+          tar -tzf hd2-web-ui.tar.gz > /tmp/tree
+          grep -qx 'web/server/index.ts' /tmp/tree
+          grep -qx 'web/lib/emulator-types.ts' /tmp/tree
+          grep -qx 'web/.next/BUILD_ID' /tmp/tree
+          grep -qx 'web/next.config.ts' /tmp/tree
+          # the sources, the tool configs and the dev leftovers are not in there
+          ! grep -qE '^web/(app|components)/' /tmp/tree
+          ! grep -qE '^web/(eslint\.config\.mjs|tsconfig\.json|next-env\.d\.ts)$' /tmp/tree
+          ! grep -q '^web/node_modules/typescript/' /tmp/tree
+          ! grep -q 'swc-linux-x64-musl' /tmp/tree
+          ! grep -q '\.map$' /tmp/tree
+
+      # act's artifact server predates v7's non-zipped API (it rejects the new
+      # mime_type field), so a local `act` run skips the upload (docs/building.md).
+      - if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v7
         with:
-          name: hd2-web-ui
           path: hd2-web-ui.tar.gz
-          # the tarball is already gzipped; do not have the runner recompress it
-          compression-level: 0
+          archive: false
           if-no-files-found: error
           retention-days: 14
