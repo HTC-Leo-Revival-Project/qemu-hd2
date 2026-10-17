@@ -249,17 +249,85 @@ Each of these was a silent stall, not a crash:
 | the bridge used the phone's own `g1` after a reboot | `find_gadget()` fell back to any gadget with a UDC file; it now creates `hd2` first and only borrows one if that is refused |
 | `stopping` in the log, and the phone's USB never came back | workers joined before the UDC was released, and a worker inside this ffs's `read(2)` does not come out (above) |
 
-Still unexplained: transfers that stop part way with the host waiting for the
-rest. One run stalled at 4,915,373 of 4,973,312 bytes and needed the guest
-rebooted; another stopped at 1,048,576 of 1,059,328 (`fastboot boot uefi.img`,
-both of them on a whole number of the bridge's 64 KB reads) and the guest's own
-UART showing `fastboot: download:00102800` and nothing more. Retrying the same
-command worked immediately -- 0.031 s -- so it is the host or the phone's UDC
-that stopped offering data, not the emulated side, and it is not a size limit
-(the successful run went past the point the stalled ones stopped at). What is
-known now: the bridge logs `nothing from the host on ep2 for N s` when the
-phone's UDC has nothing queued for it, and flags an OUT the emulator took short
-of what it was sent, so the next occurrence says which side stopped.
+Still unexplained, and now visible rather than mysterious: **a large download
+stops after 4,915,200 bytes** (75 reads of 64 KB, every time) with the guest
+*alive and waiting* -- the emulated controller's ENDPTSTAT still has the bulk
+OUT request primed -- and the host still holding the rest. At that point:
+
+```
+$ sudo cat /sys/kernel/debug/usb/ehci/0000:00:1a.0/async
+qh/... dev5 fs ep2 00400205 41020000 (04048d82* data0 nak0)
+```
+
+`nak0` with `data0`: the phone's UDC is *acking* the host's packets and not
+handing them on. On the phone side the bridge is blocked in `read(2)` on the
+bulk OUT endpoint with nothing queued, and `pidof`/`/proc/<pid>/task/*/wchan`
+says `ffs_epfile_io` -- this driver waits for the UDC inside the read whether
+the fd is `O_NONBLOCK` or not (the fdinfo flags show `O_NONBLOCK` set and it
+blocks anyway), so the bridge cannot use "the phone went quiet" to mean "the
+host has finished sending".
+
+That is why the bridge does not guess: a piece is only ever sent unaligned when
+it is a *command* (at most 64 bytes into the guest's 64-byte buffer, where the
+short completion is the point), and the end of a download comes from the size
+the host announced in `download:00102800` rather than from a timeout. What this
+still needs is a way to ask the phone's dwc3 what it thinks its OUT request
+queue looks like -- there is no `/sys/class/udc/<udc>/ep*` and no
+`/sys/kernel/debug/usb/dwc3/` on this kernel.
+
+### What a transfer looks like, and why its pages have to stay whole
+
+cLK's fastboot reads a download in 4096-byte pieces (`usb_read()`:
+`xfer = (len > 4096) ? 4096 : len`) and reads a *short* request as the end of
+what it asked for:
+
+```c
+        count += req->length;
+        ...
+        /* short transfer? */
+        if (req->length != xfer) break;
+```
+
+then `cmd_download()` compares what it got with the announced size and puts
+itself into `STATE_ERROR`, which prints `fastboot: oops!` and stops serving
+fastboot entirely. The phone's UDC hands FunctionFS however much it had room
+for -- 65,363 bytes where the guest asked for 4096 is ordinary -- so passing
+those chunks straight through ends the guest's request short and a download
+dies at whatever page that lands on.
+
+So the bridge:
+
+* hands the emulator **whole 4096-byte pieces** (`ring_whole_pages()`), which
+  the guest then always sees complete;
+* sends a **command** unaligned after the phone has been quiet a moment,
+  because a command is 17-30 bytes into a 64-byte buffer and only the short
+  completion lets the guest see it at all;
+* finishes a **download** from the size the host announced: whatever is left
+  over, 4096 or less, is exactly the piece the guest's last request wants, so
+  it goes out the moment those bytes arrive -- nothing is guessed from a
+  timeout, because the phone's quiet periods are this driver's blocking reads
+  and not the host finishing;
+* copies out of the ring **wrapping** (`ring_copy_out()`): clipping to the end
+  of the buffer put a 3,881-byte transfer where a 4,096-byte one belonged, a
+  megabyte into the transfer. Fixing that alone took `fastboot flash` from
+  2,162,688 bytes to 4,915,200.
+
+### Reading the guest while it runs
+
+The bootloader in `images/nand-lle.img` is built with `WITH_DEBUG_UART=1` and
+`DEBUG=2`, so `dprintf(INFO, ...)` reaches UART1 (`files/emu/run/uart1.log`),
+which is the only way to see what the *guest* thinks while it is being flashed.
+`aboot_init()` also starts `usbwatch`, a thread that reads four controller
+registers and prints them **when they change** (plus a heartbeat), so a
+transfer's state is visible without a debugger:
+
+```
+[66710] usbwatch: stat 00000002 prime 00000000 complete 00000000 sts 00000000
+```
+
+`stat` bit 1 is the bulk OUT request the gadget has queued. Watching it turn to
+0 while the host is still sending says the guest has given up; watching it stay
+set says the guest is waiting and the phone is the side that has stopped.
 
 ## The `-19` on bind
 
