@@ -134,6 +134,13 @@ void gdb_memtox(GString *buf, const char *mem, int len);
 void gdb_read_byte(uint8_t ch);
 
 /*
+ * Return the RSP parser to a clean idle state. Must be called whenever a gdb
+ * client connects or disconnects, otherwise a session that ended mid-packet
+ * leaves the parser desynchronised and the next client is silently ignored.
+ */
+void gdb_reset_protocol_state(void);
+
+/*
  * Packet acknowledgement - we handle this slightly differently
  * between user and system mode, mainly to deal with the differences
  * between the flexible chardev and the direct fd approaches.

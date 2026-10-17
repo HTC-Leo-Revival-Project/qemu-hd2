@@ -2329,6 +2329,37 @@ void gdb_set_stop_cpu(CPUState *cpu)
     gdbserver_state.g_cpu = cpu;
 }
 
+/*
+ * Reset the RSP parser to a clean idle state.
+ *
+ * Nothing in the stub used to do this when a client connected or went away, so
+ * a session that ended mid-packet (a batch gdb exiting after 'continue', a
+ * client killed by a timeout, a terminal closed) left state at RS_GETLINE,
+ * RS_CHKSUM1, ... with a half-filled line buffer and a pending last_packet.
+ *
+ * The next gdb to attach then sends '$' to start its first packet, but since
+ * the parser is not in RS_IDLE that '$' is treated as an ordinary packet
+ * character rather than the start of a packet. Every subsequent byte is
+ * misparsed, the stub never replies, and gdb fails with a connect/timeout
+ * error against a perfectly healthy stub. That is the "gdb is broken on this
+ * emulator" symptom.
+ *
+ * Call this on both connect and disconnect so a stale session can never wedge
+ * the next one.
+ */
+void gdb_reset_protocol_state(void)
+{
+    gdbserver_state.state = RS_IDLE;
+    gdbserver_state.line_buf_index = 0;
+    gdbserver_state.line_sum = 0;
+    if (gdbserver_state.last_packet) {
+        g_byte_array_set_size(gdbserver_state.last_packet, 0);
+    }
+    if (gdbserver_state.str_buf) {
+        g_string_truncate(gdbserver_state.str_buf, 0);
+    }
+}
+
 void gdb_read_byte(uint8_t ch)
 {
     uint8_t reply;

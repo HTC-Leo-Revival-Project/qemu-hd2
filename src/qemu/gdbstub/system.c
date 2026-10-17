@@ -90,6 +90,15 @@ static void gdb_chr_event(void *opaque, QEMUChrEvent event)
 
     switch (event) {
     case CHR_EVENT_OPENED:
+        /*
+         * A previous session may have died mid-packet (batch gdb exiting
+         * after 'continue', a killed client, a closed terminal). Reset the
+         * parser first, otherwise this client's first '$' is swallowed as a
+         * packet character and the stub never answers -- which looks exactly
+         * like a dead gdb stub.
+         */
+        gdb_reset_protocol_state();
+
         /* Start with first process attached, others detached */
         for (i = 0; i < s->process_num; i++) {
             s->processes[i].attached = !i;
@@ -100,6 +109,10 @@ static void gdb_chr_event(void *opaque, QEMUChrEvent event)
 
         vm_stop(RUN_STATE_PAUSED);
         replay_gdb_attached();
+        break;
+    case CHR_EVENT_CLOSED:
+        /* Drop any half-received packet so the next client starts clean. */
+        gdb_reset_protocol_state();
         break;
     default:
         break;
