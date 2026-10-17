@@ -55,6 +55,7 @@ typedef struct UsbipUrb {
     uint32_t len;               /* bytes of `data` the host asked to send */
     uint32_t done;              /* ... and how many the gadget has taken */
     int64_t since;
+    int64_t moved;              /* when it last took some, for "stuck" reports */
     uint8_t setup[8];
     uint8_t data[USBIP_XFER_MAX];
 } UsbipUrb;

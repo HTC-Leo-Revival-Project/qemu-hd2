@@ -135,6 +135,34 @@
  */
 #define RING_BYTES     (1024 * 1024)
 
+/* How much of an OUT transfer the emulated gadget asks for at a time: cLK's
+ * fastboot reads a download in 4096-byte pieces (usb_read(), "xfer = 4096").
+ * Handing the emulator anything else ends one of those pieces short, and a short
+ * request is what fastboot calls an error.  See ring_whole_pages(). */
+#define GUEST_PAGE     4096
+
+/*
+ * How long the phone has to be quiet before the ring gives up waiting for a
+ * whole guest-sized piece and sends what it has.
+ *
+ * A fastboot command is 17-30 bytes, and the host is waiting for the reply the
+ * moment it has sent one, so this cannot be long or every command costs it.
+ * A host that pauses this long in the middle of a megabyte is not going to send
+ * the rest anyway, and the log says when it happens.
+ */
+#define QUIET_MS       150
+
+/*
+ * How long the phone has to be quiet before a *bulk* remainder goes out
+ * unaligned, as opposed to a command's.  See pump(): a partial page in the
+ * middle of a download must not be sent because the phone paused, or the
+ * guest's request completes short and fastboot gives up with "oops".
+ */
+#define QUIET_BULK_MS  4000
+
+/* The guest's command buffer (fastboot's usb_read(buffer, 64)). */
+#define COMMAND_MAX    64
+
 static uint32_t get32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -187,6 +215,9 @@ struct ep {
     uint32_t ring_cap;
     uint32_t ring_head;         /* bytes the worker has read in */
     uint32_t ring_tail;         /* bytes handed to the emulator */
+    bool flush;                 /* OUT: send what is left, page-aligned or not */
+    uint32_t quiet;             /* OUT: how long the phone has given us nothing */
+    uint32_t download_left;     /* OUT: bytes of a download the host still owes */
 
     int slot;                   /* its urb slot; slot 0 is ep0 */
     pthread_t thread;
@@ -241,10 +272,27 @@ static volatile sig_atomic_t stop_now;
 
 /* ---- plumbing ----------------------------------------------------------- */
 
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static void logline(const char *fmt, ...)
 {
     va_list ap;
 
+    /*
+     * Milliseconds since start.  Without this the log says what happened and
+     * not when, and "the transfer is slow" is a question about time: how long a
+     * transfer takes to come back, how long the gaps between two reads are,
+     * whether the emulator or the phone is the slow side.  Almost every line
+     * here is a transfer going out or coming back, so the column reads as a
+     * timeline of the whole run.
+     */
+    fprintf(stderr, "[%9lld] ", (long long)now_ms());
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -265,14 +313,6 @@ static void sleep_ms(int ms)
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
 
     nanosleep(&ts, NULL);
-}
-
-static int64_t now_ms(void)
-{
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int write_all(int fd, const void *buf, size_t len, const char *what)
@@ -1368,6 +1408,95 @@ static uint32_t ring_held(const struct ep *e)
     return e->ring_head - e->ring_tail;
 }
 
+/* how much the worker could still read in without waiting for the emulator */
+static uint32_t room_left(const struct ep *e)
+{
+    return e->ring_cap - ring_held(e);
+}
+
+static uint32_t ring_whole_pages(uint32_t held)
+{
+    return held - (held % GUEST_PAGE);
+}
+
+/*
+ * How many bytes of the transfer this endpoint may send now.
+ *
+ * A download is the only transfer the host announces a size for, and that size
+ * is what makes the end of it safe: cCLK's fastboot asks for 4096-byte pieces
+ * while it downloads, and whatever the announced size has left over -- 4096 for
+ * an image that is a whole number of pages, less for one that is not -- is
+ * exactly the piece its last request wants.  Send that much and the guest's last
+ * request is filled *completely*: no short completion, no "fastboot: oops!", and
+ * no waiting on the phone going quiet, which this ffs does for seconds at a time
+ * for reasons of its own.
+ *
+ * Until then: whole pages only, because the guest cannot be given a part of one.
+ */
+static uint32_t out_want(const struct ep *e, uint32_t held)
+{
+    uint32_t want;
+
+    if (e->download_left) {
+        want = e->download_left > GUEST_PAGE ? ring_whole_pages(held)
+                                            : e->download_left;
+    } else {
+        want = e->flush ? held : ring_whole_pages(held);
+    }
+    return want > held ? held : want;
+}
+
+/*
+ * The `download:00102800` command the host sends before the bytes, read off the
+ * wire to learn the size.  A command the bridge forwards is otherwise only ever
+ * looked at by the guest.
+ */
+static void note_download_left(struct ep *e, const uint8_t *cmd, uint32_t len)
+{
+    static const char tag[] = "download:";
+    const uint8_t *end = cmd + len;
+    const uint8_t *p;
+    uint32_t v = 0;
+
+    e->download_left = 0;
+    if (e->in || len <= sizeof(tag) || len > 40 ||
+        memcmp(cmd, tag, sizeof(tag) - 1)) {
+        return;
+    }
+    for (p = cmd + sizeof(tag) - 1; p < end && *p >= '0' && *p <= '9'; p++) {
+        v = v * 16 + (uint32_t)(*p <= '9' ? *p - '0' : (*p | 32) - 'a' + 10);
+    }
+    if (p == end || v == 0) {
+        return;                     /* not a number, or not one we can believe */
+    }
+    e->download_left = v;
+    note("ffs: %s: a download of %u bytes", e->name, v);
+}
+
+/*
+ * Copy `len` bytes out of the ring at `at`, wrapping at the end of it.
+ *
+ * Without this the ring's end clips a transfer: a megabyte into a download the
+ * tail sits near the wrap, the contiguous span left is 3,881 bytes, and a
+ * transfer of 3,881 ends the guest's 4096-byte request short -- which is
+ * "fastboot: oops!" in the middle of a flash.  The bytes are copied out into a
+ * staging buffer anyway (submit_urb() wants one contiguous frame), so the copy
+ * is where the wrap belongs.
+ */
+static void ring_copy_out(const struct ep *e, uint8_t *dst, uint32_t at, uint32_t len)
+{
+    uint32_t off = at % e->ring_cap;
+    uint32_t first = e->ring_cap - off;
+
+    if (first > len) {
+        first = len;
+    }
+    memcpy(dst, e->ring + off, first);
+    if (len > first) {
+        memcpy(dst + first, e->ring, len - first);
+    }
+}
+
 /*
  * How much of `want` can be taken from offset `at` in one go: the ring is not
  * linear memory, and a read that runs past the end of the buffer is EFAULT.
@@ -1378,6 +1507,26 @@ static uint32_t ring_slice(const struct ep *e, uint32_t at, uint32_t want)
 
     return want > left ? left : want;
 }
+
+/*
+ * Round a count down to the emulated gadget's request size.
+ *
+ * This is the whole reason the ring exists.  The phone's UDC hands us what it
+ * has, not the host's transfers: one download arrives as 65,363 bytes and then
+ * 65,536, because 65,363 is what the UDC had room for.  If each of those goes to
+ * the emulator as its own transfer, the end of it looks like a USB short packet,
+ * and a short packet completes the gadget's outstanding request short.  *That*
+ * is what stops fastboot mid-download: cLK's usb_read() takes a short request as
+ * the end of what it asked for, cmd_download() gets fewer bytes than it promised,
+ * and fastboot prints "fastboot: oops!" and stops.  The guest asks for 4096 at a
+ * time while it downloads, so handing it whole multiples of 4096 means it never
+ * sees a request come up short.
+ *
+ * A fastboot command is 17-30 bytes and there is nothing to round it up to, so
+ * what is left over goes out on `flush` -- see pump().
+ */
+
+
 
 static void *out_worker(void *arg)
 {
@@ -1417,20 +1566,21 @@ static void *out_worker(void *arg)
         room = ring_slice(e, e->ring_head, room);
         pthread_mutex_unlock(&e->lock);
 
-        if (wait_for_io_timed(e->fd, POLLIN, 5000, &timed_out) != 0) {
+        if (wait_for_io_timed(e->fd, POLLIN, QUIET_MS, &timed_out) != 0) {
             break;
         }
         if (timed_out) {
             /*
-             * The phone had nothing for us for five seconds.  Say so, once and
-             * then every tenth time: the host has usually finished sending and
-             * is waiting for the reply the emulated phone owes it, and this is
-             * the line that says so instead of the log going quiet in the middle
-             * of a transfer.
+             * The phone had nothing for us for a moment.  Nothing to decide here:
+             * whether the ring holds a piece of the host's transfer that has to
+             * go out unaligned is the loop's call, not this thread's, because a
+             * read(2) on this ffs can sit in the driver for good and the loop has
+             * to keep working either way.
              */
-            if (quiet_rounds++ == 0 || quiet_rounds % 20 == 0) {
+            quiet_rounds++;
+            if (quiet_rounds == 40 || quiet_rounds == 240) {
                 note("ffs: nothing from the host on %s for %d s", e->name,
-                     quiet_rounds < 20 ? 5 : 100);
+                     quiet_rounds * QUIET_MS / 1000);
             }
             continue;
         }
@@ -1739,6 +1889,7 @@ static void pump(void)
 {
     struct pollfd fds[3];
     int usbip_slot = 0, ep0_slot = 1, wake_slot = 2;
+    int woken;
 
     fds[usbip_slot].fd = b.ip;
     fds[usbip_slot].events = POLLIN;
@@ -1747,11 +1898,65 @@ static void pump(void)
     fds[wake_slot].fd = wake_pipe[0];
     fds[wake_slot].events = POLLIN;
 
-    if (poll(fds, 3, -1) < 0) {
+    /*
+     * With a timeout, so the loop wakes on its own now and then.  That is what
+     * ends a host transfer that did not finish on a guest-sized boundary: the
+     * bytes that are left in the ring are the host's last few (a fastboot
+     * command, the tail of a download) and there is nothing more coming to make
+     * them a whole number of pages, so they go as they are.  See
+     * ring_whole_pages().
+     */
+    woken = poll(fds, 3, QUIET_MS);
+    if (woken < 0) {
         if (errno != EINTR) {
             fail("poll: %s", strerror(errno));
         }
         return;
+    }
+    if (!woken) {
+        for (int i = 0; i < b.nep; i++) {
+            struct ep *e = &b.eps[i];
+            uint32_t held;
+
+            if (e->in || e->fd < 0) {
+                continue;
+            }
+            pthread_mutex_lock(&e->lock);
+            held = ring_held(e);
+            if (!held || e->flush) {
+                e->quiet = 0;
+            } else {
+                /*
+                 * The loop hands over whole pages as they arrive, so what is left
+                 * in the ring is a piece of one page, and the guest cannot finish
+                 * its request without it -- nothing moves until it goes.
+                 *
+                 * Only a command-sized piece may go out unaligned, and only after
+                 * the phone has gone quiet for a moment: a fastboot command is at
+                 * most 64 bytes into the guest's 64-byte buffer, the host is
+                 * waiting for the reply, and the guest needs the short completion
+                 * to see the command at all.
+                 *
+                 * A piece of a *download* must never be sent like that, and no
+                 * amount of waiting makes it safe: the phone goes quiet while our
+                 * own worker is between reads (this ffs blocks inside read(2) for
+                 * seconds at a time), and sending 3,909 of the guest's 4,096 then
+                 * is a short request in the middle of a transfer -- fastboot calls
+                 * that an error and stops.  What finishes a download instead is
+                 * knowing how many bytes it has left, which the download: command
+                 * says exactly.  See note_download_left().
+                 */
+                e->quiet += QUIET_MS;
+                if (held <= COMMAND_MAX && room_left(e) > 0 &&
+                    e->quiet >= QUIET_MS) {
+                    note("ffs: %s quiet for %u ms with %u bytes held; "
+                         "sending them", e->name, e->quiet, held);
+                    e->flush = true;
+                    e->quiet = 0;
+                }
+            }
+            pthread_mutex_unlock(&e->lock);
+        }
     }
     if (fds[wake_slot].revents) {
         char drain[64];
@@ -1818,11 +2023,32 @@ static void pump(void)
              * One transfer at a time per endpoint, but whatever else has come
              * off the phone stays in the ring meanwhile, so the UDC keeps being
              * drained at its own pace instead of ours.
+             *
+             * Whole guest-sized pieces unless the phone has gone quiet and
+             * `flush` says this really is the end of the host's transfer: see
+             * ring_whole_pages() for why splitting one up ends fastboot.  The
+             * copy goes through ring_copy_out(), so the ring wrapping where it
+             * likes does not shorten the piece.
              */
-            len = ring_slice(e, e->ring_tail, held > XFER_MAX ? XFER_MAX : held);
-            memcpy(out, e->ring + (e->ring_tail % e->ring_cap), len);
-            e->ring_tail += len;           /* submit_urb() writes it out itself */
-            pthread_cond_signal(&e->cv);  /* room in the ring again */
+            uint32_t want = out_want(e, held);
+
+            len = want > XFER_MAX ? XFER_MAX : want;
+            if (len) {
+                ring_copy_out(e, out, e->ring_tail, len);
+                e->ring_tail += len;       /* submit_urb() writes it out itself */
+                e->flush = false;
+                if (e->download_left) {
+                    if (len <= COMMAND_MAX) {
+                        note_download_left(e, out, len);
+                    } else {
+                        e->download_left -= len;
+                        if (!e->download_left) {
+                            note("ffs: %s: the download is complete", e->name);
+                        }
+                    }
+                }
+                pthread_cond_signal(&e->cv);  /* room in the ring again */
+            }
         }
         pthread_mutex_unlock(&e->lock);
         if (len) {

@@ -101,6 +101,8 @@
 #define POLL_NS          (SCALE_MS / 10)
 /* ... and when to give up on a URB the gadget never answers */
 #define TIMEOUT_NS       (2000 * SCALE_MS)
+/* ... and when a transfer that was moving has stopped, to say so */
+#define STUCK_NS         (5000 * SCALE_MS)
 
 static inline uint32_t get32(const uint8_t *p)
 {
@@ -346,6 +348,22 @@ static bool usbip_serve_one(UsbipLink *l, int i)
             return true;
         }
         u->done += n;
+        u->moved = now;
+        if (!n && u->ep) {
+            /*
+             * The gadget was asked and gave nothing back.  On the way in,
+             * hsusb_td_xfer() has already retired whatever the gadget had queued
+             * for this endpoint -- with zero bytes -- so a request that was
+             * primed and waiting has just been completed short, and cLK's
+             * usb_read() reads that as the end of the transfer it asked for.  It
+             * is the one way this path can end a download with "fastboot: oops!"
+             * and no error anywhere else, so say which transfer it was.
+             */
+            qemu_log_mask(LOG_UNIMP,
+                          "msm-usbip: seq %u ep %u %s moved nothing: "
+                          "%u of %u, queued descriptors?\n",
+                          seq, u->ep, dir_in ? "in" : "out", u->done, u->len);
+        }
         if (more) {
             /*
              * The gadget is part-way through: it has queued some of what the
@@ -368,7 +386,22 @@ static bool usbip_serve_one(UsbipLink *l, int i)
              *
              * An IN is the other way round: the gadget chooses how much it
              * sends, and a short packet is how it says "that is all".
+             *
+             * If it stops making progress for a while, the gadget has stopped
+             * asking -- which is the one way this whole path can wedge, and it
+             * shows up on the host as fastboot hung on "Sending" with no error
+             * anywhere.  Say so here, where the numbers say how much of the
+             * transfer is still sitting in the URB and which descriptor the
+             * gadget has not primed.
              */
+            if (now - u->since > STUCK_NS && now - u->moved > STUCK_NS) {
+                qemu_log_mask(LOG_UNIMP,
+                              "msm-usbip: seq %u ep %u stuck: %u of %u bytes "
+                              "given, nothing for %d s\n",
+                              u->seq, u->ep, u->done, u->len,
+                              (int)((now - u->moved) / SCALE_MS));
+                u->moved = now;
+            }
             return false;
         }
     }
@@ -474,6 +507,7 @@ static void usbip_decode(UsbipLink *l)
             u->dir_in = dir == DIR_IN;
             u->want = dir == DIR_IN ? MIN(want, USBIP_XFER_MAX) : want;
             u->since = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            u->moved = u->since;
             memcpy(u->setup, p + 40, 8);
             /*
              * A control transfer is a whole URB carrying the SETUP packet and

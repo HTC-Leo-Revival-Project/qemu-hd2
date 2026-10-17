@@ -242,19 +242,11 @@ static int hsusb_td_xfer(MsmHsusbState *s, int bit, uint8_t *buf,
     token = ld32(td + 4);
     total = (token >> 16) & 0x7FFF;
     n = MIN(total, len);
-    qemu_log_mask(LOG_UNIMP, "msm-hsusb: ep%u td@%08x wants %u, %u to give\n",
-                  bit & 15, td, total, len);
     for (o = 0; o < n; ) {
         hwaddr a = td_byte_addr(td, o);
         uint32_t chunk = MIN(n - o, 0x1000 - (a & 0xFFF));
 
         if (!a) {
-            /*
-             * A descriptor whose data address came out as zero: say how much
-             * actually moved rather than claiming the lot, or the caller counts
-             * bytes the gadget never got.
-             */
-            n = o;
             break;
         }
         if (in) {
@@ -264,28 +256,9 @@ static int hsusb_td_xfer(MsmHsusbState *s, int bit, uint8_t *buf,
         }
         o += chunk;
     }
-    /*
-     * Part of a descriptor with nothing more to put in it: leave it at the head
-     * of the queue, still primed and still ACTIVE, so the rest of this transfer
-     * finishes it.  Completing it here would hand the gadget a request that came
-     * up short, and cLK's usb_read() reads that as the end of the transfer:
-     * fastboot puts itself into STATE_ERROR and prints "fastboot: oops!" in the
-     * middle of a download.  A real controller does not do that either -- it
-     * keeps the request pending until the host's wLength is spent.
-     */
-    if (n < total) {
-        qemu_log_mask(LOG_UNIMP,
-                      "msm-hsusb: ep%u request left %u of %u filled\n",
-                      bit & 15, n, total);
-        st32(td + 4, (token & ~0x7FFFu) | ((total - n) << 16));
-        hsusb_update(s);
-        return n;
-    }
     token = (token & ~((0x7FFFu << 16) | TD_ACTIVE | 0x6F)) |
             ((total - n) << 16);
     st32(td + 4, token);
-    qemu_log_mask(LOG_UNIMP, "msm-hsusb: ep%u request complete, %u bytes\n",
-                  bit & 15, n);
 
     /* advance the queue head */
     next = ld32(td);
