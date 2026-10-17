@@ -19,6 +19,11 @@ qmp.sock
 # QEMU's configure test dir / a firmware ELF written into the repo root by
 # running tools/hd2_radio.py from the wrong directory (it wants images/)
 /config-temp/
+
+# hfsprogs, unpacked from its .deb by tools/mkibootcard.py's README instructions
+# rather than installed. hfsprogs is not in a default Ubuntu image and pulling in
+# root to add it is more friction than extracting it.
+/tools/hfsprogs/
 /amss.elf
 /dsp1.elf
 # root-only, so it cannot swallow a source file like ImagesActivity.java
