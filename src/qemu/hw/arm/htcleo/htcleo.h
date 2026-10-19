@@ -19,6 +19,18 @@
 #define HTCLEO_RAM_BASE         0x00000000
 #define HTCLEO_RAM_SIZE         0x40000000      /* SMI + EBI1 + PMEM pools */
 
+/*
+ * Where the boot ROM leaves the HSPL: the APPSBL window at physical 0.  The
+ * HSPL maps VA 0x95000000 onto this address itself before it runs any code
+ * (section map entry "0x95000000 -> 0x00000000, 1 MB").
+ */
+#define HTCLEO_HSPL_PHYS        0x00000000
+/*
+ * The secure cached alias of the APPSBL window the boot ROM leaves mapped
+ * when it hands over: the HSPL executes at VA 0x95000000, out of physical 0.
+ */
+#define HTCLEO_HSPL_ALIAS_VA    0x95000000
+
 #define MSM_SHARED_RAM_PHYS     0x00100000      /* SMEM, 1 MiB */
 #define MSM_SHARED_RAM_SIZE     0x00100000
 

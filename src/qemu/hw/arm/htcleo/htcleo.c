@@ -39,6 +39,7 @@
 #include "hw/core/loader.h"
 #include "system/address-spaces.h"
 #include "system/physmem.h"
+#include "exec/cputlb.h"
 #include "system/system.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -117,6 +118,10 @@ struct HtcleoMachineState {
     DeviceState *lle;
     gchar *fw_data;             /* -bios image, copied to RAM on reset */
     gsize fw_len;
+    char *spl_path;             /* -M spl=<file>: run the real HSPL */
+    uint8_t *hspl;              /* the unwrapped HSPL image */
+    gsize hspl_len;
+    bool hspl_run;              /* the HSPL is booting (no QEMU hand-off) */
 
     /* RAM console tap */
     Chardev *ramcon_chr;
@@ -139,17 +144,20 @@ static void scorpion_add_cpregs(ARMCPU *cpu)
      * arch-init-scorpion.S.  All read as zero and ignore writes.
      */
     static const ARMCPRegInfo regs[] = {
-        { .name = "SCORPION_C9_0", .cp = 15, .crn = 9, .crm = 0,
-          .opc1 = CP_ANY, .opc2 = 6, .access = PL1_RW,
-          .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
-        { .name = "SCORPION_C9_1", .cp = 15, .crn = 9, .crm = 1,
-          .opc1 = CP_ANY, .opc2 = CP_ANY, .access = PL1_RW,
-          .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
-        { .name = "SCORPION_C9_7", .cp = 15, .crn = 9, .crm = 7,
-          .opc1 = 0, .opc2 = 0, .access = PL1_RW,
-          .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
         { .name = "SCORPION_C11", .cp = 15, .crn = 11, .crm = CP_ANY,
           .opc1 = CP_ANY, .opc2 = CP_ANY, .access = PL1_RW,
+          .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
+        /*
+         * DACR (c3).  From ARMv6 the access permissions live in the L1
+         * descriptor and DACR is RAZ/WI: every domain is a client.  The HSPL
+         * still zeroes it while it is setting the MMU up
+         * (hspl.bin 0x9500117c, right before it installs VBAR), and on a
+         * Scorpion that write goes nowhere; in a model that honours DACR it
+         * takes effect at once, denies every domain and the very next
+         * instruction fetch aborts, so the board never gets off the ground.
+         */
+        { .name = "SCORPION_DACR", .cp = 15, .crn = 3, .crm = 0,
+          .opc1 = 0, .opc2 = 0, .access = PL1_RW,
           .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
         { .name = "SCORPION_DBGPRSR", .cp = 14, .crn = 1, .crm = 5,
           .opc1 = 0, .opc2 = 4, .access = PL1_RW,
@@ -157,6 +165,29 @@ static void scorpion_add_cpregs(ARMCPU *cpu)
     };
     for (size_t i = 0; i < ARRAY_SIZE(regs); i++) {
         define_one_arm_cp_reg(cpu, &regs[i]);
+    }
+    /*
+     * The whole of CP15 c9 is implementation-defined (ARMv7 moved every
+     * architectural cache operation to c7), and on Scorpion Qualcomm filled
+     * it with its cache and DMA controls.  The HSPL walks all of it while
+     * it brings the caches up, and an unassigned encoding there is an
+     * undefined-instruction exception, which it has no vector for: it takes
+     * the one at 0x4, runs into the zeros next to its own code and dies.
+     * So claim all of c9, which is what a real Scorpion would answer.
+     *
+     * c9 is opc1 0 with CRm selecting the control, so CRn stays 9.  Varying
+     * CRn here instead would shadow c0..c15 - c1, the SCTLR, among them -
+     * with a constant zero, and the HSPL's MMU-off trampoline
+     * (mrc/mcr p15,0,r1,c1,c0,0) would read zero and the write be dropped.
+     */
+    for (int crm = 0; crm < 16; crm++) {
+        ARMCPRegInfo c9 = {
+            .name = g_strdup_printf("SCORPION_C9_%d", crm), .cp = 15,
+            .crn = 9, .crm = crm, .opc1 = CP_ANY, .opc2 = CP_ANY,
+            .access = PL1_RW, .type = ARM_CP_CONST | ARM_CP_OVERRIDE,
+            .resetvalue = 0,
+        };
+        define_one_arm_cp_reg(cpu, &c9);
     }
     /*
      * ETM (cp14, opc1 1): MAGLDR's entry code writes c1/c0/4 and reads
@@ -440,11 +471,177 @@ static void htcleo_ramcon_poll(void *opaque)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20 * SCALE_MS);
 }
 
+#define NAND_PAGE_RAW        2112
+#define NAND_PAGES_PER_BLOCK 64
+#define HTCLEO_SPL_BLOCK    0x20a  /* HSPL, one 2K sector per page */
+
+static bool nand_read_page_data(BlockBackend *blk, uint32_t page,
+                               uint8_t *out);
+
+/* ------------------------------------------------------------------ */
+/* HSPL, the HTC secure bootloader                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A phone starts at the boot ROM, which loads the HSPL out of NAND into the
+ * APPSBL window at physical 0 and jumps to it.  The ROM is masked ROM we do
+ * not have, so this machine takes the HSPL straight from a file and drops it
+ * where the ROM would (spl=<file>).  The HSPL then does what it does on the
+ * phone: bring the clocks up, identify the NAND, build its bad block table,
+ * read the panel and the EEPROM over I2C, DMOV the OS image from NAND into
+ * RAM and jump to it.  Nothing of that is faked any more.
+ *
+ * The HSPL is entered at physical 0 with the MMU off.  It reads the NAND,
+ * builds its own page tables from the section map at 0x950012f8 (VA
+ * 0x95000000 -> PA 0x0, 1 MB, among the rest), installs them as TTBR0, turns
+ * the MMU on and carries on - all without help from us.
+ *
+ * spl=nand takes the HSPL out of the NAND instead of a file, so the whole
+ * chain comes from the NAND image; hd2_mknand.py --spl flashes it at block
+ * 0x20a, one 2048-byte sector per page, which is where the boot ROM looks.
+ */
+
+#define HSPL_R000FF_MARK   "\x00\x01\x00\x80\x00\x00\x00\x01"
+#define HSPL_R000FF_HDR    0x20            /* header, ends with the marker */
+#define HSPL_R000FF_BLOCK  0x10000         /* payload block */
+#define HSPL_R000FF_SIG    0x80            /* signature blob at each seam */
+#define HSPL_R000FF_SEAM   (HSPL_R000FF_SIG + 1 + 8)
+
+/*
+ * HTC ships its bootloaders wrapped in an "R000FF" container: the 0x20-byte
+ * header, then the payload in 64 KiB blocks.  Every seam between blocks is
+ * marked by a 0x89-byte signature blob (128 bytes of signature, one length
+ * byte, and the same 8-byte marker the header ends with).  Strip it and the
+ * flat image is what the boot ROM copies to physical 0.
+ *
+ * Returns a g_malloc'd copy of the payload, or NULL if this is not a wrapped
+ * image (a plain dump of the running phone's memory, for instance).
+ */
+static uint8_t *htcleo_hspl_unwrap(const uint8_t *img, size_t len,
+                                   size_t *out_len)
+{
+    gsize pos, plain_len = 0;
+    uint8_t *out;
+    int seams = 0;
+
+    if (len < HSPL_R000FF_HDR ||
+        memcmp(img + 0x18, HSPL_R000FF_MARK, 8) != 0) {
+        return NULL;
+    }
+
+    for (pos = HSPL_R000FF_HDR; pos < len; pos += HSPL_R000FF_BLOCK) {
+        plain_len += MIN(HSPL_R000FF_BLOCK, len - pos);
+        if (pos + HSPL_R000FF_BLOCK + HSPL_R000FF_SEAM >= len ||
+            memcmp(img + pos + HSPL_R000FF_BLOCK + HSPL_R000FF_SIG + 1,
+                   HSPL_R000FF_MARK, 8) != 0) {
+            break;                          /* last block: no seam follows */
+        }
+        seams++;
+        pos += HSPL_R000FF_SEAM;
+    }
+
+    out = g_malloc(plain_len);
+    for (gsize src = HSPL_R000FF_HDR, dst = 0; dst < plain_len; ) {
+        gsize n = MIN(HSPL_R000FF_BLOCK, plain_len - dst);
+
+        memcpy(out + dst, img + src, n);
+        src += n;
+        dst += n;
+        pos += HSPL_R000FF_SEAM;
+    }
+    info_report("htcleo: HSPL: unwrapped R000FF image (%d signature blobs, "
+                "%zu bytes)", seams, plain_len);
+    *out_len = plain_len;
+    return out;
+}
+
+static bool htcleo_load_hspl(HtcleoMachineState *s)
+{
+    gchar *raw = NULL;
+    gsize raw_len = 0;
+    GError *err = NULL;
+
+    if (!s->spl_path) {
+        return false;
+    }
+    if (!g_file_get_contents(s->spl_path, &raw, &raw_len, &err)) {
+        error_report("htcleo: cannot read the HSPL image '%s': %s",
+                     s->spl_path, err->message);
+        g_error_free(err);
+        exit(1);
+    }
+    s->hspl = htcleo_hspl_unwrap((const uint8_t *)raw, raw_len, &s->hspl_len);
+    if (!s->hspl) {
+        s->hspl = (uint8_t *)raw;            /* already a flat image */
+        s->hspl_len = raw_len;
+        raw = NULL;
+    }
+    g_free(raw);
+    info_report("htcleo: HSPL: %zu bytes at physical 0x%x", s->hspl_len,
+                HTCLEO_HSPL_PHYS);
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* SPL hand-off                                                        */
 /* ------------------------------------------------------------------ */
 
-#define NAND_PAGE_RAW   2112
+/*
+ * Read the HSPL the way the boot ROM does: out of the NAND, one 2048-byte
+ * sector per page, from HTCLEO_SPL_BLOCK up to the first erased one.  This
+ * is what a flashed phone has -- hd2_mknand.py --spl puts it there -- so with
+ * spl=nand the whole chain, PBL included, comes out of the NAND image rather
+ * than a side-car file.  Returns false when nothing is flashed there.
+ */
+static bool htcleo_load_hspl_from_nand(HtcleoMachineState *s, BlockBackend *blk)
+{
+    gsize len = 0;
+    uint32_t base = HTCLEO_SPL_BLOCK * NAND_PAGES_PER_BLOCK;
+    uint8_t *img;
+
+    if (!blk) {
+        return false;
+    }
+    for (uint32_t i = 0; i < 1024; i++) {   /* up to 2 MiB of HSPL */
+        uint8_t page[2048];
+        bool erased = true;
+
+        if (!nand_read_page_data(blk, base + i, page)) {
+            break;
+        }
+        for (int b = 0; b < 2048; b++) {
+            if (page[b] != 0xff) {         /* end of the flashed image */
+                erased = false;
+                break;
+            }
+        }
+        if (erased) {
+            break;
+        }
+        len += 2048;
+    }
+    if (len < 4) {
+        return false;
+    }
+    img = g_malloc(len);
+    for (uint32_t i = 0; i < len / 2048; i++) {
+        if (!nand_read_page_data(blk, base + i, img + i * 2048)) {
+            g_free(img);
+            return false;
+        }
+    }
+    s->hspl = htcleo_hspl_unwrap(img, len, &s->hspl_len);
+    if (!s->hspl) {
+        s->hspl = img;                      /* already a flat image */
+        s->hspl_len = len;
+    }
+    info_report("htcleo: HSPL: %zu bytes from NAND block 0x%x -> "
+                "physical 0x%x", s->hspl_len, HTCLEO_SPL_BLOCK,
+                HTCLEO_HSPL_PHYS);
+    return true;
+}
+
+
 #define NAND_ROM_BLOCK  0x212
 
 /* Logical (ECC-mode) data of one NAND page, as cLK/Linux read it */
@@ -556,6 +753,207 @@ static void htcleo_sd_detect(void *opaque, int n, int level)
     }
 }
 
+/*
+ * Hand the CPU to the HSPL.  This is what the boot ROM does, and it is more
+ * than "drop the image at 0 and jump": the ROM leaves the core running with
+ * the MMU on, with the secure alias of the APPSBL window mapped so the HSPL
+ * executes at VA 0x95000000 out of physical 0.  The HSPL needs that, because
+ * its very first act after the reset stub is to read one of its own literals
+ * through VA 0x9501df3c (the address it jumps to once it has rebuilt the
+ * page tables for real), before it enables the MMU itself.
+ *
+ * The map below is the one the ROM would leave: RAM identity-mapped for the
+ * low window the HSPL keeps its globals and stack in (PA 0x80000, sp 0xff000),
+ * plus the 4 MB secure alias at 0x95000000 that the HSPL itself later maps as
+ * a 1 MB section on physical 0.  The HSPL then replaces all of it.
+ */
+/* 16 KiB aligned: TTBR0's low 14 bits are RES0 and get masked off */
+#define HSPL_PBL_TTBR  0x002e8000           /* below the HSPL's own tables */
+#define HTCLEO_MSC_ALIAS_PA 0x3a000000     /* RAM for the modem alias */
+#define HSPL_GLOBALS_L2 0x00000400         /* where the HSPL expects its
+                                         * coarse table for 0xb5080000 */
+#define HSPL_GLOBALS_VA 0xb5080000          /* the boot ROM's globals window */
+#define HSPL_GLOBALS_PA 0x00080000
+#define HSPL_GLOBALS_PAGES 256              /* 256 pages: the whole 1 MB */
+
+/*
+ * The map the boot ROM leaves behind, and the one the HSPL itself builds when
+ * it gets that far: its section table, the records at 0x950012f8 in the
+ * image -- virtual, physical, size in MB, terminated by a zero record.  Rather
+ * than hard-code the eight-odd RAM windows and the forty-odd peripheral
+ * windows it lists, read them back out of the image and write each one as a
+ * 4 MB short-format section descriptor, which is what its own page table
+ * builder (hspl.c, 0x9501dd2c) does with the very same records.
+ *
+ * The PMEM window is the one that catches people out: the HSPL's stack top is
+ * the constant 0x97a35ffc (hspl.c, 0x9505e60c), 10.7 MB into that window, so
+ * it lands on physical 0x2f35ffc.  Map that window identity and VA
+ * 0x97a35ffc falls past the end of RAM, where the writes are quietly dropped
+ * and the stack reads back as zeroes.
+ */
+#define HSPL_SECTIONS   0x12f8               /* the table, inside the image */
+
+#define HSPL_SECTION_LEN 12                  /* three little-endian words */
+
+static void htcleo_hspl_boot(HtcleoMachineState *s, CPUARMState *env)
+{
+    uint32_t *l1 = g_new0(uint32_t, 4096);
+    uint32_t sec, off;
+
+    if (s->hspl_len > HTCLEO_RAM_SIZE) {
+        error_report("htcleo: HSPL image is %zu bytes, larger than RAM",
+                     s->hspl_len);
+        exit(1);
+    }
+
+    physical_memory_write(HTCLEO_HSPL_PHYS, s->hspl, s->hspl_len);
+
+    /*
+     * The low RAM window, identity: the HSPL's stack pointer, its own
+     * globals and the vectors it installs all sit below 4 MB, long before it
+     * reaches the section table.
+     */
+    for (sec = 0; sec < 0x100; sec++) {
+        l1[sec] = cpu_to_le32((sec << 20) | 0xC02);
+    }
+    /*
+     * The peripheral windows at their own addresses: the HSPL reads the
+     * hardware out of its discovery table (TCSR at 0xa8700000, I2C at
+     * 0xa9900000, ...) through the MMU before it installs its own window.
+     */
+    for (sec = 0xa00; sec < 0xb00; sec++) {
+        l1[sec] = cpu_to_le32((sec << 20) | 0xC02);
+    }
+
+    for (off = HSPL_SECTIONS; off + HSPL_SECTION_LEN <= s->hspl_len;
+         off += HSPL_SECTION_LEN) {
+        uint32_t va = ldl_le_p(s->hspl + off);
+        uint32_t pa = ldl_le_p(s->hspl + off + 4);
+        uint32_t mb = ldl_le_p(s->hspl + off + 8);
+
+        if (!va && !pa && !mb) {
+            break;                              /* the terminator */
+        }
+        if (!mb || ((va >> 20) + mb) >= 4096) {
+            continue;                           /* not one of ours */
+        }
+        for (sec = 0; sec < mb; sec++) {
+            /*
+             * Short-format section descriptor: bits[1:0] = 0b10 says
+             * "section", bits[11:10] = 0b11 gives full access, domain 0.
+             * Without the 0b10 the walk faults at the first fetch.
+             */
+            l1[(va >> 20) + sec] =
+                cpu_to_le32((pa & 0xfff00000) + sec * 0x100000 | 0xC02);
+        }
+    }
+    /*
+     * The window the HSPL ends up running from: VA 0x95000000 -> physical 0.
+     * It builds this entry itself (hspl.bin 0x9501deb0) once it turns the MMU
+     * on; it is here too so that the table describes the same machine the HSPL
+     * builds one instruction later.
+     */
+    l1[HTCLEO_HSPL_ALIAS_VA >> 20] = cpu_to_le32(HTCLEO_HSPL_PHYS | 0xC02);
+
+    /*
+     * The globals window, VA 0xb5080000, which lands on the board's globals
+     * at PA 0x80000: the HSPL reads and writes the board ID and the panel
+     * type there, and every reference it makes carries the same +0x1030
+     * offset the Linux board file reads them back from
+     * (board-htcleo-panel.c).
+     *
+     * Put it exactly where the HSPL's own page table builder expects it: it
+     * installs L1[b50] = 0x402, a coarse table based at PA 0x400 (hspl.c,
+     * FUN_9501dd2c), and then leaves the entries alone, because on the phone
+     * the boot ROM had already filled them in.  Writing them there means our
+     * table and the HSPL's own walk the very same descriptors.
+     *
+     * Only the two 4 KB pages the HSPL actually names are filled: PA 0x400
+     * is the HSPL image's own zero padding, and 0x1000 onwards is its code.
+     */
+    {
+        static const uint32_t pages[] = { 0xb5081000, 0xb5082000 };
+
+        for (size_t n = 0; n < ARRAY_SIZE(pages); n++) {
+            uint32_t pa = HSPL_GLOBALS_PA + (pages[n] - HSPL_GLOBALS_VA);
+            uint32_t desc = cpu_to_le32((pa & 0xfffff000) | 0xC02);
+
+            physical_memory_write(HSPL_GLOBALS_L2 +
+                                  (((pages[n] >> 12) & 0x3ff) * 4),
+                                  &desc, sizeof(desc));
+        }
+        l1[HSPL_GLOBALS_VA >> 20] = cpu_to_le32(HSPL_GLOBALS_L2 | 0x402);
+    }
+
+    /*
+     * The RAM alias, VA 0xa0000000..0xbfffffff: a second copy of the whole
+     * 0x80000000..0x9fffffff window, one bit of the L1 index apart.  hspl.c's
+     * page table builder walks the section list twice for it (FUN_9501dd2c,
+     * the do/while that runs puVar5 from puVar1 + 0x800 to puVar1 + 0xa00),
+     * and the table it builds at 0x2ec0000 shows the result: L1[a00 + n] is
+     * L1[800 + n] with the access bits changed from 0x40e to 0x402.
+     *
+     * It matters, because the HSPL addresses its own data through the alias.
+     * The DMOV descriptor list it builds for its first NAND transfer lives at
+     * VA 0xbc1fe38, which the alias puts at physical 0x2e1fe38 -- and that is
+     * exactly the pointer it then hands to the ADM in CMD_PTR.  Map it to
+     * anything else and the descriptor is written to one place and read from
+     * another, so the data mover sees an empty list and reports the transfer
+     * as failed, over and over.
+     */
+    for (sec = 0x800; sec < 0xa00; sec++) {
+        if (l1[sec]) {
+            l1[sec + 0x200] = cpu_to_le32(ldl_le_p((uint8_t *)l1 + sec * 4) |
+                                          0x4000);
+        }
+    }
+
+    physical_memory_write(HSPL_PBL_TTBR, l1, 4096 * sizeof(uint32_t));
+    g_free(l1);
+
+    /*
+     * SVC mode, IRQ/FIQ masked, and - the part that matters - entered at
+     * *physical* 0 with the MMU off, which is what the boot ROM does.
+     *
+     * The HSPL rebuilds the tables at 0x2ec0000 itself and, at
+     * hspl.bin 0x9501deb0, installs its own window with
+     *
+     *     mov r1, pc ; lsr r1,#20 ; lsl r1,#20 ; orr r1,r1,#0x40e
+     *     str r1, [l1 + ((r1>>18) & ~0xfff)]
+     *
+     * i.e. L1[the MB its own PC is in] = that MB | 0x40e.  It only comes
+     * out right if the core is executing at physical 0 when it does that,
+     * which makes the HSPL reachable at both VA 0x00000000 and
+     * VA 0x95000000 (the latter is its own section-table entry) and leaves
+     * VA 0x1e200 - the form FUN_9505e5ec() produces by adding 0x6b000000 to
+     * a code address - pointing at the same instructions.  Enter it at
+     * VA 0x95000000 with the MMU on, as this used to, and that instruction
+     * stores L1[0x950] = 0x9500040e: the HSPL maps itself onto physical
+     * 0x95000000, which is not RAM, and the very next branch walks into
+     * zeroes.
+     */
+    env->regs[15] = HTCLEO_HSPL_PHYS;
+    env->thumb = false;
+    env->cp15.cpacr_el1 &= ~0xF00000;
+
+    env->cp15.ttbr0_el[1] = HSPL_PBL_TTBR;
+    env->cp15.ttbr1_el[1] = 0;
+    env->cp15.tcr_el[1] = 0;               /* 4 KB pages, one translation reg */
+    env->cp15.sctlr_el[1] &= ~(SCTLR_M | 0x3FFFFF);
+    env->cp15.sctlr_el[1] |= SCTLR_C;     /* caches on, MMU off            */
+    /* every domain a client; from ARMv6 the DACR is RAZ/WI anyway */
+    env->cp15.dacr_ns = 0x55555555;
+    env->cp15.vbar_ns = 0;
+    arm_rebuild_hflags(env);
+
+    /*
+     * The TLB and the translated blocks still hold the state the core came
+     * out of reset in (no MMU), so they have to go before the first fetch
+     * at 0x95000000 goes through the table we just built.
+     */
+    tlb_flush(CPU(s->cpu));
+}
+
 static void htcleo_reset(MachineState *machine, ResetType type)
 {
     HtcleoMachineState *s = HTCLEO_MACHINE(machine);
@@ -593,6 +991,32 @@ static void htcleo_reset(MachineState *machine, ResetType type)
         msm_modem_boot(MSM_MODEM(s->modem));
     }
     htcleo_set_vbus(s, true);
+
+    if (s->spl_path && !strcmp(s->spl_path, "nand")) {
+        /* spl=nand: the boot ROM reads the HSPL out of the NAND */
+        g_free(s->hspl);
+        s->hspl = NULL;
+        s->hspl_len = 0;
+        s->hspl_run = htcleo_load_hspl_from_nand(s, blk);
+        if (!s->hspl_run) {
+            error_report("htcleo: spl=nand but no HSPL is flashed at NAND "
+                         "block 0x%x", HTCLEO_SPL_BLOCK);
+            exit(1);
+        }
+    }
+
+    if (s->hspl_run) {
+        /*
+         * spl=<file>|nand: the real HSPL boots.  It gets the SoC exactly as
+         * the boot ROM leaves it and does the rest itself -- clocks, NAND
+         * identify and bad block table, panel and EEPROM over I2C, and the
+         * DMOV of the OS image out of NAND into RAM, which it ends by
+         * jumping to.  None of the hand-off below is needed, so it does not
+         * run.
+         */
+        htcleo_hspl_boot(s, env);
+        goto done;
+    }
 
     if (s->fw_data) {
         physical_memory_write(HTCLEO_KERNEL_BASE, s->fw_data, s->fw_len);
@@ -642,6 +1066,7 @@ static void htcleo_reset(MachineState *machine, ResetType type)
     env->regs[15] = entry;
     env->thumb = false;
 
+ done:
     s->ramcon_valid = false;
     s->ramcon_pos = 0;
 }
@@ -800,6 +1225,20 @@ static void htcleo_init(MachineState *machine)
                          machine->firmware, err->message);
             exit(1);
         }
+    }
+
+    /*
+     * spl=<file>|nand: run the phone's own HSPL rather than handing off
+     * ourselves.  "nand" means the boot ROM pulls it out of the NAND, which
+     * only the reset handler can do (it needs the drive), so it is left for
+     * there; any other value is a file we can read now.
+     */
+    s->hspl_run = s->spl_path && strcmp(s->spl_path, "nand")
+                  ? htcleo_load_hspl(s) : (s->spl_path != NULL);
+    if (s->hspl_run && s->fw_data) {
+        error_report("htcleo: spl= and -bios are both given; the HSPL loads "
+                     "the OS image from NAND itself");
+        exit(1);
     }
 
     /* CPU: the apps core (Scorpion), cluster 0 */
@@ -1217,6 +1656,16 @@ static void htcleo_init(MachineState *machine)
         dev = DEVICE(i2c_slave_create_simple(bus, TYPE_HTCLEO_AKM, 0x1C));
         qdev_connect_gpio_out_named(dev, "irq", 0,
                                     qemu_allocate_irq(htcleo_akm_irq, s, 0));
+        if (s->hspl_run) {
+            /*
+             * Two more chips the HSPL talks to while it brings the panel up
+             * and reads the boot configuration, which Linux never probes:
+             * without them the controller NAKs the address and the HSPL sits
+             * in its retry loop instead of loading the OS.
+             */
+            htcleo_regdev_create(bus, 0x34, NULL, 0);
+            htcleo_regdev_create(bus, 0x5C, NULL, 0);
+        }
     }
 
     /* Buttons and touchscreen */
@@ -1304,6 +1753,19 @@ static void htcleo_set_modem(Object *obj, const char *v, Error **errp)
 static char *htcleo_get_modem_fw(Object *obj, Error **errp)
 {
     return g_strdup(HTCLEO_MACHINE(obj)->modem_fw);
+}
+
+static char *htcleo_get_spl(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_MACHINE(obj)->spl_path);
+}
+
+static void htcleo_set_spl(Object *obj, const char *v, Error **errp)
+{
+    HtcleoMachineState *s = HTCLEO_MACHINE(obj);
+
+    g_free(s->spl_path);
+    s->spl_path = g_strdup(v);
 }
 
 static void htcleo_set_modem_fw(Object *obj, const char *v, Error **errp)
@@ -1438,6 +1900,15 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
                                   htcleo_set_modem_fw);
     object_class_property_set_description(oc, "baseband-firmware",
         "AMSS ELF for baseband=lle (tools/hd2_radio.py extracts it)");
+    object_class_property_add_str(oc, "spl", htcleo_get_spl, htcleo_set_spl);
+    object_class_property_set_description(oc, "spl",
+        "the HTC HSPL bootloader to run in lle mode instead of this machine "
+        "doing the SPL's last act itself: it is copied to physical 0 (where "
+        "the boot ROM puts it) and booted, and it brings up the clocks, "
+        "identifies the NAND, reads the panel over I2C and DMOVs the OS "
+        "image from NAND before jumping to it.  R000FF-wrapped images are "
+        "unwrapped; a raw dump works too.  Without it the machine keeps "
+        "loading the OS image from NAND itself");
     object_class_property_add_bool(oc, "baseband-trace", htcleo_get_modem_trace,
                                    htcleo_set_modem_trace);
     object_class_property_set_description(oc, "baseband-trace",
