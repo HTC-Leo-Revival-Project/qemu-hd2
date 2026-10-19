@@ -836,7 +836,17 @@ static void htcleo_hspl_boot(HtcleoMachineState *s, CPUARMState *env)
         if (!va && !pa && !mb) {
             break;                              /* the terminator */
         }
-        if (!mb || ((va >> 20) + mb) >= 4096) {
+        /*
+         * The bound is computed in 64 bits on purpose.  In 32-bit arithmetic
+         * it wraps: a descriptor whose va sits in the top megabyte and whose
+         * size is 0xffffffff sums to a small number, passes this test, and
+         * then the loop below writes l1[] straight off the end of a 4096-entry
+         * table.  Only an image that is not really a wrapped HSPL ever gets
+         * this far - a section list that is not a section list at all - but it
+         * has to not take the machine down with it, so the test is widened
+         * rather than the image trusted.
+         */
+        if (!mb || ((uint64_t)(va >> 20) + mb) >= 4096) {
             continue;                           /* not one of ours */
         }
         for (sec = 0; sec < mb; sec++) {
