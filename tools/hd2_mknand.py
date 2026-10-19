@@ -41,6 +41,7 @@ RAW_PAGE = 2112
 PPB = 64                    # pages per block
 NBLOCKS = 4096
 ROM_BLOCK = 0x212           # HTCLEO_ROM_OFFSET
+SPL_BLOCK = 0x20a           # HTCLEO_SPL_BLOCK: the HSPL itself
 BLK = PAGE * PPB            # 128 KiB
 
 
@@ -115,6 +116,41 @@ def nbh_unsign(d):
             break
         out += d[off + 9:off + 9 + ln]
         off += 9 + ln + sl
+    return bytes(out)
+
+
+# ---------------------------------------------------------------- HSPL container
+R000FF_MARK = b"\x00\x01\x00\x80\x00\x00\x00\x01"
+R000FF_HDR = 0x20
+R000FF_BLOCK = 0x10000
+R000FF_SIG = 0x80
+R000FF_SEAM = R000FF_SIG + 1 + 8
+
+
+def unwrap_r000ff(d):
+    """Strip the R000FF container HTC wraps its bootloaders in.
+
+    A 0x20-byte header, then the payload in 64 KiB blocks.  Every seam
+    between blocks is a 0x89-byte signature blob: 128 bytes of signature, one
+    length byte and the 8-byte marker the header ends with.  What is left is
+    the flat image the boot ROM copies to physical 0.
+    """
+    if len(d) < R000FF_HDR or d[0x18:0x20] != R000FF_MARK:
+        return d
+    out, pos, plain = bytearray(), R000FF_HDR, 0
+    while pos < len(d):
+        plain += min(R000FF_BLOCK, len(d) - pos)
+        if (pos + R000FF_BLOCK + R000FF_SEAM >= len(d) or
+                d[pos + R000FF_BLOCK + R000FF_SIG + 1:
+                  pos + R000FF_BLOCK + R000FF_SIG + 9] != R000FF_MARK):
+            break
+        pos += R000FF_SEAM
+    dst = 0
+    while dst < plain:
+        n = min(R000FF_BLOCK, plain - dst)
+        out += d[pos:pos + n]
+        pos += n
+        dst += n
     return bytes(out)
 
 
@@ -464,6 +500,9 @@ def install_rom(z, system, data, softkeys=True, gpu=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument('--spl', help='HSPL bootloader image (hspl.bin), flashed '
+                                   'at block 0x%x so -M htcleo,spl=nand can '
+                                   'boot it out of the NAND (optional)' % SPL_BLOCK)
     ap.add_argument('--nbh', help='cLK LEOIMG.nbh (official image)')
     ap.add_argument('--lk', help='raw cLK lk.bin instead of an NBH')
     ap.add_argument('--rom', required=True, help='NAND ROM zip')
@@ -473,6 +512,10 @@ def main():
                     help='replace the ROM boot cmdline, e.g. to put the '
                          'console on the emulator UART')
     ap.add_argument('--recovery', help='recovery boot image (optional)')
+    ap.add_argument('--iboot',
+                    help='iBoot Mach-O (.sys or .bin) for the iboot '
+                         'partition; cLK boots it in preference to the '
+                         'boot.img kernel (optional)')
     ap.add_argument('--system-mb', type=int, default=220)
     ap.add_argument('--cache-mb', type=int, default=30)
     ap.add_argument('--no-softkeys', action='store_true')
@@ -505,6 +548,16 @@ def main():
 
     nand = Nand(a.output)
     write_factory_macs(nand, parse_mac(a.wifi_mac), parse_mac(a.bt_mac))
+
+    # 0. HSPL: one 2048-byte sector per page, the layout the boot ROM reads
+    if a.spl:
+        spl = open(a.spl, 'rb').read()
+        spl = unwrap_r000ff(spl)
+        secs = [spl[i:i + PAGE].ljust(PAGE, b'\xff')
+                for i in range(0, len(spl), PAGE)]
+        for i, sec in enumerate(secs):
+            nand.write_page(SPL_BLOCK * PPB + i, sec)
+        print('HSPL: %d bytes (%d sectors) at block 0x%x' % (len(spl), len(secs), SPL_BLOCK))
 
     # 1. OS area (what HSPL flashes)
     for i, s in enumerate(secs):
@@ -570,6 +623,29 @@ def main():
         for i in range(0, len(rec), PAGE):
             nand.write_page(r0 * PPB + i // PAGE, rec[i:i + PAGE])
         print('recovery: %d bytes' % len(rec))
+
+    # 3b. iBoot, as a raw Mach-O into the `iboot` partition.
+    #
+    # No boot.img wrapper: cLK's new macho.c reads the Mach-O header directly,
+    # so the file is stored exactly as the linker produced it. .sys (unstripped)
+    # is the more useful one to flash -- it keeps the symbol table, which is the
+    # difference between a backtrace and a bare address after a crash.
+    if a.iboot:
+        mach = open(a.iboot, 'rb').read()
+        if mach[:4] not in (b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe'):
+            raise SystemExit('--iboot: %s is not a little-endian Mach-O '
+                             '(magic %r)' % (a.iboot, mach[:4]))
+        i0, isize = layout['iboot']
+        if len(mach) > isize * BLK:
+            raise SystemExit('iBoot too large for the iboot partition')
+        for i in range(0, len(mach), PAGE):
+            nand.write_page(i0 * PPB + i // PAGE, mach[i:i + PAGE])
+        # Erase the tail. NAND reads whole pages, so the loader's rounded-up
+        # final read would otherwise pick up whatever was there before.
+        for i in range(len(mach) // PAGE, isize * BLK // PAGE):
+            nand.write_page(i0 * PPB + i, b'\xff' * PAGE)
+        print('iboot: %d bytes Mach-O (magic %s)'
+              % (len(mach), mach[:4].hex()))
 
     # 4. yaffs2 system and userdata
     system, data = Tree(), Tree()
