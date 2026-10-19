@@ -72,7 +72,10 @@ python3 ../tools/hd2_mknand.py --nbh LEOIMG.nbh --rom rom.zip -o nand.img   # or
 ../tools/mksdcard.sh sdcard.img 1024                                        # optional microSD (FAT32)
 ```
 
-`LEOIMG.nbh` is the cLK bootloader (`--lk` takes the raw `lk.bin` instead).
+`LEOIMG.nbh` is the cLK bootloader (`--lk` takes the raw `lk.bin` instead);
+`--spl hspl.bin` additionally flashes the HSPL, the phone's own bootloader, so
+that `SPL=nand tools/start.sh` can boot the real thing (see
+[HSPL](#hspl-the-phones-own-bootloader) below).
 `hd2_mknand.py` lays the NAND out as a flashed phone would have it: the
 bootloader in the OS area, the partition table, the ROM installed (`boot.img`,
 which it builds itself from `kernel/zImage` + `kernel/boot_NAND/initrd.gz`, and
@@ -83,6 +86,50 @@ to be a **NAND** ROM — one with `kernel/`, `system/`, `data/` and
 - `--system-mb`, `--cache-mb` set the partition sizes;
 - `--wifi-mac`, `--bt-mac` set the MACs (`tools/hd2_setmac.py` changes them in an existing image);
 - `--gpu` renders with the emulated Adreno GPU instead of in software (see [GPU](#gpu-adreno-200)).
+
+<a name="hspl"></a>
+<h2><img src="docs/holo/h-run.png" width="76" height="40" alt="HSPL"></h2>
+
+By default QEMU does what the HSPL would do - read the cLK OS area out of the
+NAND, drop it at 0x11800000, seed a few board globals and jump - which is enough
+for cLK but skips everything between the SoC coming out of reset and the OS
+starting. `SPL=nand` runs the real HSPL instead, so the whole chain is the
+phone's:
+
+```bash
+cd images
+python3 ../tools/hd2_mknand.py --spl hspl.bin --nbh LEOIMG.nbh --rom rom.zip -o nand.img
+cd .. && SPL=nand tools/start.sh
+```
+
+`spl=nand` makes the boot ROM read the HSPL out of the NAND (block 0x20a, one
+2048-byte sector per page, the layout `hd2_mknand.py --spl` writes and
+`tools/hd2_osarea.py` can refresh in an existing image); `spl=<file>` boots it
+from a loose image instead, unwrapping HTC's `R000FF` container on the way in.
+From there nothing is emulated on the bootloader's behalf: the HSPL brings the
+clocks up, identifies the NAND and builds its bad block table, reads the panel
+and the EEPROM over I2C, DMOVs the OS image out of the NAND into RAM, and jumps
+to physical 0x11800000 with the MMU off. cLK then relocates itself to its
+`MEMBASE` of 0x28000000 and runs as usual. The log on `uart1.log` is the HSPL's
+own, from `Scorpion Core eFuse Setting` through `IPLMSG:0x9:INFO: Jumping to
+image...` to `Jump to Physical Address 11800000`.
+
+Three things about the SoC have to be modelled for this to work, and all three
+are in `hw/arm/htcleo/htcleo.c`:
+
+- **the HSPL is entered at physical 0 with the MMU off**, the way the boot ROM
+  does. Once it has built its page tables it installs its own window with
+  `mov r1, pc ; lsr #20 ; lsl #20 ; orr #0x40e` (hspl.bin 0x9501deb0), which
+  only comes out right if the core was executing at physical 0 when it ran.
+  Enter it at VA 0x95000000 with the MMU on instead and the HSPL maps itself
+  onto physical 0x95000000, which is not RAM.
+- **CP15 c9 is implementation-defined**, so all of it (CRm 0..15, CRn 9) reads
+  as zero and swallows writes, as on a Scorpion. Varying CRn instead would
+  shadow c0..c15 - c1, the SCTLR, among them - and the HSPL's MMU-off
+  trampoline (`mcr p15,0,r1,c1,c0,0`) would silently do nothing.
+- **the DACR is RAZ/WI from ARMv6**, every domain a client. The HSPL still
+  zeroes it while it sets the MMU up (hspl.bin 0x9500117c); in a model that
+  honours it, the very next instruction fetch aborts.
 
 <a name="run"></a>
 <h2><img src="docs/holo/h-run.png" width="76" height="40" alt="Run"></h2>

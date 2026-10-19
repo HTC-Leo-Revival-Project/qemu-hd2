@@ -32,9 +32,12 @@ one set of tools talks to whichever launcher is running:
 | `mksdcard.sh` | Create a microSD image with one FAT32 partition, as Android's `vold` expects. `mksdcard.sh sdcard.img [MiB]`. |
 | `fat_put.py` | Copy files into a FAT32 image made by `mksdcard.sh`, without mounting it. Writes both an 8.3 name and a long-name entry, which is what HD2 kernels and MAGLDR look up. |
 | `yaffs_check.py` | Read files back out of a raw NAND image (ECC-mode view) and compare them with the ROM zip. Used to prove a built image matches its source. |
+| `hd2_osarea.py` | Rewrite the cLK OS area (block 0x212) of an existing NAND image from an `os.nb`/`LEOIMG.nbh`/`lk.bin`, the way `hd2_mknand.py` first lays it down. |
 | `mknand.py` | **Legacy duplicate** of `hd2_mknand.py` without the `--kernel`/`--cmdline` options. Unused; use `hd2_mknand.py`. |
 
-`hd2_mknand.py` options include `--nbh`/`--lk`, `--rom`, `--recovery`,
+`hd2_mknand.py` options include `--spl` (flash the HSPL at block 0x20a so
+`SPL=nand tools/start.sh` can boot it out of the NAND), `--nbh`/`--lk`,
+`--rom`, `--recovery`,
 `--system-mb`, `--cache-mb`, `--wifi-mac`, `--bt-mac`, `--gpu`, `--kernel`,
 `--cmdline`. The [README](../README.md#images) and
 [docs/android.md](android.md) walk through the common cases.
