@@ -109,6 +109,7 @@ struct HtcleoMachineState {
     bool modem_lle;             /* run AMSS on a modem core (baseband=lle) */
     char *modem_fw;
     bool modem_trace;
+    bool nand_trace;
     bool q6_lle;                /* the QDSP6 runs its firmware (qdsp6=lle) */
     char *q6_link_id;           /* chardev to the qemu-system-hexagon one */
     DeviceState *q6_link;
@@ -1472,6 +1473,9 @@ static void htcleo_init(MachineState *machine)
 
     /* NAND */
     s->nand = qdev_new(TYPE_MSM_NAND);
+    if (s->nand_trace) {
+        qdev_prop_set_bit(s->nand, "trace", true);
+    }
     dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
         qdev_prop_set_drive_err(s->nand, "drive", blk_by_legacy_dinfo(dinfo),
@@ -1789,6 +1793,16 @@ static bool htcleo_get_modem_trace(Object *obj, Error **errp)
     return HTCLEO_MACHINE(obj)->modem_trace;
 }
 
+static bool htcleo_get_nand_trace(Object *obj, Error **errp)
+{
+    return HTCLEO_MACHINE(obj)->nand_trace;
+}
+
+static void htcleo_set_nand_trace(Object *obj, bool v, Error **errp)
+{
+    HTCLEO_MACHINE(obj)->nand_trace = v;
+}
+
 static void htcleo_set_modem_trace(Object *obj, bool v, Error **errp)
 {
     HTCLEO_MACHINE(obj)->modem_trace = v;
@@ -1970,6 +1984,11 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
         "arrives far too late to affect it");
     object_class_property_add_bool(oc, "baseband-trace", htcleo_get_modem_trace,
                                    htcleo_set_modem_trace);
+    object_class_property_add_bool(oc, "nand-trace", htcleo_get_nand_trace,
+                                   htcleo_set_nand_trace);
+    object_class_property_set_description(oc, "nand-trace",
+        "log every NAND program and erase the guest issues, with the page "
+        "and the bytes: what is being written where, one line per codeword");
     object_class_property_set_description(oc, "baseband-trace",
         "log the modem core's peripheral accesses (baseband=lle)");
     mc->init = htcleo_init;

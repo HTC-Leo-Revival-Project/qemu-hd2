@@ -338,7 +338,16 @@ static void nand_exec(MsmNandState *s)
         s->op_remaining = 0;
         return;
     case CMD_BLOCK_ERASE:
-        s->op_page = reg(s, NAND_ADDR0) | (reg(s, NAND_ADDR1) << 16);
+        /*
+         * The same row address the read and program paths use: ADDR0 carries
+         * the column in bits 15:0 and the low 16 bits of the row in 31:16,
+         * ADDR1 the top 8.  Reading it the other way round - as the whole of
+         * ADDR0 - addresses a row sixteen times too large, which lands past
+         * the end of the part and silently erases nothing, so an erase looks
+         * like it worked and the block still reads back what it held.
+         */
+        s->op_page = (reg(s, NAND_ADDR0) >> 16) |
+                     ((reg(s, NAND_ADDR1) & 0xFF) << 16);
         nand_do_erase(s);
         s->regs[NAND_READ_STATUS >> 2] = 0xE0;
         s->op_remaining = 0;
