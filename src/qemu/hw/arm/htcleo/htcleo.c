@@ -119,6 +119,7 @@ struct HtcleoMachineState {
     gchar *fw_data;             /* -bios image, copied to RAM on reset */
     gsize fw_len;
     char *spl_path;             /* -M spl=<file>: run the real HSPL */
+    char *keys_held;            /* -M keys=...: held down from reset       */
     uint8_t *hspl;              /* the unwrapped HSPL image */
     gsize hspl_len;
     bool hspl_run;              /* the HSPL is booting (no QEMU hand-off) */
@@ -992,6 +993,13 @@ static void htcleo_reset(MachineState *machine, ResetType type)
     }
     htcleo_set_vbus(s, true);
 
+    /*
+     * The keys have to be on the matrix before anything runs: the HSPL reads
+     * it as one of its first acts after reset, and the running system's own
+     * input handler is not even installed yet.
+     */
+    htcleo_update_keys(s);
+
     if (s->spl_path && !strcmp(s->spl_path, "nand")) {
         /* spl=nand: the boot ROM reads the HSPL out of the NAND */
         g_free(s->hspl);
@@ -1855,6 +1863,49 @@ static void htcleo_instance_init(Object *obj)
     HTCLEO_MACHINE(obj)->cable = CABLE_USB;     /* the adb cable */
 }
 
+/*
+ * Keys already down when the machine comes up, named the same way tools/keys.py
+ * names them: volup, voldown, windows, call, endcall, back, home, power.
+ *
+ * This is for the bootloader's own key test.  The HSPL decides whether to be
+ * the bootloader by reading the matrix a moment after the boot ROM hands it
+ * the core, which is long before a key event sent from outside can arrive -
+ * so the only way to try that path is for the key to be down at reset.
+ */
+static void htcleo_set_keys(Object *obj, const char *value, Error **errp)
+{
+    HtcleoMachineState *s = HTCLEO_MACHINE(obj);
+    static const char *const names[HD2_NKEYS] = {
+        "volup", "voldown", "windows", "call", "endcall", "back", "home",
+        "power"
+    };
+    char *copy, *tok, *save = NULL;
+
+    g_free(s->keys_held);
+    s->keys_held = g_strdup(value);
+
+    memset(s->keys, 0, sizeof(s->keys));
+    if (!value || !*value) {
+        return;
+    }
+    copy = g_strdup(value);
+    for (tok = strtok_r(copy, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        for (int k = 0; k < HD2_NKEYS; k++) {
+            if (!g_strcmp0(tok, names[k])) {
+                s->keys[k] = true;
+                break;
+            }
+        }
+    }
+    g_free(copy);
+}
+
+static char *htcleo_get_keys(Object *obj, Error **errp)
+{
+    return g_strdup(HTCLEO_MACHINE(obj)->keys_held);
+}
+
 static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1909,6 +1960,14 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
         "image from NAND before jumping to it.  R000FF-wrapped images are "
         "unwrapped; a raw dump works too.  Without it the machine keeps "
         "loading the OS image from NAND itself");
+    object_class_property_add_str(oc, "keys", htcleo_get_keys,
+                                  htcleo_set_keys);
+    object_class_property_set_description(oc, "keys",
+        "keys held down when the machine comes up, comma separated: volup, "
+        "voldown, windows, call, endcall, back, home, power.  The HSPL's "
+        "own test for becoming the bootloader runs in the first moments "
+        "after the boot ROM hands it the core, so a key sent from outside "
+        "arrives far too late to affect it");
     object_class_property_add_bool(oc, "baseband-trace", htcleo_get_modem_trace,
                                    htcleo_set_modem_trace);
     object_class_property_set_description(oc, "baseband-trace",
