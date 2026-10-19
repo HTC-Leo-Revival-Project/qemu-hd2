@@ -5,6 +5,9 @@
 #   and boots Android instead of the firmware, which looks like a dead boot:
 #   no output on uart1.log at all, while ramcon.log shows the kernel coming up.
 #   NAND=/SDCARD= pick other images.
+#   SPL=nand boots the real HSPL out of the NAND instead of letting QEMU do the
+#   hand-off: the HSPL reads the cLK OS area itself and jumps to it.  SPL=<file>
+#   does the same from a loose image instead.
 #   BASEBAND=lle runs the real AMSS (amss.elf) on the modem core; TRACE=on
 #   logs its peripheral accesses to qemu.log, AMSSLOG=1 its debug messages
 #   (contrib/plugins/amsslog.c; AMSSLOG="hook=0x... ..." adds hooks).
@@ -25,6 +28,8 @@ M=htcleo
 D=${QEMU_D:-unimp,guest_errors} PLUGIN=
 [ "$BASEBAND" = lle ] && M="$M,baseband=lle,baseband-firmware=${AMSS:-amss.elf},baseband-trace=${TRACE:-off}"
 [ "$USB" = lle ] && M="$M,usb-host=lle"
+# SPL=<file|nand>: run the phone's own HSPL; it boots the OS image out of NAND
+[ -n "$SPL" ] && M="$M,spl=$SPL"
 if [ -n "$AMSSLOG" ]; then
   # AMSS 2.15.50.14's msg_send entry points
   P="../src/qemu/build/contrib/plugins/libamsslog.so,msg=0x526604,msg=0xc55d88,msg=0xc57028"
@@ -38,4 +43,5 @@ fi
   ${AUDIODEV:--audiodev none,id=snd0} -global msm-modem.audiodev=snd0 $SD $NET $ADB "$@" > qemu.out 2>&1 &
 for i in $(seq 20); do [ -S qmp.sock ] && break; sleep 0.3; done
 sleep 2.5
-[ -n "${CLK_KEYS-pgdn pgdn f2}" ] && python3 ../tools/keys.py qmp.sock ${CLK_KEYS-pgdn pgdn f2}
+[ -z "$SPL" ] && [ -n "${CLK_KEYS-pgdn pgdn f2}" ] && \
+  python3 ../tools/keys.py qmp.sock ${CLK_KEYS-pgdn pgdn f2}
