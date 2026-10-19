@@ -57,6 +57,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmAdmState, MSM_ADM)
 #define CMD_LC          (1u << 31)
 #define CMD_MODE_MASK   3
 #define CMD_MODE_SINGLE 0
+#define CMD_MODE_FILL   2
 #define CMD_MODE_SG     1
 #define CMD_MODE_BOX    3
 #define CMD_SRC_SWAP_BYTES  (1u << 11)
@@ -267,6 +268,25 @@ static void adm_copy(uint32_t cmd, hwaddr src, hwaddr dst, uint32_t len)
 }
 
 /*
+ * Mode 2, SINGLE_FILL: the ADM's memset.  The descriptor has the same shape
+ * as a single copy, except that the source word carries the fill byte rather
+ * than an address.  The HSPL uses it to clear the RAM it is about to unpack
+ * things into, so without it its data mover reports the transfer as failed.
+ */
+static void adm_fill(uint32_t cmd, hwaddr dst, uint8_t val, uint32_t len)
+{
+    g_autofree uint8_t *buf = NULL;
+
+    if (!len) {
+        return;
+    }
+    buf = g_malloc(len);
+    memset(buf, val, len);
+    swap_buf(buf, len, cmd, false);
+    dma_write(dst, buf, len);
+}
+
+/*
  * Run one array of command descriptors: 1 done, 0 bad list, -1 stalled
  * (*stall is then the descriptor that waits)
  */
@@ -274,6 +294,7 @@ static int adm_run_array(MsmAdmState *s, hwaddr a, uint32_t *stall)
 {
     for (int guard = 0; guard < 4096; guard++) {
         uint32_t cmd = ld32(a);
+
         trace_msm_adm_desc(a, cmd, ld32(a + 4), ld32(a + 8), ld32(a + 12));
         if (!crci_serviced(s, cmd, ld32(a + 4), ld32(a + 8))) {
             *stall = a;
@@ -299,6 +320,14 @@ static int adm_run_array(MsmAdmState *s, hwaddr a, uint32_t *stall)
                 adm_copy(cmd, src + r * src_off, dst + r * dst_off, len);
             }
             a += 24;
+            break;
+        }
+        case CMD_MODE_FILL: {
+            uint32_t val = ld32(a + 4), dst = ld32(a + 8);
+            uint32_t len = ld32(a + 12);
+
+            adm_fill(cmd, dst, val & 0xff, len & 0xFFFF);
+            a += 16;
             break;
         }
         case CMD_MODE_SG:

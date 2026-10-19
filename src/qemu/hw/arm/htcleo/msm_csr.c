@@ -25,6 +25,8 @@
 #include "qemu/timer.h"
 #include "qemu/module.h"
 #include "htcleo.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "msm_modem.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmCsrState, MSM_CSR)
@@ -229,6 +231,33 @@ static void csr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             if (n == 6 && s->modem &&
                 msm_modem_pcom_answer(MSM_MODEM(s->modem))) {
                 return;
+            }
+            /*
+             * HSPL FIFO (n=3): the apps bootloader hands the baseband a
+             * request over the ring buffer it keeps in SMEM scratch (at
+             * SMEM + 0xf0000, the "scratch" window of the Leo memory map)
+             * and spins until the read pointer catches up with the write
+             * pointer.  There is no modem core to do it in this model, so
+             * take the request as consumed.  The bootloader is the only
+             * writer, so this never disturbs the normal boot.
+             */
+            if (n == 3) {
+                uint8_t ptr[4];
+                unsigned wp, rp;
+
+                address_space_read(&address_space_memory,
+                                   MSM_SHARED_RAM_PHYS + 0xf3fcc,
+                                   MEMTXATTRS_UNSPECIFIED, ptr, 4);
+                wp = (ptr[0] | (ptr[1] << 8)) & 0x1ff;   /* HSPL write ptr */
+                rp = (ptr[2] | (ptr[3] << 8)) & 0x1ff;   /* baseband read */
+                if (wp != rp) {
+                    /* take the request as consumed */
+                    ptr[2] = wp & 0xff;
+                    ptr[3] = (wp >> 8) & 0xff;
+                    address_space_write(&address_space_memory,
+                                        MSM_SHARED_RAM_PHYS + 0xf3fce,
+                                        MEMTXATTRS_UNSPECIFIED, ptr + 2, 2);
+                }
             }
             qemu_irq_pulse(s->a2m[n]);
         }
