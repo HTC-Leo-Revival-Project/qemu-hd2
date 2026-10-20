@@ -323,9 +323,13 @@ static void htcleo_gpio_out(void *opaque, int pin, int level)
     if (pin == HTCLEO_GPIO_TS_POWER && s->ts) {
         htcleo_ts_set_power(s->ts, msm_gpio_get_output(s->gpio, pin) == 1);
     }
+    if (pin == HTCLEO_GPIO_PS_HOLD) {
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD -> %d\n", level);
+    }
     if (pin == HTCLEO_GPIO_PS_HOLD && level == 0 &&
         msm_gpio_get_output(s->gpio, HTCLEO_GPIO_PS_HOLD) == 0) {
         /* PS_HOLD released: the PMIC cuts power */
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD released: power off\n");
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
     }
 }

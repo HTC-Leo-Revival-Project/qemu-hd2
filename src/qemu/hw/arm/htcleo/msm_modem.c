@@ -246,11 +246,17 @@ static void smsm_handle(MsmModemState *s)
     uint32_t tmaster = smsm_get(s, SMSM_STATE_TIME_MASTER_DEM);
     uint32_t old_master = master, old_tmaster = tmaster;
 
+    if (apps != s->last_apps) {
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: SMSM apps state %08x -> %08x\n",
+                      s->last_apps, apps);
+    }
+
     if ((apps & (SMSM_SYSTEM_REBOOT | SMSM_SYSTEM_POWER_DOWN)) !=
         (s->last_apps & (SMSM_SYSTEM_REBOOT | SMSM_SYSTEM_POWER_DOWN))) {
         if (apps & SMSM_SYSTEM_REBOOT) {
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         } else if (apps & SMSM_SYSTEM_POWER_DOWN) {
+            qemu_log_mask(LOG_GUEST_ERROR, "htcleo: SMSM_SYSTEM_POWER_DOWN: power off\n");
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         }
     }
@@ -453,6 +459,7 @@ static void proc_comm_handle(MsmModemState *s)
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
     case PCOM_POWER_DOWN:
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PCOM_POWER_DOWN: power off\n");
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         break;
     case PCOM_GET_POWER_ON_STATUS:
@@ -566,6 +573,7 @@ static void dex_handle(MsmModemState *s)
 
     switch (cmd) {
     case DEX_POWER_OFF:
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: DEX_POWER_OFF: power off\n");
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         break;
     case DEX_NOTIFY_ARM9_REBOOT:
