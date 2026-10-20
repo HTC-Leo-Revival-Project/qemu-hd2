@@ -213,6 +213,30 @@ jobs:
           unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-q6.so'
           unzip -l "$apk" | grep -q 'lib/arm64-v8a/libhtcleo-usbffs.so'
 
+      # The APK carries only those three files, so a DT_NEEDED entry for
+      # anything but bionic cannot resolve on the phone.  This is the check
+      # that catches "library libslirp.so.0 not found" before an APK ships.
+      - name: check the emulator is statically linked
+        run: |
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          dir="$RUNNER_TEMP/apk-libs"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          unzip -j "$apk" 'lib/arm64-v8a/libhtcleo-*.so' -d "$dir"
+          fail=0
+          for f in "$dir"/*.so; do
+            while IFS= read -r need; do
+              case "$need" in
+                libc.so|libm.so|libdl.so|liblog.so) ;;
+                *)
+                  echo "::error file=$apk::$(basename "$f") needs $need, which is not in the APK"
+                  fail=1 ;;
+              esac
+            done < <("$readelf" -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+          done
+          exit $fail
+
       # archive: false ships the APK itself instead of a zip around an APK, and
       # with it the artifact name is the file's, so give it the repo's name.
       - name: stage the APK

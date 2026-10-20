@@ -291,13 +291,9 @@ stage() { # stage <abi>
     local abi="$1" prefix="$PREFIX_ROOT/$abi" qdir="$BUILD/$abi/qemu"
     local out="$JLIB/$abi"
     mkdir -p "$out"
-    rm -f "$out/qemu-system-arm" "$out/qemu-system-hexagon"
-    local installed
-    installed="$(find "$prefix/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.[0-9]*' \) -type f 2>/dev/null | head -20)"
-    if [ -n "$installed" ]; then
-        # dynamically linked after all: keep the libraries next to the binary
-        while IFS= read -r so; do cp -f "$so" "$out/"; done <<< "$installed"
-    fi
+    # jniLibs is not in git and survives between builds, so drop whatever a
+    # previous (possibly dynamic) build left behind before staging afresh.
+    rm -f "$out"/*.so
     # Only lib/<abi>/lib*.so survives into the APK: the installer unpacks
     # nothing else, so the executables go in under those names and
     # Paths.qemu() finds them again.  See Paths.java.
@@ -311,6 +307,27 @@ stage() { # stage <abi>
     # a library, it just has to arrive executable, and Paths.usbffs() looks for
     # exactly this name
     build_bridge "$abi" "$out/libhtcleo-usbffs.so"
+
+    # The APK ships these three files and nothing else, so any DT_NEEDED other
+    # than bionic's own libraries would be missing on the device.  This is
+    # what "libslirp.so.0 not found" looks like: the linker picked a shared
+    # libslirp out of a cached prefix.
+    local bad=0 bin needed
+    for bin in "$out"/*.so; do
+        while IFS= read -r needed; do
+            case "$needed" in
+                libc.so|libm.so|libdl.so|liblog.so) ;;
+                *)
+                    echo "--- $(basename "$bin") needs $needed ---" >&2
+                    bad=1 ;;
+            esac
+        done < <("$LLVM/bin/llvm-readelf" -d "$bin" 2>/dev/null |
+                 sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+    done
+    if [ "$bad" != 0 ]; then
+        echo "--- $out is not statically linked; refusing to stage it ---" >&2
+        exit 1
+    fi
     note "staged $(du -sh "$out" | cut -f1) into app/src/main/jniLibs/$abi"
 }
 
@@ -419,6 +436,11 @@ build_abi() { # build_abi <abi>
     else note "have libfdt ($abi)"; fi
 
     say "qemu ($abi)"
+    # Every dependency was built static, but a prefix restored from an older
+    # cache can still hold a shared copy, and the linker prefers libslirp.so.0
+    # over libslirp.a.  The APK then contains a binary that needs a library
+    # Android will not find.  Make the prefix static-only first.
+    find "$prefix/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -delete
     qemu_configure "$abi" "$prefix"
     stage "$abi"
 }
