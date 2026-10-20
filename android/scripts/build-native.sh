@@ -130,17 +130,27 @@ unpack() { # unpack <tarball> <dir name>
     local tarball="$DL/$1" dir="$DL/$2"
     [ -d "$dir" ] && return 0
     note "unpacking $1"
+    # Some tarballs unpack under another name (libslirp uses
+    # libslirp-v4.8.0-<hash>/), so find the directory this extraction added.
+    # Do not pick the newest mtime: tar restores the source dates, so a
+    # different tarball extracted earlier can look newer.  That renamed
+    # pixman to libslirp on a fresh CI checkout, left slirp out of the
+    # prefix, and made QEMU build its bundled shared libslirp instead.
+    local before after new
+    before="$(cd "$DL" && ls -d */ 2>/dev/null | LC_ALL=C sort || true)"
     case "$1" in
         *.tar.bz2|*.tar.bz) tar xjf "$tarball" -C "$DL" ;;
         *.tar.xz) tar xJf "$tarball" -C "$DL" ;;
         *) tar xzf "$tarball" -C "$DL" ;;
     esac
-    # some tarballs unpack under their own name (libslirp-v4.8.0-<hash>)
     if [ ! -d "$dir" ]; then
-        local newest
-        newest="$(ls -dt "$DL"/*/ | head -1)"
-        [ -n "$newest" ] && mv "$newest" "$dir"
+        after="$(cd "$DL" && ls -d */ 2>/dev/null | LC_ALL=C sort || true)"
+        new="$(comm -13 <(printf '%s\n' "$before") \
+                       <(printf '%s\n' "$after") | head -1)"
+        new="${new%/}"
+        [ -n "$new" ] && mv "$DL/$new" "$dir"
     fi
+    [ -d "$dir" ] || { echo "--- $1 did not unpack into $dir ---" >&2; exit 1; }
 }
 
 meson_dep() { # meson_dep <abi> <dir name> <prefix> <src dir> <name> <options...>
@@ -413,6 +423,13 @@ build_abi() { # build_abi <abi>
     unpack "libslirp-$SLIRP_VERSION.tar.bz2" "libslirp-$SLIRP_VERSION"
     meson_dep "$abi" libslirp "$prefix" "$DL/libslirp-$SLIRP_VERSION" \
         -Ddefault_library=static
+    # QEMU falls back to its bundled slirp subproject if pkg-config cannot
+    # find this one, and that copy is built shared.  Make a missing install
+    # fail here, where the message says what happened.
+    if [ ! -f "$prefix/lib/libslirp.a" ] || [ ! -f "$prefix/lib/pkgconfig/slirp.pc" ]; then
+        echo "--- libslirp did not install into $prefix ---" >&2
+        exit 1
+    fi
 
     say "libfdt ($abi)"
     unpack "dtc-$DTC_VERSION.tar.xz" "dtc-$DTC_VERSION"
