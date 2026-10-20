@@ -1080,6 +1080,14 @@ static void htcleo_reset(MachineState *machine, ResetType type)
      * Windows Mobile writes FPEXC right away and expects that to work.
      */
     env->cp15.cpacr_el1 |= 0xF00000;
+    /*
+     * The SPL also leaves DACR with every domain a client.  A Scorpion
+     * ignores c3, but the model still consults it, and cLK's MAGLDR
+     * relocation stub turns the MMU on before it writes c3 itself: with
+     * DACR at its reset value of zero every domain is denied and the first
+     * fetch from the relocated image aborts.
+     */
+    env->cp15.dacr_ns = 0x55555555;
 
     /* SVC mode, IRQ/FIQ masked, MMU off: jump to the OS image */
     env->regs[15] = entry;
