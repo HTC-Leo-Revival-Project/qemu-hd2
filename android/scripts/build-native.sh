@@ -3,8 +3,10 @@
 # Cross-compiles QEMU (the htcleo machine) and the few libraries it needs
 # for Android, with the NDK, and drops the result into the app's jniLibs.
 #
-#   android/scripts/build-native.sh                 arm64-v8a (the only ABI)
+#   android/scripts/build-native.sh                 arm64-v8a (phones)
 #   android/scripts/build-native.sh arm64-v8a       the same, explicitly
+#   android/scripts/build-native.sh x86_64          x86_64 (the emulator)
+#   android/scripts/build-native.sh arm64-v8a x86_64
 #   android/scripts/build-native.sh --clean         start over
 #   android/scripts/build-native.sh --stage-only    skip building, just install
 #
@@ -36,8 +38,8 @@ JOBS="$(nproc 2>/dev/null || echo 4)"
 # riscv64, s390x, ppc64, sparc64, loongarch64 and the interpreter, and
 # meson.build rejects any host with 4-byte pointers - so an armeabi-v7a build
 # of the emulator is not a matter of flags: there is nothing to build it with.
-# The app therefore ships arm64-v8a only.
-ABIS=("arm64-v8a")
+# The app ships arm64-v8a for phones and x86_64 for the Android emulator.
+ABIS=()
 
 # sources: small, and every one of them a plain tarball
 ZLIB_VERSION=1.3.1
@@ -54,15 +56,18 @@ for arg in "$@"; do
         --clean) CLEAN=1 ;;
         --stage-only) STAGE_ONLY=1 ;;
         -j*) JOBS="${arg#-j}" ;;
-        arm64-v8a) ABIS=("arm64-v8a") ;;
+        arm64-v8a|x86_64) ABIS+=("$arg") ;;
         armeabi-v7a)
             echo "QEMU 11 has no 32-bit host TCG backend (tcg/ has none, and meson.build" >&2
             echo "rejects a 4-byte-pointer host), so the emulator cannot be built for" >&2
-            echo "armeabi-v7a.  The app ships arm64-v8a only." >&2
+            echo "armeabi-v7a.  The app ships arm64-v8a and x86_64." >&2
             exit 2 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+if [ "${#ABIS[@]}" -eq 0 ]; then
+    ABIS=("arm64-v8a")
+fi
 
 say() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
@@ -79,6 +84,7 @@ cross_file() { # cross_file <abi> <prefix>
     local abi="$1" prefix="$2" cc triple cpu family
     case "$abi" in
         arm64-v8a)  triple="aarch64-linux-android$API"; cpu="aarch64"; family="aarch64" ;;
+        x86_64)     triple="x86_64-linux-android$API"; cpu="x86_64"; family="x86_64" ;;
         armeabi-v7a) triple="armv7a-linux-androideabi$API"; cpu="armv7"; family="arm" ;;
         *) echo "unknown abi $abi" >&2; exit 2 ;;
     esac
@@ -180,6 +186,7 @@ configure_dep() { # configure_dep <abi> <dir name> <prefix> <src dir> <host trip
     local cc
     case "$abi" in
         arm64-v8a) cc="aarch64-linux-android$API" ;;
+        x86_64)    cc="x86_64-linux-android$API" ;;
         armeabi-v7a) cc="armv7a-linux-androideabi$API" ;;
     esac
     ( cd "$bdir" && CC="$LLVM/bin/$cc-clang" \
@@ -228,6 +235,7 @@ qemu_configure() { # qemu_configure <abi> <prefix>
     local triple cpu
     case "$abi" in
         arm64-v8a)   triple="aarch64-linux-android$API"; cpu="aarch64" ;;
+        x86_64)      triple="x86_64-linux-android$API"; cpu="x86_64" ;;
         armeabi-v7a) triple="armv7a-linux-androideabi$API"; cpu="arm" ;;
     esac
     mkdir -p "$bdir"
@@ -256,7 +264,7 @@ qemu_configure() { # qemu_configure <abi> <prefix>
         --prefix="$prefix" \
         --target-list=arm-softmmu,hexagon-softmmu \
         --extra-cflags="-I$prefix/include" \
-        --extra-ldflags="-L$prefix/lib -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
+        --extra-ldflags="-L$prefix/lib -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -Wl,--whole-archive -lhtcleo-compat -Wl,--no-whole-archive" \
         --extra-cxxflags="-I$prefix/include" \
         --enable-vnc --enable-slirp --enable-pixman \
         --disable-opengl --disable-virglrenderer --disable-spice \
@@ -276,6 +284,29 @@ qemu_configure() { # qemu_configure <abi> <prefix>
         { echo "--- ninja failed ---" >&2; tail -60 "$bdir/build.log" >&2; exit 1; }
     touch "$bdir/.stamp"
     note "built qemu ($abi)"
+}
+
+# The binaries target API 28, but Android 8.1 (API 27) is still a supported
+# phone: bionic grew getrandom(), iconv*(), posix_spawn*() and
+# pthread_attr_setinheritsched() in API 28, and without definitions the
+# dynamic linker aborts before QEMU reaches main().  android/native/
+# android-compat.c supplies them; on API 28+ each function delegates to the
+# real bionic one through dlsym(RTLD_NEXT, ...), so modern phones keep the
+# native behaviour.
+build_compat() { # build_compat <abi> <prefix>
+    local abi="$1" prefix="$2" dir="$ANDROID_DIR/native" cc
+    case "$abi" in
+        arm64-v8a)   cc="aarch64-linux-android$API" ;;
+        x86_64)      cc="x86_64-linux-android$API" ;;
+        armeabi-v7a) cc="armv7a-linux-androideabi$API" ;;
+    esac
+    mkdir -p "$prefix/lib"
+    "$LLVM/bin/$cc-clang" -O2 -Wall -Wextra -Wno-unused-parameter \
+        -c "$dir/android-compat.c" -o "$prefix/lib/android-compat.o" || {
+            echo "--- android-compat failed ---" >&2; exit 1; }
+    "$LLVM/bin/llvm-ar" rcs "$prefix/lib/libhtcleo-compat.a" \
+        "$prefix/lib/android-compat.o"
+    note "built android-compat ($abi)"
 }
 
 # glib insists on an iconv dependency.  bionic has had <iconv.h> and
@@ -348,6 +379,7 @@ build_bridge() { # build_bridge <abi> <output>
     local cc
     case "$abi" in
         arm64-v8a)   cc="aarch64-linux-android$API" ;;
+        x86_64)      cc="x86_64-linux-android$API" ;;
         armeabi-v7a) cc="armv7a-linux-androideabi$API" ;;
     esac
     # The same 16 KB page alignment the QEMU build gets (see cross_file() and
@@ -382,10 +414,16 @@ build_abi() { # build_abi <abi>
     local prefix="$PREFIX_ROOT/$abi"
     local b="$BUILD/$abi"
     say "zlib $ZLIB_VERSION ($abi)"
+    local zcc
+    case "$abi" in
+        arm64-v8a)   zcc="aarch64-linux-android$API" ;;
+        x86_64)      zcc="x86_64-linux-android$API" ;;
+        armeabi-v7a) zcc="armv7a-linux-androideabi$API" ;;
+    esac
     if [ ! -f "$b/zlib/.stamp" ]; then
         unpack "zlib-$ZLIB_VERSION.tar.gz" "zlib-$ZLIB_VERSION"
         mkdir -p "$b/zlib" && cross_file "$abi" "$prefix" "$b/zlib/cross.txt"
-        ( cd "$b/zlib" && CHOST="$abi" CC="$LLVM/bin/$( [ "$abi" = arm64-v8a ] && echo aarch64-linux-android$API || echo armv7a-linux-androideabi$API)-clang" \
+        ( cd "$b/zlib" && CHOST="$abi" CC="$LLVM/bin/$zcc-clang" \
             AR="$LLVM/bin/llvm-ar" RANLIB="$LLVM/bin/llvm-ranlib" \
             "$DL/zlib-$ZLIB_VERSION/configure" --prefix "$prefix" --static ) >"$b/zlib/build.log" 2>&1 &&
         { make -C "$b/zlib" -j "$JOBS" >>"$b/zlib/build.log" 2>&1 && make -C "$b/zlib" install >>"$b/zlib/build.log" 2>&1; } ||
@@ -394,9 +432,14 @@ build_abi() { # build_abi <abi>
     else note "have zlib ($abi)"; fi
 
     say "pcre2 $PCRE2_VERSION ($abi)"
+    local phost
+    case "$abi" in
+        arm64-v8a)   phost="aarch64-linux-android" ;;
+        x86_64)      phost="x86_64-linux-android" ;;
+        armeabi-v7a) phost="arm-linux-androideabi" ;;
+    esac
     unpack "pcre2-$PCRE2_VERSION.tar.bz2" "pcre2-$PCRE2_VERSION"
-    configure_dep "$abi" pcre2 "$prefix" "$DL/pcre2-$PCRE2_VERSION" \
-        "$([ "$abi" = arm64-v8a ] && echo aarch64-linux-android || echo arm-linux-androideabi)" \
+    configure_dep "$abi" pcre2 "$prefix" "$DL/pcre2-$PCRE2_VERSION" "$phost" \
         --enable-pcre2-8 --disable-pcre2-16 --disable-pcre2-32 \
         --disable-pcre2grep --disable-pcre2test --enable-jit
 
@@ -412,12 +455,19 @@ build_abi() { # build_abi <abi>
 
     say "pixman $PIXMAN_VERSION ($abi)"
     unpack "pixman-$PIXMAN_VERSION.tar.gz" "pixman-$PIXMAN_VERSION"
+    # SSE2/SSSE3 are the fast path on the emulator's x86_64 host; the ARM SIMD
+    # options do not exist there, and the reverse is true for arm64-v8a.
+    local pixman_opts=(-Ddefault_library=static -Dgtk=disabled -Dlibpng=disabled
+        -Dtests=disabled -Ddemos=disabled -Dtimers=false -Dopenmp=disabled
+        -Dloongson-mmi=disabled -Dvmx=disabled -Dneon=disabled -Darm-simd=disabled
+        -Drvv=disabled -Dtls=enabled)
+    if [ "$abi" = x86_64 ]; then
+        pixman_opts+=(-Dmmx=enabled -Dsse2=enabled -Dssse3=enabled)
+    else
+        pixman_opts+=(-Dmmx=disabled -Dsse2=disabled -Dssse3=disabled)
+    fi
     meson_dep "$abi" pixman "$prefix" "$DL/pixman-$PIXMAN_VERSION" \
-        -Ddefault_library=static -Dgtk=disabled -Dlibpng=disabled \
-        -Dtests=disabled -Ddemos=disabled -Dtimers=false -Dopenmp=disabled \
-        -Dloongson-mmi=disabled -Dmmx=disabled -Dsse2=disabled -Dssse3=disabled \
-        -Dvmx=disabled -Dneon=disabled -Darm-simd=disabled -Drvv=disabled \
-        -Dtls=enabled
+        "${pixman_opts[@]}"
 
     say "libslirp $SLIRP_VERSION ($abi)"
     unpack "libslirp-$SLIRP_VERSION.tar.bz2" "libslirp-$SLIRP_VERSION"
@@ -437,6 +487,7 @@ build_abi() { # build_abi <abi>
         local cc
         case "$abi" in
             arm64-v8a)   cc="aarch64-linux-android$API" ;;
+            x86_64)      cc="x86_64-linux-android$API" ;;
             armeabi-v7a) cc="armv7a-linux-androideabi$API" ;;
         esac
         mkdir -p "$prefix/lib" "$prefix/include"
@@ -458,6 +509,7 @@ build_abi() { # build_abi <abi>
     # over libslirp.a.  The APK then contains a binary that needs a library
     # Android will not find.  Make the prefix static-only first.
     find "$prefix/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -delete
+    build_compat "$abi" "$prefix"
     qemu_configure "$abi" "$prefix"
     stage "$abi"
 }
