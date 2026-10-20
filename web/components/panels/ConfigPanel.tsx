@@ -107,6 +107,27 @@ export const ConfigPanel = ({ config, images, firmware, onChange }: Props) => {
       )}
 
       <Divider />
+      <ListPref
+        title="Guest clock (icount shift)"
+        icon={<Gauge {...I} />}
+        value={String(config.icountShift) as "-1" | "0" | "1" | "2" | "3" | "4"}
+        choices={[
+          { value: "-1", label: "auto", summary: "The clock follows the host: fast, but the guest times out on a slow host" },
+          { value: "0", label: "shift=0 (1 ns per instruction)" },
+          { value: "1", label: "shift=1" },
+          { value: "2", label: "shift=2" },
+          { value: "3", label: "shift=3", summary: "8 ns per instruction: the same timeline on every host" },
+          { value: "4", label: "shift=4" },
+        ]}
+        onChange={(v) => onChange({ icountShift: Number(v) })}
+      />
+      <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">
+        The clock follows the host&apos;s real time unless a shift is picked. A guest that waits for something gives up when the wait
+        takes too long of the guest&apos;s own time: Windows Mobile&apos;s power handshake does, and the phone powers itself off in the
+        middle of the boot.
+      </p>
+
+      <Divider />
       <ListPref title="USB host" icon={<Usb {...I} />} value={config.usb} choices={usbChoices} onChange={(usb) => onChange({ usb })} />
       {config.usb === "lle" && (
         <p className="px-4 pb-2 pl-16 text-[12.5px] text-holo-text-3">

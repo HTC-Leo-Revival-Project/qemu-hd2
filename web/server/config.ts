@@ -26,6 +26,7 @@ export const sanitize = (raw: Partial<EmulatorConfig>, base: EmulatorConfig = DE
     adbPort: num(raw.adbPort, 1024, 65535, base.adbPort),
     amssLog: bool(raw.amssLog, base.amssLog),
     dspShift: num(raw.dspShift, -1, 4, base.dspShift),
+    icountShift: num(raw.icountShift, -1, 4, base.icountShift),
     extraArgs: typeof raw.extraArgs === "string" ? raw.extraArgs.slice(0, 2000) : base.extraArgs,
     encoder: oneOf(raw.encoder, ["x264", "nvenc"], base.encoder),
     quality: num(raw.quality, 10, 40, base.quality),

@@ -68,6 +68,16 @@ const tail = (file: string, n = 6) => {
   }
 };
 
+/**
+ * The DSP's clock.  It shares the DRAM with the apps core and the two talk
+ * over the Q6 link, so they have to run on the same clock: with icount on the
+ * apps side and the host's real time on the DSP side the two would drift
+ * apart, and the audio would run at a different speed from the guest that
+ * fills its buffers.  A shift the user picked for the DSP still wins.
+ */
+const q6Shift = (cfg: EmulatorConfig) =>
+  cfg.dspShift >= 0 ? cfg.dspShift : cfg.icountShift >= 0 ? cfg.icountShift : "auto";
+
 export class Emulator extends EventEmitter {
   readonly hub: StreamHub;
   private arm: ChildProcess | null = null;
@@ -205,6 +215,16 @@ export class Emulator extends EventEmitter {
       "-audiodev", `${backend},id=snd0`, "-global", "msm-modem.audiodev=snd0",
       "-global", `msm-adreno.backend=${cfg.gpu}`,
     ];
+    /*
+     * The guest's clock.  QEMU's clock follows the host's real time, so the
+     * guest gets a different amount of work done per second of its own time
+     * on a slow host than on a fast one, and a guest that waits for
+     * something gives up: Windows Mobile's power handshake times out and
+     * the phone powers itself off in the middle of the boot.  With icount the
+     * clock advances with the guest's own instructions, so the guest sees the
+     * same timeline everywhere.
+     */
+    if (cfg.icountShift >= 0) args.push("-icount", `shift=${cfg.icountShift}`);
     // usb=lle puts the gadget on the host's own stack, so the phone reaches
     // this machine's adb directly; the TCP bridge would be a second, private
     // host for the same endpoint and the two cannot both drive it.
@@ -244,7 +264,7 @@ export class Emulator extends EventEmitter {
         "-L", QEMU_PCBIOS, "-L", QEMU_PCBIOS_BUILD,
         "-M", `htcleo-q6,link=q6link,apps-irq=11,modem-irq=2,trace=off`,
         "-kernel", "dsp1.elf",
-        "-icount", `shift=${cfg.dspShift < 0 ? "auto" : cfg.dspShift}`,
+        "-icount", `shift=${q6Shift(cfg)}`,
         ...mem,
         "-chardev", `socket,id=q6link,path=${SOCK.q6link}`,
         "-audiodev", `${backend},id=q6snd`, "-global", "htcleo-q6-audif.audiodev=q6snd",

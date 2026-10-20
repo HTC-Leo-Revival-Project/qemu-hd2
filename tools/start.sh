@@ -11,6 +11,12 @@
 #   BASEBAND=lle runs the real AMSS (amss.elf) on the modem core; TRACE=on
 #   logs its peripheral accesses to qemu.log, AMSSLOG=1 its debug messages
 #   (contrib/plugins/amsslog.c; AMSSLOG="hook=0x... ..." adds hooks).
+#   IC=N runs the guest on an icount clock (2^N ns per instruction), so the
+#   clock advances with the guest's own work instead of with the wall clock.
+#   The guest then sees the same timeline on every host, which is what a
+#   phone needs: a guest that waits for the modem gives up when the wait
+#   takes too much of the host's real time, and Windows Mobile's power
+#   handshake does exactly that.  IC=3 is 8 ns per instruction, 125 MIPS.
 #   USB=lle hands the gadget to this machine's own USB stack instead: the
 #   emulated HD2 turns up in lsusb and dmesg, and the host's adb and fastboot
 #   talk to it directly.  It needs root and vhci_hcd, so use
@@ -38,6 +44,7 @@ if [ -n "$AMSSLOG" ]; then
 fi
 ../src/qemu/build/qemu-system-arm -L ../src/qemu/pc-bios -L ../src/qemu/build/pc-bios \
   -M $M -drive if=mtd,format=raw,file=${NAND:-nand.img} \
+  ${IC:+-icount shift=$IC} \
   -display none -serial file:uart1.log -serial file:ramcon.log \
   -qmp unix:qmp.sock,server,nowait -d $D -D qemu.log $PLUGIN \
   ${AUDIODEV:--audiodev none,id=snd0} -global msm-modem.audiodev=snd0 $SD $NET $ADB "$@" > qemu.out 2>&1 &

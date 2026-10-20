@@ -19,6 +19,12 @@ export type EmulatorConfig = {
   adbPort: number;
   amssLog: boolean;
   dspShift: number;
+  /**
+   * The guest's clock: -1 follows the host's real time, 0..N are the icount
+   * shifts (2^N ns per instruction, so the clock advances with the guest's
+   * own work instead of with the wall clock).
+   */
+  icountShift: number;
   extraArgs: string;
   encoder: VideoEncoder;
   quality: number;
@@ -39,6 +45,7 @@ export const DEFAULT_CONFIG: EmulatorConfig = {
   adbPort: 5555,
   amssLog: false,
   dspShift: -1,
+  icountShift: 3,
   extraArgs: "",
   encoder: "x264",
   quality: 20,

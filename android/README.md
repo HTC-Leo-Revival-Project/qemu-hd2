@@ -277,6 +277,23 @@ table in the boot area says where).  Images -> Radio firmware does the same on
 demand, from the NAND image or from a radio NBH (`hd2_radio.py -o amss.elf
 --dsp dsp1.elf`).  Both give the same bytes as `hd2_radio.py`.
 
+## The guest's clock
+
+**Settings -> Guest clock** puts the guest on an **icount** clock: 2^shift
+nanoseconds per instruction, so the clock advances with the guest's own work
+instead of with the wall clock.  The guest then sees the same timeline on
+every host, which is what a phone needs.  A phone emulates this machine a
+hundred times slower than a workstation, so a guest that waits for the modem
+gets a hundred times less done per second of its own time, and gives up:
+Windows Mobile's power handshake waits for the modem, and when it gives up
+it releases PS_HOLD and the phone powers itself off in the middle of the
+boot, right after the red version text.  `shift=3` is 8 ns per instruction,
+125 MIPS, and the default.
+
+The DSP runs on the same clock as the apps core - it shares the DRAM with it
+and the two talk over the Q6 link - so the two cannot drift apart.  A shift
+picked for the DSP in its own setting still wins.
+
 ## Root and USB
 
 The emulator never needs root.  **Root & USB** is the start of the features

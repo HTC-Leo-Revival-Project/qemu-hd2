@@ -58,7 +58,17 @@ properties and images for its mode, then passes any extra arguments to QEMU.
 
 Environment variables understood by the launchers (see `start.sh` for the full
 list): `NAND=`, `SDCARD=`, `BASEBAND=lle`, `AMSS=`, `TRACE=on`, `AMSSLOG=1`,
-`AUDIODEV=`, `ADB_PORT=`, `CLK_KEYS=`, `USB=lle`, `QEMU_D=`.
+`AUDIODEV=`, `ADB_PORT=`, `CLK_KEYS=`, `USB=lle`, `QEMU_D=`, `IC=N`.
+
+`IC=N` puts the guest on an **icount** clock: 2^N nanoseconds per
+instruction, so the clock advances with the guest's own work instead of
+with the wall clock. The guest then sees the same timeline on every
+host. It matters on a slow one: a guest that waits for the modem gives
+up when the wait takes too much of the host's real time, and Windows
+Mobile's power handshake does exactly that - it gives up, releases
+PS_HOLD, and the phone powers itself off in the middle of the boot.
+`IC=3` is 8 ns per instruction, 125 MIPS, and what the Android app
+uses.
 
 ## Driving a running emulator (QMP)
 
