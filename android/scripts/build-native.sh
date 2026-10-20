@@ -231,7 +231,16 @@ EOF
 qemu_configure() { # qemu_configure <abi> <prefix>
     local abi="$1" prefix="$2"
     local bdir="$BUILD/$abi/qemu"
-    [ -f "$bdir/.stamp" ] && { note "have qemu ($abi)"; return 0; }
+    # The stamp says "configured", not "up to date": the emulator's own
+    # sources change under it (src/qemu is a git checkout of its own), and a
+    # stamp that never expires means a new QEMU is never built.  So configure
+    # only once and let ninja do the rest - it knows what is stale.
+    if [ -f "$bdir/.stamp" ]; then
+        note "have qemu ($abi), rebuilding what changed"
+        ( cd "$bdir" && ninja -j "$JOBS" ) >"$bdir/build.log" 2>&1 ||
+            { echo "--- ninja failed ---" >&2; tail -60 "$bdir/build.log" >&2; exit 1; }
+        return 0
+    fi
     local triple cpu
     case "$abi" in
         arm64-v8a)   triple="aarch64-linux-android$API"; cpu="aarch64" ;;
