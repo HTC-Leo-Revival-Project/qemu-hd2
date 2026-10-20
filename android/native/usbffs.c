@@ -150,7 +150,19 @@
  * A host that pauses this long in the middle of a megabyte is not going to send
  * the rest anyway, and the log says when it happens.
  */
-#define QUIET_MS       150
+/*
+ * How long the phone has to be quiet before what it gave us goes out as it is.
+ *
+ * Long enough that a command has arrived whole: fastboot writes
+ * "download:004be000\n" as its own transfer, but the UDC hands over whatever
+ * fits, which was eleven bytes of it here, and a quiet period shorter than this
+ * splits the command into two transfers -- the guest then reads "download:4" as
+ * the command and the rest as the next one.  It also has to stay well inside the
+ * host's own patience: fastboot waits 60 s for a reply, so a few hundred
+ * milliseconds per command is invisible and the whole boot script still runs at
+ * a sensible speed.
+ */
+#define QUIET_MS       400
 
 /*
  * How long the phone has to be quiet before a *bulk* remainder goes out
@@ -217,7 +229,11 @@ struct ep {
     uint32_t ring_tail;         /* bytes handed to the emulator */
     bool flush;                 /* OUT: send what is left, page-aligned or not */
     uint32_t quiet;             /* OUT: how long the phone has given us nothing */
-    uint32_t download_left;     /* OUT: bytes of a download the host still owes */
+    uint32_t download_left;     /* OUT: the size the host announced, 0 if none */
+    uint64_t download_seen;     /* OUT: bytes submitted since that command */
+    bool download_done;         /* OUT: ... and whether that is all of them */
+    char command[80];           /* OUT: the command being reassembled */
+    uint32_t command_len;
 
     int slot;                   /* its urb slot; slot 0 is ep0 */
     pthread_t thread;
@@ -234,6 +250,9 @@ struct ep {
 struct bridge {
     int ip;                     /* the USB/IP socket to QEMU */
     uint32_t seq;
+    uint64_t read_total;        /* bytes off the phone's OUT endpoint */
+    uint64_t sent;              /* bytes handed to the emulator */
+    uint64_t lost;              /* ... and how many could not be handed over */
 
     /* what the emulated gadget says it is */
     uint8_t dev[18];
@@ -1437,11 +1456,16 @@ static uint32_t out_want(const struct ep *e, uint32_t held)
 {
     uint32_t want;
 
-    if (e->download_left) {
-        want = e->download_left > GUEST_PAGE ? ring_whole_pages(held)
-                                            : e->download_left;
+    if (e->download_left && !e->download_done) {
+        want = ring_whole_pages(held);
     } else {
-        want = e->flush ? held : ring_whole_pages(held);
+        /*
+         * No download running, or all of it has been sent: what is left goes as
+         * it is.  For the tail that is the last page of the image and the guest's
+         * last request wants exactly that much; for a command it is the whole
+         * command.
+         */
+        want = held;
     }
     return want > held ? held : want;
 }
@@ -1451,25 +1475,51 @@ static uint32_t out_want(const struct ep *e, uint32_t held)
  * wire to learn the size.  A command the bridge forwards is otherwise only ever
  * looked at by the guest.
  */
-static void note_download_left(struct ep *e, const uint8_t *cmd, uint32_t len)
+static void note_download_left(struct ep *e)
 {
     static const char tag[] = "download:";
-    const uint8_t *end = cmd + len;
-    const uint8_t *p;
-    uint32_t v = 0;
+    const char *cmd = e->command;
+    uint32_t len = e->command_len;
+    const char *p;
+    uint32_t v = 0, digits = 0;
 
-    e->download_left = 0;
-    if (e->in || len <= sizeof(tag) || len > 40 ||
-        memcmp(cmd, tag, sizeof(tag) - 1)) {
+    if (e->in) {
+        e->command_len = 0;
         return;
     }
-    for (p = cmd + sizeof(tag) - 1; p < end && *p >= '0' && *p <= '9'; p++) {
-        v = v * 16 + (uint32_t)(*p <= '9' ? *p - '0' : (*p | 32) - 'a' + 10);
+    /*
+     * fastboot sends a command as its own short transfer and cLK's fastboot
+     * takes it as it is -- there is no newline to wait for -- and the UDC may
+     * hand the text over in pieces ("getvar:" and "version" separately).  So
+     * this is called with whatever has arrived: a prefix that is not a download
+     * clears the buffer, a prefix that is one keeps the digits it has until
+     * there are enough to be a size.
+     */
+    if (len <= sizeof(tag) || len > 40 || memcmp(cmd, tag, sizeof(tag) - 1)) {
+        e->command_len = 0;
+        return;
     }
-    if (p == end || v == 0) {
-        return;                     /* not a number, or not one we can believe */
+    for (p = cmd + sizeof(tag) - 1; p < cmd + len; p++) {
+        uint32_t d;
+
+        if (*p >= '0' && *p <= '9') {
+            d = (uint32_t)(*p - '0');
+        } else if ((*p | 32) >= 'a' && (*p | 32) <= 'f') {
+            d = (uint32_t)((*p | 32) - 'a' + 10);
+        } else {
+            break;
+        }
+        v = v * 16 + d;
+        digits++;
+    }
+    if (digits < 4 || !v) {
+        note("ffs: %s: download command so far: \"%.*s\"", e->name, (int)len, cmd);
+        return;                     /* more to come */
     }
     e->download_left = v;
+    e->download_seen = 0;         /* the command is not part of the image */
+    e->download_done = false;
+    e->command_len = 0;
     note("ffs: %s: a download of %u bytes", e->name, v);
 }
 
@@ -1560,8 +1610,8 @@ static void *out_worker(void *arg)
          * megabyte is a request to sit there for a megabyte -- and asking for
          * more than the endpoint's packets add up to is what it answers EFAULT.
          */
-        if (room > XFER_MAX) {
-            room = XFER_MAX;
+        if (room > GUEST_PAGE) {
+            room = GUEST_PAGE;
         }
         room = ring_slice(e, e->ring_head, room);
         pthread_mutex_unlock(&e->lock);
@@ -1603,6 +1653,7 @@ static void *out_worker(void *arg)
         pthread_mutex_lock(&e->lock);
         if (n > 0) {
             e->ring_head += (uint32_t)n;
+            b.read_total += (uint64_t)n;
             wake_the_loop();
         }
         pthread_mutex_unlock(&e->lock);
@@ -1923,6 +1974,29 @@ static void pump(void)
             }
             pthread_mutex_lock(&e->lock);
             held = ring_held(e);
+            if (held && !e->flush && e->quiet == 0) {
+                static int64_t last_tally;
+
+                if (now_ms() - last_tally > 1000) {
+                    last_tally = now_ms();
+                    note("ffs: %s idle: read %llu, sent %llu, lost %llu, "
+                         "ring %u", e->name,
+                         (unsigned long long)b.read_total,
+                         (unsigned long long)b.sent,
+                         (unsigned long long)b.lost, held);
+                }
+            }
+            if (held && !e->flush && e->quiet == 0) {
+                /*
+                 * The endpoint has gone quiet with something still in the ring.
+                 * Say what, and how long it has been sitting there: this is the
+                 * difference between the ring holding the host's data and the
+                 * data having gone nowhere, and it is the one question a stalled
+                 * download needs answered.
+                 */
+                note("ffs: %s quiet holding %u bytes (room %u, left %u)", e->name,
+                     held, room_left(e), e->download_left);
+            }
             if (!held || e->flush) {
                 e->quiet = 0;
             } else {
@@ -1948,7 +2022,7 @@ static void pump(void)
                  */
                 e->quiet += QUIET_MS;
                 if (held <= COMMAND_MAX && room_left(e) > 0 &&
-                    e->quiet >= QUIET_MS) {
+                    e->quiet >= QUIET_MS && !(e->download_left && !e->download_done)) {
                     note("ffs: %s quiet for %u ms with %u bytes held; "
                          "sending them", e->name, e->quiet, held);
                     e->flush = true;
@@ -2037,14 +2111,26 @@ static void pump(void)
                 ring_copy_out(e, out, e->ring_tail, len);
                 e->ring_tail += len;       /* submit_urb() writes it out itself */
                 e->flush = false;
-                if (e->download_left) {
-                    if (len <= COMMAND_MAX) {
-                        note_download_left(e, out, len);
-                    } else {
-                        e->download_left -= len;
-                        if (!e->download_left) {
-                            note("ffs: %s: the download is complete", e->name);
-                        }
+                if (!e->download_left) {
+                    /*
+                     * A command, and the only place the size of the transfer
+                     * that follows can come from: fastboot sends
+                     * "download:004be000\n" and then the image, and what is left
+                     * over when the host stops is exactly the piece the guest's
+                     * last request wants.
+                     *
+                     * It comes to us in pieces -- the UDC hands over what fits,
+                     * which was eleven bytes of it -- so it is reassembled here
+                     * until the newline, and only then read.
+                     */
+                    for (uint32_t i = 0; i < len && e->command_len + 1 < sizeof(e->command); i++) {
+                        e->command[e->command_len++] = (char)out[i];
+                    }
+                    note_download_left(e);
+                } else {
+                    e->download_left -= len;
+                    if (!e->download_left) {
+                        note("ffs: %s: the download is complete", e->name);
                     }
                 }
                 pthread_cond_signal(&e->cv);  /* room in the ring again */
@@ -2052,7 +2138,18 @@ static void pump(void)
         }
         pthread_mutex_unlock(&e->lock);
         if (len) {
-            submit_urb(u, e->num, false, NULL, 0, out, len, NULL);
+            if (submit_urb(u, e->num, false, NULL, 0, out, len, NULL) < 0) {
+                /*
+                 * Cannot happen -- the slot was free a moment ago -- but if it
+                 * does, the bytes are already out of the ring, so say so instead
+                 * of leaving the guest waiting for a transfer nobody sent.
+                 */
+                fail("ffs: could not submit %u bytes on %s; they are lost", len,
+                     e->name);
+                b.lost += len;
+            } else {
+                b.sent += len;
+            }
             note("emu: <- submit seq %u ep %d out (%u)", u->seq, e->num, len);
             continue;
         }
@@ -2072,11 +2169,44 @@ static void pump(void)
     }
 }
 
+/*
+ * Is there something an endpoint could send right now but did not?
+ *
+ * The loop submits one transfer per endpoint per pass and then goes back to
+ * poll() for the next answer.  That is fine as long as something else wakes it,
+ * and usually the worker's read does -- but a burst of reads can be drained out
+ * of the wake pipe in one pass while the endpoint's transfer is still in flight,
+ * and then the last wake has already been spent: the ring keeps half a megabyte
+ * of a download, the emulator is idle, and the host waits for the rest.  This is
+ * what that looks like, so serve() asks rather than assuming.
+ */
+static bool backlog(void)
+{
+    for (int i = 0; i < b.nep; i++) {
+        struct urb *u = &pending[i + 1];
+        uint32_t held;
+
+        if (b.eps[i].in || b.eps[i].fd < 0 || u->used || u->ready) {
+            continue;
+        }
+        pthread_mutex_lock(&b.eps[i].lock);
+        held = ring_held(&b.eps[i]);
+        pthread_mutex_unlock(&b.eps[i].lock);
+        if (held && out_want(&b.eps[i], held)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void serve(void)
 {
     b.running = true;
     while (!stop_now) {
         pump();
+        if (backlog()) {
+            sleep_ms(1);
+        }
     }
     note("stopping");
 }
