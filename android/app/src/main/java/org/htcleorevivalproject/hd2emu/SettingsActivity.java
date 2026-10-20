@@ -103,6 +103,28 @@ public class SettingsActivity extends HoloActivity {
                     }
                 });
         if (!lle) page.note(getString(R.string.set_dsp_note));
+        /*
+         * The guest's clock.  With the host's real time the guest gets a
+         * different amount of work done per second of its own time on a
+         * phone than on a workstation, and a guest that waits for something
+         * gives up: Windows Mobile's power handshake times out on a phone
+         * and the phone powers itself off in the middle of the boot.  With
+         * icount the clock follows the guest's own instructions and the
+         * guest sees the same timeline everywhere.
+         */
+        page.choice(getString(R.string.set_guest_clock), shiftLabel(config.icountShift),
+                new String[]{getString(R.string.set_auto), "shift=0", "shift=1", "shift=2", "shift=3", "shift=4"},
+                new String[]{getString(R.string.set_guest_clock_real_sum),
+                        getString(R.string.set_shift_0_sum), getString(R.string.set_shift_1_sum),
+                        getString(R.string.set_shift_2_sum), getString(R.string.set_shift_3_sum), ""},
+                config.icountShift + 1, new Holo.OnPick() {
+                    @Override
+                    public void onPick(int index) {
+                        config.icountShift = index - 1;
+                        save();
+                        rebuild();
+                    }
+                });
         if (config.dspRunning()) {
             page.choice(getString(R.string.set_dsp_clock), shiftLabel(config.dspShift),
                     new String[]{getString(R.string.set_auto), "shift=0", "shift=1", "shift=2", "shift=3", "shift=4"},

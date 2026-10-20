@@ -90,6 +90,10 @@
     <string name="set_shift_auto_sum">QEMU adjusts the shift to follow real time</string>
     <string name="set_shift_0_sum">1 ns per instruction</string>
     <string name="set_shift_1_sum">the default</string>
+    <string name="set_guest_clock">Guest clock (icount shift)</string>
+    <string name="set_guest_clock_real_sum">The clock follows the host: fast, but the guest times out on a slow host</string>
+    <string name="set_shift_2_sum">4 ns per instruction</string>
+    <string name="set_shift_3_sum">8 ns per instruction: the same timeline on every host</string>
     <string name="set_cat_images">Images</string>
     <string name="set_nand">NAND flash</string>
     <string name="set_not_in_folder">%1$s (not in the app\'s images folder)</string>

@@ -36,6 +36,12 @@ public class Config {
      */
     public boolean usbPassthrough = false;
     public int dspShift = -1;
+    /**
+     * The guest's clock: -1 follows the host's real time, 0..N are the icount
+     * shifts (2^N ns per instruction, so the clock advances with the guest's
+     * own work instead of with the wall clock).
+     */
+    public int icountShift = 3;
     public int gpuThreads = 0;            // 0 = QEMU's own choice
     public float volume = 1.0f;
     public boolean showFps = false;
@@ -96,6 +102,7 @@ public class Config {
         clkRegimeFake = prefs.getBoolean("clkRegimeFake", clkRegimeFake);
         usbPassthrough = prefs.getBoolean("usbPassthrough", usbPassthrough);
         dspShift = prefs.getInt("dspShift", dspShift);
+        icountShift = prefs.getInt("icountShift", icountShift);
         gpuThreads = prefs.getInt("gpuThreads", gpuThreads);
         volume = prefs.getFloat("volume", volume);
         showFps = prefs.getBoolean("showFps", showFps);
@@ -119,6 +126,7 @@ public class Config {
                 .putBoolean("clkRegimeFake", clkRegimeFake)
                 .putBoolean("usbPassthrough", usbPassthrough)
                 .putInt("dspShift", dspShift)
+                .putInt("icountShift", icountShift)
                 .putInt("gpuThreads", gpuThreads)
                 .putFloat("volume", volume)
                 .putBoolean("showFps", showFps)

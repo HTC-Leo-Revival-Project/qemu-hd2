@@ -194,6 +194,26 @@ public class Emulator {
         args.add("-M");
         args.add(machine);
         /*
+         * The guest's clock.
+         *
+         * Left alone, QEMU's clock follows the host's real time, so the guest
+         * gets a different amount of work done per second of its own time on
+         * a phone than on a workstation - a phone emulates this machine a
+         * hundred times slower.  Windows Mobile's power handshake waits for
+         * the modem and gives up when the wait takes too long: on a phone it
+         * gives up, releases PS_HOLD and the phone powers itself off in the
+         * middle of the boot.
+         *
+         * With icount the clock advances with the guest's own instructions
+         * (2^shift ns each), so the guest sees the same timeline everywhere
+         * and a guest that boots on a workstation boots on a phone too.
+         * shift=3 is 8 ns per instruction, 125 MIPS.
+         */
+        if (cfg.icountShift >= 0) {
+            args.add("-icount");
+            args.add("shift=" + cfg.icountShift);
+        }
+        /*
          * QEMU's working directory is the run directory, but the SMEM dump
          * lives in images/.  Without this the modelled baseband starts with a
          * zero SMEM heap and the kernel hangs in smd_core_init(), which looks
