@@ -193,6 +193,18 @@ public class Emulator {
         }
         args.add("-M");
         args.add(machine);
+        /*
+         * QEMU's working directory is the run directory, but the SMEM dump
+         * lives in images/.  Without this the modelled baseband starts with a
+         * zero SMEM heap and the kernel hangs in smd_core_init(), which looks
+         * exactly like a black screen.  tools/start.sh gets away with the
+         * implicit "smem.bin" because it runs from images/.
+         */
+        File smem = paths.image("smem.bin");
+        if (smem.isFile()) {
+            args.add("-global");
+            args.add("msm-modem.smem-image=" + smem.getAbsolutePath());
+        }
         args.add("-drive");
         args.add("if=mtd,format=raw,file=" + nand.getAbsolutePath());
         args.add("-display");
@@ -303,7 +315,7 @@ public class Emulator {
             q6args.add("-kernel");
             q6args.add(paths.image("dsp1.elf").getAbsolutePath());
             q6args.add("-icount");
-            q6args.add("shift=" + (cfg.dspShift < 0 ? "auto" : Integer.toString(cfg.dspShift)));
+            q6args.add("shift=" + q6Shift(cfg));
             q6args.add("-object");
             q6args.add("memory-backend-file,id=htcleo.ram,size=1G,mem-path="
                     + paths.dram().getAbsolutePath() + ",share=on");
@@ -374,6 +386,22 @@ public class Emulator {
 
     private boolean soundOn(Config cfg) {
         return "app".equals(cfg.audio);
+    }
+
+    /**
+     * The DSP's clock.
+     *
+     * It shares the DRAM with the apps core and the two talk over the Q6
+     * link, so they have to run on the same clock: with icount on the apps
+     * side and "auto" (the host's real time) on the DSP side the two would
+     * drift apart, and the audio would run at a different speed from the
+     * guest that fills its buffers.  A shift the user picked for the DSP
+     * still wins.
+     */
+    private String q6Shift(Config cfg) {
+        if (cfg.dspShift >= 0) return Integer.toString(cfg.dspShift);
+        if (cfg.icountShift >= 0) return Integer.toString(cfg.icountShift);
+        return "auto";
     }
 
     private void connectVnc(Config cfg) {
