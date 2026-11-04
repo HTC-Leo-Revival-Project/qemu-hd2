@@ -334,4 +334,4 @@ jobs:
           path: hd2-web-ui.tar.gz
           archive: false
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 60
