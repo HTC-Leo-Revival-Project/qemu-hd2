@@ -18,6 +18,7 @@
 #              only covers the first 2000 draws - the boot animation, never
 #              the launcher.
 #   ADRENO_STATS=5      the per-draw counters and timing breakdown
+#   NAND=, SD=          images (default files/images/nand-lle.img, sdcard.img)
 #   GNODEFER=1          (renderer experiments only; see android/adreno-divider.md)
 set -u
 PKG=org.htcleorevivalproject.hd2emu
@@ -26,6 +27,9 @@ Q6="$2"
 BACKEND="${3:-soft}"
 D=/data/user/0/$PKG/files
 R=$D/emu/run
+NAND=${NAND:-$D/images/nand-lle.img}
+SDARG=""
+[ -f "${SD:-$D/images/sdcard.img}" ] && SDARG="-drive if=sd,format=raw,file=${SD:-$D/images/sdcard.img}"
 
 cd "$R" || exit 1
 rm -f dram.bin vnc.sock qmp.sock q6link.sock qemu.log qemu.out "$PKG.out"
@@ -56,7 +60,7 @@ unset LD_LIBRARY_PATH
 "$ARM" \
   -L "$D/emu/pc-bios" \
   -M "htcleo,baseband=lle,baseband-firmware=$D/images/amss.elf,baseband-trace=off" \
-  -drive "if=mtd,format=raw,file=$D/images/nand-lle.img" \
+  -drive "if=mtd,format=raw,file=$NAND" \
   -display none \
   -vnc "unix:$R/vnc.sock" \
   -serial "file:$R/uart1" \
@@ -69,7 +73,7 @@ unset LD_LIBRARY_PATH
   -global msm-modem.clk-regime-fake=on \
   -d unimp,guest_errors \
   -D "$R/qemu.log" \
-  -drive "if=sd,format=raw,file=$D/images/sdcard.img" \
+  $SDARG \
   -nic user,model=bcm4329 \
   -nic user,model=msm-modem,net=10.0.3.0/24 \
   -chardev socket,id=adb,host=127.0.0.1,port=5555,server=on,wait=off \

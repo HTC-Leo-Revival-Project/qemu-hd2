@@ -31,7 +31,8 @@ S=$(adb devices | awk '$2 == "device" { print $1; exit }' 2>/dev/null || true)
 adb -s "$S" shell "su -c 'for p in \$(ps -A | grep -E \"qemu-arm|qemu-q6\" | tr -s \" \" | cut -d\" \" -f2); do kill -9 \$p 2>/dev/null; done'"
 sleep 2
 adb -s "$S" push "$SO" /data/local/tmp/qemu-arm.new >/dev/null
-adb -s "$S" shell "su -c 'cp /data/local/tmp/qemu-arm.new /data/user/0/$PKG/files/emu/bin/qemu-arm; chmod 755 /data/user/0/$PKG/files/emu/bin/qemu-arm'"
+adb -s "$S" push android/app/src/main/jniLibs/arm64-v8a/libhtcleo-q6.so /data/local/tmp/qemu-q6.new >/dev/null
+adb -s "$S" shell "su -c 'B=/data/user/0/$PKG/files/emu/bin; cp /data/local/tmp/qemu-arm.new \$B/qemu-arm; cp /data/local/tmp/qemu-q6.new \$B/qemu-q6; chmod 755 \$B/qemu-*; chown \$(stat -c %u:%g \$B) \$B/qemu-*'"
 
 want=$(md5sum "$SO" | cut -d' ' -f1)
 got=$(adb -s "$S" shell "su -c 'md5sum /data/user/0/$PKG/files/emu/bin/qemu-arm'" | tr -d '\r' | cut -d' ' -f1)
