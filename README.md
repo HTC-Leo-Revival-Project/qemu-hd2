@@ -134,6 +134,32 @@ are in `hw/arm/htcleo/htcleo.c`:
   DACR = 0xffffffff (all managers) to ignore the XN bit its section
   descriptors carry, and faults on its first fetch with the MMU on.
 
+### Flashing from the SD card
+
+The HSPL flashes `LEOIMG.nbh` from the root of a FAT32 (MBR) card, as on the
+phone: hold VolDown at power-on, let go at the tricolour screen, press POWER
+at "Press power button to start update image".
+
+```bash
+tools/mksdcard.sh sd.img 512 && mcopy -i sd.img@@1M LEOIMG.nbh ::LEOIMG.NBH
+# SPL=nand tools/start.sh, plus:  -M ...,keys=voldown:1000  -drive if=sd,...
+python3 tools/keys.py images/qmp.sock f12:800   # POWER, once the prompt is up
+```
+
+`keys=voldown:1000` holds VolDown for the first second of guest time and then
+lets go: still held at the prompt, VolDown means "cancel". The log ends with
+`si backup: Erase physical block from 4080 to 4096` and the screen with
+`UPDATE SUCCESS`. Tested with cLK 1.4.0.2 (the OS area comes out byte for
+byte, and the HSPL then boots it) and MAGLDR 1.13 (boots from the HSPL); the
+stock RUU gets as far as writing the radio.
+
+**Known problem:** the HSPL treats blocks 0x1f1-0x211 as its own reserved
+area ("Fill RSVD information for block 497 to 530") and erases some of them
+on the next boot, 0x20a among them - which is where this emulator keeps the
+HSPL for `spl=nand`. After a flash, `spl=nand` therefore works once; boot
+with `spl=hspl.bin` (the loose file) from then on. The real SPL lives
+somewhere the HSPL leaves alone; moving `SPL_BLOCK` there is still to do.
+
 <a name="run"></a>
 <h2><img src="docs/holo/h-run.png" width="76" height="40" alt="Run"></h2>
 
