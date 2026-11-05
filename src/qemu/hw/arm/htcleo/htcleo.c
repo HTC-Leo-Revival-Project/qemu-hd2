@@ -100,6 +100,10 @@ struct HtcleoMachineState {
     I2CSlave *gauge;
     int cable;                  /* CABLE_NONE / CABLE_USB / CABLE_AC */
     bool keys[HD2_NKEYS];
+    bool keys_reset[HD2_NKEYS];   /* -M keys=: down at reset            */
+    int64_t keys_hold_ms[HD2_NKEYS]; /* ...released after this, 0 = never */
+    QEMUTimer *keys_timer;
+    int64_t keys_t0;              /* virtual ms at the last reset */
     QemuInputHandlerState *kbd;
     QemuInputHandlerState *touch;
     I2CSlave *ts;
@@ -211,6 +215,8 @@ static void scorpion_add_cpregs(ARMCPU *cpu)
 /* ------------------------------------------------------------------ */
 /* Keypad                                                              */
 /* ------------------------------------------------------------------ */
+
+static void htcleo_keys_release(void *opaque);
 
 static void htcleo_update_keys(HtcleoMachineState *s)
 {
@@ -1013,9 +1019,23 @@ static void htcleo_reset(MachineState *machine, ResetType type)
     /*
      * The keys have to be on the matrix before anything runs: the HSPL reads
      * it as one of its first acts after reset, and the running system's own
-     * input handler is not even installed yet.
+     * input handler is not even installed yet.  A key given as name:ms
+     * is let go of that long into the boot, the way a person holds VolDown
+     * until the bootloader is up - and then lets go, since the HSPL takes a
+     * VolDown still down at its update prompt as "cancel".
      */
+    memcpy(s->keys, s->keys_reset, sizeof(s->keys));
     htcleo_update_keys(s);
+    s->keys_t0 = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    for (int k = 0; k < HD2_NKEYS; k++) {
+        if (s->keys_reset[k] && s->keys_hold_ms[k]) {
+            if (!s->keys_timer) {
+                s->keys_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                             htcleo_keys_release, s);
+            }
+            timer_mod(s->keys_timer, s->keys_t0 + s->keys_hold_ms[k]);
+        }
+    }
 
     if (s->spl_path && !strcmp(s->spl_path, "nand")) {
         /* spl=nand: the boot ROM reads the HSPL out of the NAND */
@@ -1910,6 +1930,29 @@ static void htcleo_instance_init(Object *obj)
  * the core, which is long before a key event sent from outside can arrive -
  * so the only way to try that path is for the key to be down at reset.
  */
+/* -M keys=name:ms - let go of a key held from reset, as a person would */
+static void htcleo_keys_release(void *opaque)
+{
+    HtcleoMachineState *s = opaque;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), next = INT64_MAX;
+
+    for (int k = 0; k < HD2_NKEYS; k++) {
+        if (s->keys_reset[k] && s->keys_hold_ms[k]) {
+            int64_t at = s->keys_t0 + s->keys_hold_ms[k];
+
+            if (at <= now) {
+                s->keys[k] = false;
+            } else {
+                next = MIN(next, at);
+            }
+        }
+    }
+    htcleo_update_keys(s);
+    if (next != INT64_MAX) {
+        timer_mod(s->keys_timer, next);
+    }
+}
+
 static void htcleo_set_keys(Object *obj, const char *value, Error **errp)
 {
     HtcleoMachineState *s = HTCLEO_MACHINE(obj);
@@ -1923,15 +1966,23 @@ static void htcleo_set_keys(Object *obj, const char *value, Error **errp)
     s->keys_held = g_strdup(value);
 
     memset(s->keys, 0, sizeof(s->keys));
+    memset(s->keys_reset, 0, sizeof(s->keys_reset));
+    memset(s->keys_hold_ms, 0, sizeof(s->keys_hold_ms));
     if (!value || !*value) {
         return;
     }
     copy = g_strdup(value);
     for (tok = strtok_r(copy, ",", &save); tok;
          tok = strtok_r(NULL, ",", &save)) {
+        char *ms = strchr(tok, ':');
+
+        if (ms) {
+            *ms++ = '\0';
+        }
         for (int k = 0; k < HD2_NKEYS; k++) {
             if (!g_strcmp0(tok, names[k])) {
-                s->keys[k] = true;
+                s->keys[k] = s->keys_reset[k] = true;
+                s->keys_hold_ms[k] = ms ? MAX(1, atoi(ms)) : 0;
                 break;
             }
         }
@@ -2002,7 +2053,8 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
                                   htcleo_set_keys);
     object_class_property_set_description(oc, "keys",
         "keys held down when the machine comes up, comma separated: volup, "
-        "voldown, windows, call, endcall, back, home, power.  The HSPL's "
+        "voldown, windows, call, endcall, back, home, power; name:MS lets "
+        "go of it MS milliseconds into the boot.  The HSPL's "
         "own test for becoming the bootloader runs in the first moments "
         "after the boot ROM hands it the core, so a key sent from outside "
         "arrives far too late to affect it");
