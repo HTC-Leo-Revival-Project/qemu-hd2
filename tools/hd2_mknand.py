@@ -529,6 +529,14 @@ def main():
     clk14 = None
     if a.nbh:
         secs, start, count = extract_nbh_os(a.nbh)
+        # An NBH of cLK 1.4 (upstream cLK still is one) carries the compiled
+        # board_part_list, not a VPTABLE: partitions from 0x219.  Laid out as
+        # 1.5 instead, cLK finds no boot image header and reboots.  The table
+        # is inside the flashed image, so it is used as it stands.
+        off, parts = clk14_ptable(b''.join(secs[start:start + count]))
+        if parts:
+            print('cLK 1.4 NBH: compiled partition table, sizes as built')
+            clk14 = clk14_layout(parts)
     elif a.lk:
         lk = bytearray(open(a.lk, 'rb').read())
         off, parts = clk14_ptable(lk)
