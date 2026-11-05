@@ -154,6 +154,14 @@ byte, and the HSPL then boots it) and MAGLDR 1.13, which reaches its boot
 menu from the HSPL once the radio is in the NAND (`hd2_radio.py --write-nand`)
 and the machine runs `baseband=lle` - without them it stops at `FAILED`.
 
+Not working yet: the stock RUU from the card stops at `Start Restore GSM1=
+0x417C0000` - the HSPL waits, with no timeout, for bytes on what looks like
+the modem's diag channel (channel 6, hspl.bin 0x95032c98), and nothing
+answers. And WinMo booted *by the HSPL* (`spl=hspl.bin` on an
+`hd2_wmnand.py` image) gets its kernel running (PC in 0x8006xxxx) but the
+screen stays the HSPL's grey; QEMU's own hand-off boots the same image to
+Windows.
+
 The HSPL lives in the radio's `0:APPSBL` partition (block 0x1f1, the MIBIB
 says so), where the HSPL itself never writes. It used to be kept at 0x20a, in
 `0:EFS2APPS`, which the HSPL treats as scratch after a flash and erased;
