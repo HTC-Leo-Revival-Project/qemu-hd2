@@ -18,6 +18,7 @@
 #              only covers the first 2000 draws - the boot animation, never
 #              the launcher.
 #   ADRENO_STATS=5      the per-draw counters and timing breakdown
+#   IC=N                icount shift (default 3, as the app; -1 = real time)
 #   NAND=, SD=          images (default files/images/nand-lle.img, sdcard.img)
 #   GNODEFER=1          (renderer experiments only; see android/adreno-divider.md)
 set -u
@@ -25,10 +26,17 @@ PKG=org.htcleorevivalproject.hd2emu
 ARM="$1"
 Q6="$2"
 BACKEND="${3:-soft}"
-D=/data/user/0/$PKG/files
+D=${GLESRUN_D:-/data/user/0/$PKG/files}
 R=$D/emu/run
 NAND=${NAND:-$D/images/nand-lle.img}
 SDARG=""
+# What the app adds (Emulator.java): the guest's clock on icount, so it sees
+# the same timeline as on a workstation (IC=-1 for the host's real time),
+# and the SMEM dump the baseband takes its heap from.
+IC=${IC:-3}
+ICARG=""; Q6IC=auto
+[ "$IC" -ge 0 ] && ICARG="-icount shift=$IC" && Q6IC=$IC   # the Q6 on the same clock, as the app
+SMEMARG=""; [ -f "$D/images/smem.bin" ] && SMEMARG="-global msm-modem.smem-image=$D/images/smem.bin"
 [ -f "${SD:-$D/images/sdcard.img}" ] && SDARG="-drive if=sd,format=raw,file=${SD:-$D/images/sdcard.img}"
 
 cd "$R" || exit 1
@@ -60,13 +68,14 @@ unset LD_LIBRARY_PATH
 "$ARM" \
   -L "$D/emu/pc-bios" \
   -M "htcleo,baseband=lle,baseband-firmware=$D/images/amss.elf,baseband-trace=off" \
+  $ICARG $SMEMARG \
   -drive "if=mtd,format=raw,file=$NAND" \
   -display none \
   -vnc "unix:$R/vnc.sock" \
   -serial "file:$R/uart1" \
   -serial "file:$R/ramcon.log" \
   -qmp "unix:$R/qmp.sock,server=on,wait=off" \
-  -qmp "tcp:127.0.0.1:4444,server=on,wait=off" \
+  -qmp "tcp:127.0.0.1:${QMP_PORT:-4444},server=on,wait=off" \
   -audiodev none,id=snd0 \
   -global msm-modem.audiodev=snd0 \
   -global "msm-adreno.backend=$BACKEND" \
@@ -76,7 +85,7 @@ unset LD_LIBRARY_PATH
   $SDARG \
   -nic user,model=bcm4329 \
   -nic user,model=msm-modem,net=10.0.3.0/24 \
-  -chardev socket,id=adb,host=127.0.0.1,port=5555,server=on,wait=off \
+  -chardev socket,id=adb,host=127.0.0.1,port=${ADB_PORT:-5555},server=on,wait=off \
   -global msm-hsusb.adb=adb \
   -object memory-backend-file,id=htcleo.ram,size=1G,mem-path="$R/dram.bin",share=on \
   -machine memory-backend=htcleo.ram,qdsp6=lle,qdsp6-link=q6link \
@@ -96,7 +105,7 @@ done
   -L "$D/emu/pc-bios" \
   -M "htcleo-q6,link=q6link,apps-irq=11,modem-irq=2,trace=off" \
   -kernel "$D/images/dsp1.elf" \
-  -icount shift=auto \
+  -icount shift=$Q6IC \
   -object memory-backend-file,id=htcleo.ram,size=1G,mem-path="$R/dram.bin",share=on \
   -machine memory-backend=htcleo.ram \
   -chardev socket,id=q6link,path="$R/q6link.sock" \

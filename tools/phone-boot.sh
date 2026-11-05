@@ -40,6 +40,7 @@ adb shell "su -c 'cp /data/local/tmp/glesrun.sh.new /data/local/tmp/glesrun.sh; 
 
 ENV=""
 [ -n "${NAND:-}" ] && ENV="$ENV NAND=$D/images/$NAND"
+[ -n "${IC:-}" ] && ENV="$ENV IC=$IC"
 [ -n "${SD:-}" ] && ENV="$ENV SD=$D/images/$SD"
 case "$MODE" in
     *trace*) ENV="$ENV GTRACE=1" ;;
