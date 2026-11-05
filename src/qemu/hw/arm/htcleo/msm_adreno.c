@@ -1218,6 +1218,7 @@ static const Property adreno_props[] = {
     DEFINE_PROP_UINT32("threads", MsmAdrenoState, nthreads, 6),
     /* "gl": the host GPU (OpenGL 4.5 with interlock), "soft": the CPU */
     DEFINE_PROP_STRING("backend", MsmAdrenoState, backend),
+    DEFINE_PROP_UINT32("gles-barrier", MsmAdrenoState, gles_barrier, 1),
 };
 
 static void adreno_class_init(ObjectClass *klass, const void *data)

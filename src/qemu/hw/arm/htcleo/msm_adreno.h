@@ -313,6 +313,7 @@ struct MsmAdrenoState {
      * OpenGL ES - a phone has no desktop OpenGL, so "gles" is the one it
      * wants there) */
     char *backend;              /* "gl", "gles" or "soft" */
+    uint32_t gles_barrier;      /* GLES: 0 none, 1 on overlap, 2 every draw */
     AdrenoGl *gl;
     bool gl_failed;
     bool gl_gles;               /* the host context is OpenGL ES */

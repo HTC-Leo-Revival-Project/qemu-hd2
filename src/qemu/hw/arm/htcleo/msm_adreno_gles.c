@@ -1360,6 +1360,9 @@ typedef struct AdrenoGles {
     uint8_t *scratch;
     size_t scratch_size;
     uint64_t ndraw;
+    /* the window area drawn since the last storage barrier (gles-barrier=1) */
+    bool pending;
+    int px0, py0, px1, py1;
     /* by RAM page: the command kick it last changed in (dirty logging) */
     uint32_t *page_kick;
     size_t npage_kick;
@@ -2251,6 +2254,41 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         /* window y is the guest's (down), so the winding is the other way */
         glFrontFace((sc & (1 << 2)) ? GL_CCW_ : GL_CW_);
     }
+    /*
+     * GMEM is a storage buffer each draw reads, blends into and writes
+     * back, and GL ES does not promise a draw sees an earlier draw's stores
+     * without glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT): a blended dot
+     * drawn over the last draw came out with pieces missing, a different
+     * piece each frame.  But on a tiler a barrier ends the pass, and one
+     * after every draw took the guest from ~15 to 1-2 frames a second.  So
+     * by default (gles-barrier=1) there is one only when this draw touches
+     * the window area drawn since the last; 2 is every draw, 0 none.
+     */
+    if (gl.MemoryBarrier && s->gles_barrier) {
+        bool need = s->gles_barrier >= 2;
+
+        if (!need && gls->pending &&
+            g->clip_x0 < gls->px1 && gls->px0 < g->clip_x1 &&
+            g->clip_y0 < gls->py1 && gls->py0 < g->clip_y1) {
+            need = true;
+        }
+        if (need) {
+            gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT_);
+            gls->pending = false;
+        }
+        if (!gls->pending) {
+            gls->px0 = g->clip_x0;
+            gls->py0 = g->clip_y0;
+            gls->px1 = g->clip_x1;
+            gls->py1 = g->clip_y1;
+            gls->pending = true;
+        } else {
+            gls->px0 = MIN(gls->px0, g->clip_x0);
+            gls->py0 = MIN(gls->py0, g->clip_y0);
+            gls->px1 = MAX(gls->px1, g->clip_x1);
+            gls->py1 = MAX(gls->py1, g->clip_y1);
+        }
+    }
     if (p->key.geom == GEOM_CPU) {
         glDrawArrays(GL_TRIANGLES_, 0, g->nverts);
     } else {
@@ -2260,16 +2298,6 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
                       GL_TRIANGLES_;
 
         glDrawElements(mode, g->nidx, GL_UNSIGNED_INT_, (void *)0);
-    }
-    /*
-     * GMEM is a storage buffer the shaders read, blend into and write back,
-     * and GL ES makes no promise that the next draw sees this one's stores:
-     * without a barrier a draw blending over the last one reads GMEM as it
-     * was before it - a blended dot comes out with pieces missing, a
-     * different piece each frame.  Draws stay in order with one.
-     */
-    if (gl.MemoryBarrier) {
-        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT_);
     }
     /*
      * Qualcomm's driver answers eglCreateContext() with an ES 3 context even
