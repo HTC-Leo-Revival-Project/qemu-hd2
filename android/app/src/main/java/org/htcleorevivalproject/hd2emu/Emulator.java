@@ -56,6 +56,13 @@ public class Emulator {
     private Qmp qmp, q6qmp;
     private volatile VncClient vnc, q6vnc;
     private PcmPlayer audio;
+    /*
+     * With the DSP running, Android's sound is the QDSP6's: AudioFlinger ->
+     * msm_pcm_out -> the DSP firmware's AFE -> htcleo-q6-audif, all in the
+     * qemu-system-hexagon process.  That process gets a VNC socket of its
+     * own for nothing but its audio, and this plays it.
+     */
+    private PcmPlayer q6audio;
     private Thread sensors, bootKeys;
     /** Whether the USB passthrough bridge is ours to stop; see {@link #killAll()}. */
     private volatile boolean bridgeRunning;
@@ -354,11 +361,16 @@ public class Emulator {
             q6args.add("htcleo-q6-audif.audiodev=q6snd");
             q6args.add("-display");
             q6args.add("none");
+            if (soundOn(cfg)) {
+                q6args.add("-vnc");
+                q6args.add("unix:" + paths.q6VncSocket() + ",audiodev=q6snd");
+            }
             q6args.add("-d");
             q6args.add("guest_errors,unimp");
             q6args.add("-D");
             q6args.add(paths.log("q6").getAbsolutePath());
             hexagon = spawn(q6, q6args, "q6.out", false);
+            if (soundOn(cfg)) connectQ6Audio(cfg);
         }
 
         watch();
@@ -458,6 +470,38 @@ public class Emulator {
                 return;
             } catch (IOException e) {
                 if (tries == 19) note(ctx.getString(R.string.emu_no_picture, e.getMessage()));
+                sleep(250);
+            }
+        }
+    }
+
+    /* the DSP's playback, over its audio-only VNC socket */
+    private void connectQ6Audio(Config cfg) {
+        q6audio = new PcmPlayer();
+        q6audio.setVolume(cfg.volume);
+        q6audio.start();
+        for (int tries = 0; tries < 40 && state != State.CRASHED; tries++) {
+            try {
+                q6vnc = VncClient.connect(paths.q6VncSocket().getAbsolutePath(), new VncClient.Listener() {
+                    @Override
+                    public void onFrame(byte[] fb, int w, int h) {
+                    }
+
+                    @Override
+                    public void onAudio(byte[] pcm, int length) {
+                        PcmPlayer p = q6audio;
+                        if (p != null) p.write(pcm, length);
+                        for (Listener l : listeners) l.onAudio(pcm, length);
+                    }
+
+                    @Override
+                    public void onClosed(String why) {
+                        if (!why.isEmpty()) Log.i(TAG, "q6 vnc closed: " + why);
+                    }
+                }, false, true);
+                return;
+            } catch (IOException e) {
+                if (tries == 39) Log.w(TAG, "no DSP audio: " + e.getMessage());
                 sleep(250);
             }
         }
@@ -601,6 +645,10 @@ public class Emulator {
             audio.stop();
             audio = null;
         }
+        if (q6audio != null) {
+            q6audio.stop();
+            q6audio = null;
+        }
         for (Process p : new Process[]{arm, hexagon}) {
             if (p != null) {
                 p.destroy();
@@ -619,7 +667,7 @@ public class Emulator {
 
     private void cleanSockets() {
         for (File f : new File[]{paths.qmpSocket(), paths.vncSocket(), paths.q6LinkSocket(),
-                paths.usbIpSocket()}) {
+                paths.q6VncSocket(), paths.usbIpSocket()}) {
             if (f.exists()) f.delete();
         }
     }
@@ -687,6 +735,7 @@ public class Emulator {
 
     public void setVolume(float v) {
         if (audio != null) audio.setVolume(v);
+        if (q6audio != null) q6audio.setVolume(v);
     }
 
     /* ---------------------------------------------------------------- input */

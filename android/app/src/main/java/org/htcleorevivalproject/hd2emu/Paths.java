@@ -62,6 +62,11 @@ public class Paths {
         return new File(runDir, "q6link.sock");
     }
 
+    /** The QDSP6's VNC socket: audio only, the DSP's playback. */
+    public File q6VncSocket() {
+        return new File(runDir, "q6vnc.sock");
+    }
+
     /** Where QEMU listens for the USB/IP stream the bridge connects to. */
     public File usbIpSocket() {
         return new File(runDir, "usbip.sock");
