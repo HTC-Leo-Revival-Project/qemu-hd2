@@ -163,7 +163,11 @@ screen stays the HSPL's grey; QEMU's own hand-off boots the same image to
 Windows. The kernel spins at 0x8006e3ac-0x8006e3c0 (with IRQs off) until bit 0 of
 entry 7 of an 8-entry SMSM-style state table in SMEM (VA 0xae802810, PA
 0x102810: entries 0 and 1 read 0x08000001 and 0x08010069) is set; nothing
-sets it. `smem-image=` makes no difference.
+sets it, because the modem is dead: on this path AMSS hits ERR_FATAL in
+`dpram.c` (HTC's DPRAM SIO channel; modem core in the dog-kick loop at
+0x538bba, its SMSM state showing SMSM_RESET 0x40) - presumably the HSPL's
+own use of the DPRAM ports leaves state that WinMo's second open trips
+over. `smem-image=` makes no difference.
 
 The HSPL lives in the radio's `0:APPSBL` partition (block 0x1f1, the MIBIB
 says so), where the HSPL itself never writes. It used to be kept at 0x20a, in
