@@ -160,7 +160,10 @@ the modem's diag channel (channel 6, hspl.bin 0x95032c98), and nothing
 answers. And WinMo booted *by the HSPL* (`spl=hspl.bin` on an
 `hd2_wmnand.py` image) gets its kernel running (PC in 0x8006xxxx) but the
 screen stays the HSPL's grey; QEMU's own hand-off boots the same image to
-Windows.
+Windows. The kernel spins at 0x8006e3ac-0x8006e3c0 (with IRQs off) until bit 0 of
+entry 7 of an 8-entry SMSM-style state table in SMEM (VA 0xae802810, PA
+0x102810: entries 0 and 1 read 0x08000001 and 0x08010069) is set; nothing
+sets it. `smem-image=` makes no difference.
 
 The HSPL lives in the radio's `0:APPSBL` partition (block 0x1f1, the MIBIB
 says so), where the HSPL itself never writes. It used to be kept at 0x20a, in
