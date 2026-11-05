@@ -102,7 +102,7 @@ python3 ../tools/hd2_mknand.py --spl hspl.bin --nbh LEOIMG.nbh --rom rom.zip -o 
 cd .. && SPL=nand tools/start.sh
 ```
 
-`spl=nand` makes the boot ROM read the HSPL out of the NAND (block 0x20a, one
+`spl=nand` makes the boot ROM read the HSPL out of the NAND (block 0x1f1, one
 2048-byte sector per page, the layout `hd2_mknand.py --spl` writes and
 `tools/hd2_osarea.py` can refresh in an existing image); `spl=<file>` boots it
 from a loose image instead, unwrapping HTC's `R000FF` container on the way in.
@@ -153,12 +153,10 @@ lets go: still held at the prompt, VolDown means "cancel". The log ends with
 byte, and the HSPL then boots it) and MAGLDR 1.13 (boots from the HSPL); the
 stock RUU gets as far as writing the radio.
 
-**Known problem:** the HSPL treats blocks 0x1f1-0x211 as its own reserved
-area ("Fill RSVD information for block 497 to 530") and erases some of them
-on the next boot, 0x20a among them - which is where this emulator keeps the
-HSPL for `spl=nand`. After a flash, `spl=nand` therefore works once; boot
-with `spl=hspl.bin` (the loose file) from then on. The real SPL lives
-somewhere the HSPL leaves alone; moving `SPL_BLOCK` there is still to do.
+The HSPL lives in the radio's `0:APPSBL` partition (block 0x1f1, the MIBIB
+says so), where the HSPL itself never writes. It used to be kept at 0x20a, in
+`0:EFS2APPS`, which the HSPL treats as scratch after a flash and erased;
+images made that way still boot (0x20a is tried when APPSBL is empty).
 
 <a name="run"></a>
 <h2><img src="docs/holo/h-run.png" width="76" height="40" alt="Run"></h2>

@@ -41,7 +41,7 @@ RAW_PAGE = 2112
 PPB = 64                    # pages per block
 NBLOCKS = 4096
 ROM_BLOCK = 0x212           # HTCLEO_ROM_OFFSET
-SPL_BLOCK = 0x20a           # HTCLEO_SPL_BLOCK: the HSPL itself
+SPL_BLOCK = 0x1f1           # HTCLEO_SPL_BLOCK: the HSPL, in 0:APPSBL
 BLK = PAGE * PPB            # 128 KiB
 
 
@@ -561,11 +561,13 @@ def main():
     if a.spl:
         spl = open(a.spl, 'rb').read()
         spl = unwrap_r000ff(spl)
-        secs = [spl[i:i + PAGE].ljust(PAGE, b'\xff')
-                for i in range(0, len(spl), PAGE)]
-        for i, sec in enumerate(secs):
+        # (not "secs": that is the OS image, written to the OS area below)
+        spl_secs = [spl[i:i + PAGE].ljust(PAGE, b'\xff')
+                    for i in range(0, len(spl), PAGE)]
+        for i, sec in enumerate(spl_secs):
             nand.write_page(SPL_BLOCK * PPB + i, sec)
-        print('HSPL: %d bytes (%d sectors) at block 0x%x' % (len(spl), len(secs), SPL_BLOCK))
+        print('HSPL: %d bytes (%d sectors) at block 0x%x'
+              % (len(spl), len(spl_secs), SPL_BLOCK))
 
     # 1. OS area (what HSPL flashes)
     for i, s in enumerate(secs):

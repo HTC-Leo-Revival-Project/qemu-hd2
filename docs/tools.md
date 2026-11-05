@@ -35,7 +35,7 @@ one set of tools talks to whichever launcher is running:
 | `hd2_osarea.py` | Rewrite the cLK OS area (block 0x212) of an existing NAND image from an `os.nb`/`LEOIMG.nbh`/`lk.bin`, the way `hd2_mknand.py` first lays it down. |
 | `mknand.py` | **Legacy duplicate** of `hd2_mknand.py` without the `--kernel`/`--cmdline` options. Unused; use `hd2_mknand.py`. |
 
-`hd2_mknand.py` options include `--spl` (flash the HSPL at block 0x20a so
+`hd2_mknand.py` options include `--spl` (flash the HSPL at block 0x1f1, 0:APPSBL so
 `SPL=nand tools/start.sh` can boot it out of the NAND), `--nbh`/`--lk`,
 `--rom`, `--recovery`,
 `--system-mb`, `--cache-mb`, `--wifi-mac`, `--bt-mac`, `--gpu`, `--kernel`,

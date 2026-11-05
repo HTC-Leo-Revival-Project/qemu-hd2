@@ -487,7 +487,16 @@ static void htcleo_ramcon_poll(void *opaque)
 
 #define NAND_PAGE_RAW        2112
 #define NAND_PAGES_PER_BLOCK 64
-#define HTCLEO_SPL_BLOCK    0x20a  /* HSPL, one 2K sector per page */
+/*
+ * The HSPL, one 2K sector per page, in the radio's 0:APPSBL partition (MIBIB:
+ * block 497, 6 blocks) - the apps bootloader's own place, which the HSPL
+ * leaves alone.  0x20a, where this used to be, is in 0:EFS2APPS: the HSPL
+ * fills 497-530 with its reserved-block data on an SD flash and erases parts
+ * of EFS2APPS on the next boot, the block that held it among them.  Images
+ * made before still boot: 0x20a is tried when APPSBL is empty.
+ */
+#define HTCLEO_SPL_BLOCK        0x1f1
+#define HTCLEO_SPL_BLOCK_OLD    0x20a
 
 static bool nand_read_page_data(BlockBackend *blk, uint32_t page,
                                uint8_t *out);
@@ -512,7 +521,8 @@ static bool nand_read_page_data(BlockBackend *blk, uint32_t page,
  *
  * spl=nand takes the HSPL out of the NAND instead of a file, so the whole
  * chain comes from the NAND image; hd2_mknand.py --spl flashes it at block
- * 0x20a, one 2048-byte sector per page, which is where the boot ROM looks.
+ * 0x1f1 (0:APPSBL), one 2048-byte sector per page, which is where the boot
+ * ROM looks.
  */
 
 #define HSPL_R000FF_MARK   "\x00\x01\x00\x80\x00\x00\x00\x01"
@@ -607,10 +617,11 @@ static bool htcleo_load_hspl(HtcleoMachineState *s)
  * spl=nand the whole chain, PBL included, comes out of the NAND image rather
  * than a side-car file.  Returns false when nothing is flashed there.
  */
-static bool htcleo_load_hspl_from_nand(HtcleoMachineState *s, BlockBackend *blk)
+static bool htcleo_load_hspl_from_nand(HtcleoMachineState *s, BlockBackend *blk,
+                                       uint32_t block)
 {
     gsize len = 0;
-    uint32_t base = HTCLEO_SPL_BLOCK * NAND_PAGES_PER_BLOCK;
+    uint32_t base = block * NAND_PAGES_PER_BLOCK;
     uint8_t *img;
 
     if (!blk) {
@@ -650,7 +661,7 @@ static bool htcleo_load_hspl_from_nand(HtcleoMachineState *s, BlockBackend *blk)
         s->hspl_len = len;
     }
     info_report("htcleo: HSPL: %zu bytes from NAND block 0x%x -> "
-                "physical 0x%x", s->hspl_len, HTCLEO_SPL_BLOCK,
+                "physical 0x%x", s->hspl_len, block,
                 HTCLEO_HSPL_PHYS);
     return true;
 }
@@ -1042,10 +1053,12 @@ static void htcleo_reset(MachineState *machine, ResetType type)
         g_free(s->hspl);
         s->hspl = NULL;
         s->hspl_len = 0;
-        s->hspl_run = htcleo_load_hspl_from_nand(s, blk);
+        s->hspl_run = htcleo_load_hspl_from_nand(s, blk, HTCLEO_SPL_BLOCK) ||
+                      htcleo_load_hspl_from_nand(s, blk, HTCLEO_SPL_BLOCK_OLD);
         if (!s->hspl_run) {
             error_report("htcleo: spl=nand but no HSPL is flashed at NAND "
-                         "block 0x%x", HTCLEO_SPL_BLOCK);
+                         "block 0x%x (or 0x%x)", HTCLEO_SPL_BLOCK,
+                         HTCLEO_SPL_BLOCK_OLD);
             exit(1);
         }
     }
