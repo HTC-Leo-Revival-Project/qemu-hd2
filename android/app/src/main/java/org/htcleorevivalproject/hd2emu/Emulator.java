@@ -256,6 +256,11 @@ public class Emulator {
             args.add("-global");
             args.add("msm-modem.clk-regime-fake=on");
         }
+        if ("gles".equals(cfg.gpu)) {
+            /* when one GPU draw must see the last one's GMEM writes */
+            args.add("-global");
+            args.add("msm-adreno.gles-barrier=" + cfg.glesBarrier);
+        }
         if (cfg.gpuThreads > 0) {
             args.add("-global");
             args.add("msm-adreno.threads=" + cfg.gpuThreads);

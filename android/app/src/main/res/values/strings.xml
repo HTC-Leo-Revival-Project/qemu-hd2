@@ -111,6 +111,13 @@
     <string name="set_renderer_soft_sum">Everything on the CPU</string>
     <string name="set_renderer_gles_sum">The Adreno 200 runs on this phone\'s own GPU through OpenGL ES 3</string>
     <string name="set_gpu_threads">GPU threads</string>
+    <string name="set_gpu_sync">GPU sync</string>
+    <string name="set_gpu_sync_none">Never</string>
+    <string name="set_gpu_sync_overlap">Where draws overlap</string>
+    <string name="set_gpu_sync_all">Every draw</string>
+    <string name="set_gpu_sync_none_sum">Fastest; blended parts can come out with pieces missing</string>
+    <string name="set_gpu_sync_overlap_sum">Waits only where a draw covers the last ones</string>
+    <string name="set_gpu_sync_all_sum">Always right, but very slow on a phone GPU</string>
     <string name="set_one_thread">1 thread</string>
     <string name="set_threads">%1$d threads</string>
     <string name="set_gles_note">The host GPU is asked for an OpenGL ES 3 context and checked for what the renderer needs; the answer is in the emulator log. The Adreno 200\'s draws run on this phone\'s own GPU through it.</string>

@@ -102,6 +102,13 @@
     <string name="set_renderer_soft_sum">Alles auf der CPU</string>
     <string name="set_renderer_gles_sum">Der Adreno 200 läuft über OpenGL ES 3 auf der GPU dieses Telefons</string>
     <string name="set_gpu_threads">GPU-Threads</string>
+    <string name="set_gpu_sync">GPU-Synchronisierung</string>
+    <string name="set_gpu_sync_none">Nie</string>
+    <string name="set_gpu_sync_overlap">Wo sich Zeichnungen überlappen</string>
+    <string name="set_gpu_sync_all">Bei jeder Zeichnung</string>
+    <string name="set_gpu_sync_none_sum">Am schnellsten; überblendete Teile können lückenhaft sein</string>
+    <string name="set_gpu_sync_overlap_sum">Wartet nur, wo eine Zeichnung die vorigen überdeckt</string>
+    <string name="set_gpu_sync_all_sum">Immer korrekt, auf einer Handy-GPU aber sehr langsam</string>
     <string name="set_one_thread">1 Thread</string>
     <string name="set_threads">%1$d Threads</string>
     <string name="set_gles_note">Die GPU des Hosts wird nach einem OpenGL-ES-3-Kontext gefragt und geprüft, ob sie kann, was der Renderer braucht; die Antwort steht im Emulator-Protokoll. Software, bis der ES-Renderer fertig ist. GPU-Threads: 0 überlässt es QEMU.</string>

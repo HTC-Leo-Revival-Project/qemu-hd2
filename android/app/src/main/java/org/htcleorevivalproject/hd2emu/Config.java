@@ -43,6 +43,7 @@ public class Config {
      */
     public int icountShift = 3;
     public int gpuThreads = 0;            // 0 = QEMU's own choice
+    public int glesBarrier = 1;           // GPU sync: 0 none, 1 where draws overlap, 2 every draw
     public float volume = 1.0f;
     public boolean showFps = false;
     public boolean keepScreenOn = true;   // while the emulator runs and its screen is shown
@@ -104,6 +105,7 @@ public class Config {
         dspShift = prefs.getInt("dspShift", dspShift);
         icountShift = prefs.getInt("icountShift", icountShift);
         gpuThreads = prefs.getInt("gpuThreads", gpuThreads);
+        glesBarrier = prefs.getInt("glesBarrier", glesBarrier);
         volume = prefs.getFloat("volume", volume);
         showFps = prefs.getBoolean("showFps", showFps);
         keepScreenOn = prefs.getBoolean("keepScreenOn", keepScreenOn);
@@ -128,6 +130,7 @@ public class Config {
                 .putInt("dspShift", dspShift)
                 .putInt("icountShift", icountShift)
                 .putInt("gpuThreads", gpuThreads)
+                .putInt("glesBarrier", glesBarrier)
                 .putFloat("volume", volume)
                 .putBoolean("showFps", showFps)
                 .putBoolean("keepScreenOn", keepScreenOn)

@@ -198,6 +198,23 @@ public class SettingsActivity extends HoloActivity {
                         rebuild();
                     }
                 });
+        if (gles) {
+            final String[] sync = {getString(R.string.set_gpu_sync_none),
+                    getString(R.string.set_gpu_sync_overlap), getString(R.string.set_gpu_sync_all)};
+            int b = Math.max(0, Math.min(2, config.glesBarrier));
+            page.choice(getString(R.string.set_gpu_sync), sync[b], sync,
+                    new String[]{getString(R.string.set_gpu_sync_none_sum),
+                            getString(R.string.set_gpu_sync_overlap_sum),
+                            getString(R.string.set_gpu_sync_all_sum)},
+                    b, new Holo.OnPick() {
+                        @Override
+                        public void onPick(int index) {
+                            config.glesBarrier = index;
+                            save();
+                            rebuild();
+                        }
+                    });
+        }
         page.seek(getString(R.string.set_gpu_threads), 0, 8, config.gpuThreads, new Holo.Format() {
             @Override
             public String format(int v) {
