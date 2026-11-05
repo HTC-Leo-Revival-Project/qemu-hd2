@@ -150,8 +150,9 @@ python3 tools/keys.py images/qmp.sock f12:800   # POWER, once the prompt is up
 lets go: still held at the prompt, VolDown means "cancel". The log ends with
 `si backup: Erase physical block from 4080 to 4096` and the screen with
 `UPDATE SUCCESS`. Tested with cLK 1.4.0.2 (the OS area comes out byte for
-byte, and the HSPL then boots it) and MAGLDR 1.13 (boots from the HSPL); the
-stock RUU gets as far as writing the radio.
+byte, and the HSPL then boots it) and MAGLDR 1.13, which reaches its boot
+menu from the HSPL once the radio is in the NAND (`hd2_radio.py --write-nand`)
+and the machine runs `baseband=lle` - without them it stops at `FAILED`.
 
 The HSPL lives in the radio's `0:APPSBL` partition (block 0x1f1, the MIBIB
 says so), where the HSPL itself never writes. It used to be kept at 0x20a, in
