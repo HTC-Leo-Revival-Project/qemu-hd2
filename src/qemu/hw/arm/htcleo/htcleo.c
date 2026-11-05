@@ -150,17 +150,19 @@ static void scorpion_add_cpregs(ARMCPU *cpu)
           .opc1 = CP_ANY, .opc2 = CP_ANY, .access = PL1_RW,
           .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
         /*
-         * DACR (c3).  From ARMv6 the access permissions live in the L1
-         * descriptor and DACR is RAZ/WI: every domain is a client.  The HSPL
-         * still zeroes it while it is setting the MMU up
-         * (hspl.bin 0x9500117c, right before it installs VBAR), and on a
-         * Scorpion that write goes nowhere; in a model that honours DACR it
-         * takes effect at once, denies every domain and the very next
-         * instruction fetch aborts, so the board never gets off the ground.
+         * DACR (c3) is *not* in here: it is a real register on a v7
+         * short-descriptor MMU, and the Linux zImage decompressor depends
+         * on it.  It loads DACR with 0xffffffff, every domain a manager,
+         * because its section descriptors (0x12 | ...) carry bit 4 - XN on
+         * v7 - and only a manager domain skips that check.  With DACR forced
+         * to "client" the decompressor takes a permission fault on the first
+         * fetch after its MMU comes on, and Android never boots.
+         *
+         * The HSPL's DACR = 0 at hspl.bin 0x9500117c runs with the MMU off
+         * (it is entered at physical 0, see htcleo_hspl_boot()), so it is
+         * harmless; it loads 0x55555555 itself (0x9501ded8) before it turns
+         * the MMU on.
          */
-        { .name = "SCORPION_DACR", .cp = 15, .crn = 3, .crm = 0,
-          .opc1 = 0, .opc2 = 0, .access = PL1_RW,
-          .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
         { .name = "SCORPION_DBGPRSR", .cp = 14, .crn = 1, .crm = 5,
           .opc1 = 0, .opc2 = 4, .access = PL1_RW,
           .type = ARM_CP_CONST | ARM_CP_OVERRIDE, .resetvalue = 0 },
@@ -957,7 +959,7 @@ static void htcleo_hspl_boot(HtcleoMachineState *s, CPUARMState *env)
     env->cp15.tcr_el[1] = 0;               /* 4 KB pages, one translation reg */
     env->cp15.sctlr_el[1] &= ~(SCTLR_M | 0x3FFFFF);
     env->cp15.sctlr_el[1] |= SCTLR_C;     /* caches on, MMU off            */
-    /* every domain a client; from ARMv6 the DACR is RAZ/WI anyway */
+    /* every domain a client until the HSPL loads its own DACR */
     env->cp15.dacr_ns = 0x55555555;
     env->cp15.vbar_ns = 0;
     arm_rebuild_hflags(env);

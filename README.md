@@ -127,9 +127,12 @@ are in `hw/arm/htcleo/htcleo.c`:
   as zero and swallows writes, as on a Scorpion. Varying CRn instead would
   shadow c0..c15 - c1, the SCTLR, among them - and the HSPL's MMU-off
   trampoline (`mcr p15,0,r1,c1,c0,0`) would silently do nothing.
-- **the DACR is RAZ/WI from ARMv6**, every domain a client. The HSPL still
-  zeroes it while it sets the MMU up (hspl.bin 0x9500117c); in a model that
-  honours it, the very next instruction fetch aborts.
+- **the DACR is a real register**, and must stay one. The HSPL zeroes it
+  while the MMU is still off (hspl.bin 0x9500117c), which is harmless, and
+  loads 0x55555555 itself before it turns the MMU on. Faking it as "every
+  domain a client" breaks Linux instead: the zImage decompressor relies on
+  DACR = 0xffffffff (all managers) to ignore the XN bit its section
+  descriptors carry, and faults on its first fetch with the MMU on.
 
 <a name="run"></a>
 <h2><img src="docs/holo/h-run.png" width="76" height="40" alt="Run"></h2>
