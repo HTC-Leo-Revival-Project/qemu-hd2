@@ -154,20 +154,17 @@ byte, and the HSPL then boots it) and MAGLDR 1.13, which reaches its boot
 menu from the HSPL once the radio is in the NAND (`hd2_radio.py --write-nand`)
 and the machine runs `baseband=lle` - without them it stops at `FAILED`.
 
+With `baseband=lle` the modem core is held while the HSPL runs and released
+when it hands off to the OS: run together, AMSS dies a few seconds into the
+HSPL (ERR_FATAL `dpram.c:461`, DPRAM traffic on a port it has no receiver
+for) and the OS then waits for the modem forever. Booted by the HSPL this
+way, WinMo 6.5 reaches HTC's setup, cLK + CM9 reaches Android, MAGLDR its
+menu.
+
 Not working yet: the stock RUU from the card stops at `Start Restore GSM1=
 0x417C0000` - the HSPL waits, with no timeout, for bytes on what looks like
-the modem's diag channel (channel 6, hspl.bin 0x95032c98), and nothing
-answers. And WinMo booted *by the HSPL* (`spl=hspl.bin` on an
-`hd2_wmnand.py` image) gets its kernel running (PC in 0x8006xxxx) but the
-screen stays the HSPL's grey; QEMU's own hand-off boots the same image to
-Windows. The kernel spins at 0x8006e3ac-0x8006e3c0 (with IRQs off) until bit 0 of
-entry 7 of an 8-entry SMSM-style state table in SMEM (VA 0xae802810, PA
-0x102810: entries 0 and 1 read 0x08000001 and 0x08010069) is set; nothing
-sets it, because the modem is dead: on this path AMSS hits ERR_FATAL in
-`dpram.c` (HTC's DPRAM SIO channel; modem core in the dog-kick loop at
-0x538bba, its SMSM state showing SMSM_RESET 0x40) - presumably the HSPL's
-own use of the DPRAM ports leaves state that WinMo's second open trips
-over. `smem-image=` makes no difference.
+the modem's diag channel (channel 6, hspl.bin 0x95032c98). With the modem
+held nothing answers; let run, it is dead by then.
 
 The HSPL lives in the radio's `0:APPSBL` partition (block 0x1f1, the MIBIB
 says so), where the HSPL itself never writes. It used to be kept at 0x20a, in
