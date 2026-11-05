@@ -93,6 +93,7 @@ typedef long            GLsizeiptr;
 #define GL_COPY_WRITE_BUFFER_            0x8F37
 #define GL_MAP_READ_BIT_                 0x0001
 #define GL_BUFFER_UPDATE_BARRIER_BIT_    0x0200
+#define GL_SHADER_STORAGE_BARRIER_BIT_   0x2000
 #define GL_RGBA32F_                     0x8814
 #define GL_RGBA8_                       0x8058
 #define GL_REPEAT_                       0x2901
@@ -1329,6 +1330,8 @@ typedef struct GlesTex {
     AdrenoTexImage im;
     uint64_t used;
     bool fresh;
+    uint32_t npages;
+    uint64_t *pages;            /* its pages' RAM addresses + 1 (0: none) */
 } GlesTex;
 
 #define GlesTexCacheMax   768
@@ -1357,6 +1360,9 @@ typedef struct AdrenoGles {
     uint8_t *scratch;
     size_t scratch_size;
     uint64_t ndraw;
+    /* by RAM page: the command kick it last changed in (dirty logging) */
+    uint32_t *page_kick;
+    size_t npage_kick;
     /*
      * Why a draw would come out wrong, counted so the log can say: a texture
      * the guest's memory cannot be turned into one (so every fetch of it
@@ -1551,6 +1557,92 @@ static GLenum gles_wrap(unsigned m)
            m == 3 ? GL_CLAMP_TO_EDGE_ : GL_REPEAT_;
 }
 
+/*
+ * The CPU's writes to textures, as in msm_adreno_gl.c: QEMU's dirty logging
+ * of guest RAM.  A texture whose pages the CPU has not touched and the GPU
+ * has not written since it was last checked is the same texture, without
+ * hashing all of it again - and, above all, without first draining every
+ * deferred resolve, which is a wait for the GPU.
+ */
+static uint64_t gles_page_ram(MsmAdrenoState *s, uint32_t va)
+{
+    hwaddr pa, xlat, len = 0x1000;
+    MemoryRegion *mr;
+    uint64_t ram = 0;
+
+    if (!adreno_translate(s, va, &pa)) {
+        return 0;
+    }
+    WITH_RCU_READ_LOCK_GUARD() {
+        mr = address_space_translate(&address_space_memory, pa, &xlat, &len,
+                                     false, MEMTXATTRS_UNSPECIFIED);
+        if (memory_region_is_ram(mr) && len >= 0x1000 && !(xlat & 0xfff)) {
+            ram = memory_region_get_ram_addr(mr) + xlat + 1;
+        } else {
+            mr = NULL;
+        }
+    }
+    if (mr && !memory_region_is_logging(mr, DIRTY_MEMORY_VGA)) {
+        memory_region_set_log(mr, true, DIRTY_MEMORY_VGA);
+    }
+    return ram;
+}
+
+/* the kick a RAM page last changed in (as far as we have looked) */
+static uint32_t gles_page_changed(MsmAdrenoState *s, uint64_t ram)
+{
+    AdrenoGles *gls = g_gles;
+    size_t pg = ram >> 12;
+
+    if (pg >= gls->npage_kick) {
+        size_t n = MAX(pg + 1, gls->npage_kick * 2);
+
+        gls->page_kick = g_renew(uint32_t, gls->page_kick, n);
+        memset(gls->page_kick + gls->npage_kick, 0,
+               (n - gls->npage_kick) * sizeof(uint32_t));
+        gls->npage_kick = n;
+    }
+    if (physical_memory_test_and_clear_dirty(ram, 0x1000, DIRTY_MEMORY_VGA,
+                                             NULL)) {
+        gls->page_kick[pg] = s->kick_epoch;
+    }
+    return gls->page_kick[pg];
+}
+
+/* note the texture's pages (and take their dirty bits) */
+static void gles_tex_pages(MsmAdrenoState *s, GlesTex *t)
+{
+    uint32_t first = t->lo & ~0xfffu;
+
+    t->npages = t->hi > first ? DIV_ROUND_UP(t->hi - first, 0x1000) : 0;
+    t->pages = g_renew(uint64_t, t->pages, t->npages);
+    for (uint32_t i = 0; i < t->npages; i++) {
+        t->pages[i] = gles_page_ram(s, first + i * 0x1000);
+        if (t->pages[i]) {
+            gles_page_changed(s, t->pages[i] - 1);
+        }
+    }
+}
+
+/* the texture's pages are where they were, and the CPU left them alone */
+static bool gles_tex_pages_unchanged(MsmAdrenoState *s, GlesTex *t)
+{
+    uint32_t first = t->lo & ~0xfffu;
+
+    if (!t->pages) {
+        return false;
+    }
+    for (uint32_t i = 0; i < t->npages; i++) {
+        uint64_t ram = gles_page_ram(s, first + i * 0x1000);
+
+        if (!ram || ram != t->pages[i] ||
+            (int32_t)(gles_page_changed(s, ram - 1) - t->stamp.kick) > 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
 {
     AdrenoGles *gls = g_gles;
@@ -1569,30 +1661,45 @@ static GlesTex *gles_texture(MsmAdrenoState *s, unsigned idx)
     key.fc[3] = fc[3] & 1;
     key.fc[4] = fc[4] & 0x3fc;
     key.fc[5] = fc[5] & ~3u;
-    /* a resolve not done yet may have written what we are about to read */
-    adreno_resolves_flush(s);
     t = g_hash_table_lookup(gls->texes, &key);
-    if (t && t->tex && t->hash == adreno_tex_hash(s, &gls->tlb, idx, &lo, &hi)) {
+    /*
+     * Nothing the GPU wrote overlaps it, and it was checked in this kick or
+     * the CPU has not touched its pages since: the same texture.
+     */
+    if (t && t->tex && !adreno_gpu_wrote(s, &t->stamp, t->lo, t->hi) &&
+        (t->stamp.kick == s->kick_epoch || gles_tex_pages_unchanged(s, t))) {
         t->stamp.kick = s->kick_epoch;
         t->stamp.writes = s->gpu_writes;
         t->used = gls->ndraw;
         return t;
+    }
+    {
+        int64_t t0 = s->stats_on ? g_get_monotonic_time() : 0;
+
+        /* a resolve not done yet may have written what we are about to read */
+        adreno_resolves_flush(s);
+        h = adreno_tex_hash(s, &gls->tlb, idx, &lo, &hi);
+        if (s->stats_on) {
+            s->st.tex += g_get_monotonic_time() - t0;
+            s->st.hashes++;
+        }
     }
     if (!t) {
         t = g_new0(GlesTex, 1);
         t->key = key;
         g_hash_table_insert(gls->texes, &t->key, t);
     }
-    h = adreno_tex_hash(s, &gls->tlb, idx, &lo, &hi);
     if (t->tex && t->hash == h) {
         t->stamp.kick = s->kick_epoch;
         t->stamp.writes = s->gpu_writes;
+        gles_tex_pages(s, t);
         t->used = gls->ndraw;
         return t;
     }
     t->hash = h;
     t->lo = lo;
     t->hi = hi;
+    gles_tex_pages(s, t);
     t->stamp.kick = s->kick_epoch;
     t->stamp.writes = s->gpu_writes;
     t->used = gls->ndraw;
@@ -2153,6 +2260,16 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
                       GL_TRIANGLES_;
 
         glDrawElements(mode, g->nidx, GL_UNSIGNED_INT_, (void *)0);
+    }
+    /*
+     * GMEM is a storage buffer the shaders read, blend into and write back,
+     * and GL ES makes no promise that the next draw sees this one's stores:
+     * without a barrier a draw blending over the last one reads GMEM as it
+     * was before it - a blended dot comes out with pieces missing, a
+     * different piece each frame.  Draws stay in order with one.
+     */
+    if (gl.MemoryBarrier) {
+        gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT_);
     }
     /*
      * Qualcomm's driver answers eglCreateContext() with an ES 3 context even
