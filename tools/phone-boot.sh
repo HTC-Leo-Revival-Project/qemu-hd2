@@ -59,5 +59,8 @@ adb shell "run-as $PKG sh -c '$ENV setsid sh /data/local/tmp/glesrun.sh $D/emu/b
 # anything.  Without this the guest sits in the bootloader forever, ramcon
 # stays empty, and the PC parks at 0x28007b92 - which looks like a hang and
 # is not one.  The app does the same thing from startBootKeys().
+# NOKEYS=1 for an image whose bootloader does not wait (WinMo, an
+# autobooting cLK): F2 is a real key once the OS is up.
+[ -n "${NOKEYS:-}" ] && exit 0
 sleep 12
 python3 "$HERE/phone-keys.py" f2 >/dev/null 2>&1 || true
