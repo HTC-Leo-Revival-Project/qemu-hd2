@@ -50,6 +50,8 @@
 #include "hw/core/cpu.h"
 #include "htcleo.h"
 #include "msm_modem_lle.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmModemLleState, MSM_MODEM_LLE)
 
@@ -80,11 +82,15 @@ struct MsmModemLleState {
     MemoryRegion mem;           /* the modem core's view of the bus */
     MemoryRegion ram_alias;
     MemoryRegion tap;
-    MemoryRegion ram9c, imem;
+    MemoryRegion ram9c, imem, dblram;
     DeviceState *vic, *tmr, *mdsp, *ssbi, *gstmr, *wstmr;
 
     MemoryRegion *ram;
     char *firmware;
+    char *osbl;                 /* osbl=: boot the modem through OSBL */
+    char *fsbl;                 /* fsbl=: FSBL, resident under OSBL */
+    qemu_irq apps_release;      /* OSBL lets the apps core out of reset */
+    uint32_t apps_rst;
     bool trace;
 
     GByteArray *elf;
@@ -191,6 +197,17 @@ static MemTxResult tap_write(void *opaque, hwaddr off, uint64_t data,
         g_hash_table_insert(s->regs, k, GUINT_TO_POINTER(w));
     }
     tap_log(s, a, true, data, size, r);
+    /*
+     * OSBL's "Boot CE": once it has loaded APPSBL to 0 it pulses bit 2 of
+     * CLK_CTL + 0x20C, and the apps core comes out of reset as that bit
+     * drops.
+     */
+    if (s->osbl && a == 0xA860020C && size == 4) {
+        if ((s->apps_rst & 4) && !(data & 4)) {
+            qemu_irq_pulse(s->apps_release);
+        }
+        s->apps_rst = data;
+    }
     if (s->dump_on && a == s->dump_on && !s->dumped) {
         lle_dump_stack(s);
     }
@@ -370,6 +387,239 @@ static void lle_osbl_htc_config(MsmModemLleState *s)
     }
 }
 
+/*
+ * osbl=<file>: start the modem core in HTC's OSBL (the "OEMSBL") instead of
+ * in AMSS, the way FSBL hands over on the phone.  The file is the OSBL
+ * partition as it is in the NAND: 2 KiB pages, the first page of every
+ * 128 KiB block a copy of the partition header, the image itself starting
+ * with a 40-byte header (id 0xb, version 3, destination, size).  OSBL then
+ * decides itself whether to load AMSS or, for the bootloader and RUU,
+ * stay where it is and serve the apps side.
+ *
+ * FSBL passes a 32-byte block of pointers in r0; OSBL insists on +0, +8,
+ * +20 and +28 being non-NULL and copies 24, 80 and 24 bytes from three of
+ * them.  What FSBL puts there is not known yet: here they point at zeroes.
+ */
+#define OSBL_SHARED     0x002E0000
+#define FSBL_BASE       0x02B00000
+#define NAND_RAW_PAGE   2112    /* 2048 bytes and the spare, as the image has them */
+
+/*
+ * The radio's system partition table (MIBIB, magic 0x55EE73AA 0xE35EBDDB,
+ * version 3, 464 bytes): DBL reads it out of the NAND and hands it to OSBL
+ * (hand-off +12), whose NAND driver finds the radio's partitions by it.  It
+ * is the first thing in a page of the MIBIB blocks, inside the first
+ * codeword.
+ */
+static bool lle_read_ptable(uint8_t *out)
+{
+    DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+    BlockBackend *blk = dinfo ? blk_by_legacy_dinfo(dinfo) : NULL;
+    uint8_t page[NAND_RAW_PAGE];
+
+    if (!blk) {
+        return false;
+    }
+    for (int pg = 0; pg < 10 * 64; pg++) {
+        if (blk_pread(blk, (int64_t)pg * NAND_RAW_PAGE, sizeof(page), page,
+                      0) < 0) {
+            return false;
+        }
+        if (ldl_le_p(page) == 0x55EE73AA && ldl_le_p(page + 4) == 0xE35EBDDB &&
+            ldl_le_p(page + 8) == 3) {
+            memcpy(out, page, 0x1d0);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* a boot partition's image: its pages less the first of every block */
+static GByteArray *lle_read_sbl(const char *path)
+{
+    g_autoptr(GError) gerr = NULL;
+    g_autofree gchar *raw = NULL;
+    GByteArray *img;
+    gsize len;
+
+    if (!g_file_get_contents(path, &raw, &len, &gerr)) {
+        error_report("msm-modem-lle: %s", gerr->message);
+        return NULL;
+    }
+    img = g_byte_array_new();
+    for (gsize o = 0; o + 2048 <= len; o += 2048) {
+        if ((o / 2048) % 64) {
+            g_byte_array_append(img, (guint8 *)raw + o, 2048);
+        }
+    }
+    return img;
+}
+
+/*
+ * FSBL stays in memory under OSBL and serves it: OSBL calls the six
+ * functions of FSBL's "target" interface (hand-off +28), one of which hands
+ * back the FSBL interface proper.  The image is loaded at 0x02B00000, and
+ * its first word is its entry.
+ */
+static bool lle_load_fsbl(MsmModemLleState *s, uint32_t *entry)
+{
+    g_autoptr(GByteArray) img = lle_read_sbl(s->fsbl);
+    uint32_t used;
+
+    if (!img || img->len < 4) {
+        return false;
+    }
+    for (used = img->len; used && img->data[used - 1] == 0xff; used--) {
+    }
+    address_space_write(&address_space_memory, FSBL_BASE,
+                        MEMTXATTRS_UNSPECIFIED, img->data, used);
+    *entry = ldl_le_p(img->data);
+    info_report("htcleo: FSBL resident at 0x%08x (%u bytes)", FSBL_BASE, used);
+    return true;
+}
+
+static bool lle_start_osbl(MsmModemLleState *s)
+{
+    g_autoptr(GError) gerr = NULL;
+    g_autofree gchar *raw = NULL;
+    g_autoptr(GByteArray) img = g_byte_array_new();
+    gsize len;
+    uint32_t dest, size, sh[8] = { 0 };
+    g_autofree uint8_t *zero = g_malloc0(0x1000);
+
+    if (!g_file_get_contents(s->osbl, &raw, &len, &gerr)) {
+        error_report("msm-modem-lle: osbl: %s", gerr->message);
+        return false;
+    }
+    for (gsize o = 0; o + 2048 <= len; o += 2048) {
+        if ((o / 2048) % 64) {
+            g_byte_array_append(img, (guint8 *)raw + o, 2048);
+        }
+    }
+    if (img->len < 40 || ldl_le_p(img->data) != 0xb) {
+        error_report("msm-modem-lle: osbl: %s is not an OSBL partition",
+                     s->osbl);
+        return false;
+    }
+    dest = ldl_le_p(img->data + 12);
+    size = MIN(ldl_le_p(img->data + 16), img->len - 40);
+    address_space_write(&address_space_memory, dest, MEMTXATTRS_UNSPECIFIED,
+                        img->data + 40, size);
+
+    address_space_write(&address_space_memory, OSBL_SHARED,
+                        MEMTXATTRS_UNSPECIFIED, zero, 0x1000);
+    sh[0] = cpu_to_le32(OSBL_SHARED + 0x100);
+    sh[2] = cpu_to_le32(OSBL_SHARED + 0x200);
+    sh[5] = cpu_to_le32(OSBL_SHARED + 0x300);
+    sh[7] = cpu_to_le32(OSBL_SHARED + 0x400);
+    sh[6] = cpu_to_le32(1);
+    sh[1] = cpu_to_le32(OSBL_SHARED + 0xC00);
+    {
+        uint8_t pt[0x1d0];
+
+        if (lle_read_ptable(pt)) {
+            address_space_write(&address_space_memory, OSBL_SHARED + 0xD00,
+                                MEMTXATTRS_UNSPECIFIED, pt, sizeof(pt));
+            sh[3] = cpu_to_le32(OSBL_SHARED + 0xD00);
+        } else {
+            warn_report("msm-modem-lle: no radio partition table in the NAND");
+        }
+    }
+    address_space_write(&address_space_memory, OSBL_SHARED,
+                        MEMTXATTRS_UNSPECIFIED, sh, sizeof(sh));
+    /*
+     * +8 is the boot ROM's (PBL's) shared data, 80 bytes: magic 0x78577020,
+     * +8 a table of six ROM services (OSBL registers its error handler and
+     * a callback through the first - here all are a stub that returns 1),
+     * +12 the end of a 0x68-byte block OSBL copies, +28 a 48-byte block.
+     */
+    {
+        static const uint32_t stub[] = { 0xe3a00001, 0xe12fff1e };
+        uint32_t pbl[8] = {
+            cpu_to_le32(0x78577020), 0,
+            cpu_to_le32(OSBL_SHARED + 0x700),
+            cpu_to_le32(OSBL_SHARED + 0x780 + 0x68), 0, 0, 0,
+            cpu_to_le32(OSBL_SHARED + 0x900),
+        };
+        uint32_t tbl[16];
+
+        for (int i = 0; i < 16; i++) {
+            tbl[i] = cpu_to_le32(OSBL_SHARED + 0x800);
+        }
+        address_space_write(&address_space_memory, OSBL_SHARED + 0x200,
+                            MEMTXATTRS_UNSPECIFIED, pbl, sizeof(pbl));
+        address_space_write(&address_space_memory, OSBL_SHARED + 0x700,
+                            MEMTXATTRS_UNSPECIFIED, tbl, sizeof(tbl));
+        address_space_write(&address_space_memory, OSBL_SHARED + 0x800,
+                            MEMTXATTRS_UNSPECIFIED, stub, sizeof(stub));
+        /* +28 -> word 0: the device PBL booted from, 2 = NAND */
+        stl_le_p(&tbl[0], 2);
+        address_space_write(&address_space_memory, OSBL_SHARED + 0x900,
+                            MEMTXATTRS_UNSPECIFIED, &tbl[0], 4);
+    }
+
+    /*
+     * +4 is DBL's: OSBL calls the function its first word points to (on a
+     * stack in the boot RAM) and copies the 24 bytes it returns; words 0
+     * and 5 of them are boot configuration whose defaults in OSBL are 0x13
+     * and 0xa.  Here a stub returns exactly those.
+     */
+    {
+        uint32_t dbl[] = {
+            cpu_to_le32(OSBL_SHARED + 0xC20),       /* +0xC00: the object */
+            0, 0, 0, 0, 0, 0, 0,
+            cpu_to_le32(0xe28f0004),    /* +0xC20: add r0, pc, #4 */
+            cpu_to_le32(0xe12fff1e),    /*         bx lr */
+            cpu_to_le32(0xe1a00000),    /*         nop */
+            cpu_to_le32(0x13), 0, 0, 0, 0, cpu_to_le32(0xa),
+        };
+        address_space_write(&address_space_memory, OSBL_SHARED + 0xC00,
+                            MEMTXATTRS_UNSPECIFIED, dbl, sizeof(dbl));
+    }
+
+    /*
+     * DBL calls FSBL as a library before it starts OSBL: FSBL's entry (the
+     * first word of its image) takes the table to fill with its "target"
+     * interface (hand-off +28) and the caller's error handler pair, sets up
+     * its data and runs its init list.  It returns to a trampoline here that
+     * starts OSBL with the hand-off block in r0.
+     */
+    if (s->fsbl) {
+        uint32_t entry;
+
+        if (lle_load_fsbl(s, &entry)) {
+            uint32_t tramp[] = {
+                cpu_to_le32(0xe59f0000),    /* ldr r0, [pc]  -> +8 */
+                cpu_to_le32(0xe59ff000),    /* ldr pc, [pc]  -> +12 */
+                cpu_to_le32(OSBL_SHARED),
+                cpu_to_le32(dest),
+                cpu_to_le32(0xeafffffe),    /* +0x10: b . (error hook) */
+            };
+            uint32_t err[2] = { cpu_to_le32(OSBL_SHARED + 0xB10),
+                                cpu_to_le32(OSBL_SHARED + 0xB10) };
+
+            address_space_write(&address_space_memory, OSBL_SHARED + 0xB00,
+                                MEMTXATTRS_UNSPECIFIED, tramp, sizeof(tramp));
+            address_space_write(&address_space_memory, OSBL_SHARED + 0xA00,
+                                MEMTXATTRS_UNSPECIFIED, err, sizeof(err));
+            s->cpu.env.regs[0] = OSBL_SHARED + 0x400;
+            s->cpu.env.regs[1] = 0;
+            s->cpu.env.regs[2] = OSBL_SHARED + 0xA00;
+            s->cpu.env.regs[13] = 0x002F0000;
+            s->cpu.env.regs[14] = OSBL_SHARED + 0xB00;
+            cpu_set_pc(CPU(&s->cpu), entry);
+            info_report("htcleo: modem core starts FSBL at 0x%08x, then OSBL "
+                        "at 0x%08x", entry, dest);
+            return true;
+        }
+    }
+    s->cpu.env.regs[0] = OSBL_SHARED;
+    cpu_set_pc(CPU(&s->cpu), dest);
+    info_report("htcleo: modem core starts OSBL at 0x%08x (%u bytes)",
+                dest, size);
+    return true;
+}
+
 void msm_modem_lle_reset(DeviceState *dev)
 {
     MsmModemLleState *s = MSM_MODEM_LLE(dev);
@@ -377,11 +627,15 @@ void msm_modem_lle_reset(DeviceState *dev)
 
     g_hash_table_remove_all(s->seen);
     g_hash_table_remove_all(s->regs);
+    s->apps_rst = 0;
     s->dumped = false;
     cpu_reset(CPU(&s->cpu));
     if (!lle_load_elf(s, &err)) {
         error_report_err(err);
         exit(1);
+    }
+    if (s->osbl && lle_start_osbl(s)) {
+        return;
     }
     lle_osbl_smem_init(s);
     lle_osbl_htc_config(s);
@@ -404,6 +658,11 @@ void msm_modem_lle_hold(DeviceState *dev, bool hold)
         cs->halted = 0;
         qemu_cpu_kick(cs);
     }
+}
+
+bool msm_modem_lle_boots_osbl(DeviceState *dev)
+{
+    return MSM_MODEM_LLE(dev)->osbl != NULL;
 }
 
 ARMCPU *msm_modem_lle_cpu(DeviceState *dev)
@@ -459,6 +718,7 @@ static void lle_realize(DeviceState *dev, Error **errp)
     }
     s->elf = g_byte_array_new_take((guint8 *)data, len);
 
+    qdev_init_gpio_out_named(dev, &s->apps_release, "apps-release", 1);
     memory_region_init(&s->mem, OBJECT(dev), "modem-bus", UINT64_MAX);
     memory_region_init_alias(&s->ram_alias, OBJECT(dev), "modem-ram", s->ram,
                              0, memory_region_size(s->ram));
@@ -472,6 +732,10 @@ static void lle_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->imem, OBJECT(dev), "modem-imem",
                            MODEM_IMEM_SIZE, &error_fatal);
     memory_region_add_subregion(&s->mem, MODEM_IMEM_PHYS, &s->imem);
+    /* the boot loaders' internal RAM: DBL lives here, OSBL calls it */
+    memory_region_init_ram(&s->dblram, OBJECT(dev), "modem-bootram",
+                           0x40000, &error_fatal);
+    memory_region_add_subregion(&s->mem, 0xC0000000, &s->dblram);
 
     qdev_prop_set_uint32(DEVICE(&s->cluster), "cluster-id", 1);
     object_initialize_child(OBJECT(&s->cluster), "cpu", &s->cpu,
@@ -594,6 +858,8 @@ static const Property lle_props[] = {
     DEFINE_PROP_LINK("ram", MsmModemLleState, ram, TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_STRING("firmware", MsmModemLleState, firmware),
+    DEFINE_PROP_STRING("osbl", MsmModemLleState, osbl),
+    DEFINE_PROP_STRING("fsbl", MsmModemLleState, fsbl),
     DEFINE_PROP_BOOL("trace", MsmModemLleState, trace, false),
     DEFINE_PROP_UINT32("dump-on-write", MsmModemLleState, dump_on, 0),
 };

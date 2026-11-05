@@ -119,6 +119,12 @@ static const uint8_t pm_rt_reg[PM_GROUPS] = {
 #define SRC_INVALID_CHG PM_SRC(0, 0x10)     /* irq 3 */
 #define SRC_PWR_KEY_ON  PM_SRC(2, 0x08)     /* irq 12 */
 #define SRC_PWR_KEY_OFF PM_SRC(2, 0x04)     /* irq 13 */
+/*
+ * The keypad power input as the boot loaders see it: OSBL's power-on
+ * reason is bit 0 of 0x40, "PM_KPD_PWR_KEY_ON_RT_ST", and with none of
+ * the power key, a cable or the alarm it switches the phone off again.
+ */
+#define SRC_KPD_PWR_ON  PM_SRC(1, 0x01)
 
 static int pm_group_of(const uint8_t *tbl, uint8_t a)
 {
@@ -169,6 +175,7 @@ void msm_ssbi_pmic_set_power_key(DeviceState *dev, bool pressed)
 
     pm7540_set_src(s, SRC_PWR_KEY_ON, pressed);
     pm7540_set_src(s, SRC_PWR_KEY_OFF, !pressed);
+    pm7540_set_src(s, SRC_KPD_PWR_ON, pressed);
 }
 
 /* RTC seconds now */

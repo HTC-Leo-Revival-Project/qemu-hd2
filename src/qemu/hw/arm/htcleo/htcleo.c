@@ -129,6 +129,7 @@ struct HtcleoMachineState {
     uint8_t *hspl;              /* the unwrapped HSPL image */
     gsize hspl_len;
     bool hspl_run;              /* the HSPL is booting (no QEMU hand-off) */
+    bool spl_modem_run;         /* spl-modem=run: AMSS runs under the HSPL */
 
     /* RAM console tap */
     Chardev *ramcon_chr;
@@ -243,6 +244,22 @@ static void htcleo_update_keys(HtcleoMachineState *s)
     }
 }
 
+/* OSBL releases the apps core: it starts where the HSPL boot set it up */
+static void htcleo_apps_release(void *opaque, int n, int level)
+{
+    HtcleoMachineState *s = opaque;
+    CPUState *cs = CPU(s->cpu);
+
+    if (!level || !cs->halted) {
+        return;
+    }
+    info_report("htcleo: OSBL releases the apps core (PC 0x%08x)",
+                (uint32_t)s->cpu->env.regs[15]);
+    s->cpu->power_state = PSCI_ON;
+    cs->halted = 0;
+    qemu_cpu_kick(cs);
+}
+
 static void htcleo_wifi_irq(void *opaque, int n, int level)
 {
     HtcleoMachineState *s = opaque;
@@ -307,6 +324,22 @@ static void htcleo_set_vbus(HtcleoMachineState *s, bool notify)
     htcleo_update_charger(s);
 }
 
+/*
+ * PS_HOLD released: the PMIC cuts power - unless the power key is held,
+ * which keeps the PMIC on by itself.  That is how a phone comes up at all:
+ * the key powers it, and the radio's boot loader configures its GPIOs (with
+ * PS_HOLD low for a moment) before it raises PS_HOLD.  Let go of the key
+ * with PS_HOLD still low and the phone is off.
+ */
+static void htcleo_check_ps_hold(HtcleoMachineState *s)
+{
+    if (msm_gpio_get_output(s->gpio, HTCLEO_GPIO_PS_HOLD) == 0 &&
+        !s->keys[HD2_KEY_POWER]) {
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD released: power off\n");
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    }
+}
+
 static void htcleo_gpio_out(void *opaque, int pin, int level)
 {
     HtcleoMachineState *s = opaque;
@@ -334,13 +367,13 @@ static void htcleo_gpio_out(void *opaque, int pin, int level)
         htcleo_ts_set_power(s->ts, msm_gpio_get_output(s->gpio, pin) == 1);
     }
     if (pin == HTCLEO_GPIO_PS_HOLD) {
-        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD -> %d\n", level);
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD -> %d (cpu %d pc 0x%08x)\n",
+                      level, current_cpu ? current_cpu->cpu_index : -1,
+                      current_cpu ? (uint32_t)ARM_CPU(current_cpu)->env.regs[15]
+                                  : 0);
     }
-    if (pin == HTCLEO_GPIO_PS_HOLD && level == 0 &&
-        msm_gpio_get_output(s->gpio, HTCLEO_GPIO_PS_HOLD) == 0) {
-        /* PS_HOLD released: the PMIC cuts power */
-        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD released: power off\n");
-        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    if (pin == HTCLEO_GPIO_PS_HOLD && level == 0) {
+        htcleo_check_ps_hold(s);
     }
 }
 
@@ -1016,6 +1049,18 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * jumps to AMSS, so both run from here.
          */
         msm_modem_lle_reset(s->lle);
+        if (msm_modem_lle_boots_osbl(s->lle)) {
+            /*
+             * Booted through OSBL the apps core stays in reset until OSBL
+             * lets it go ("Boot CE", htcleo_apps_release).
+             */
+            CPUState *acs = CPU(s->cpu);
+
+            s->cpu->power_state = PSCI_OFF;
+            s->cpu->env.halt_reason = HALT_PSCI;
+            acs->halted = 1;
+            info_report("htcleo: the apps core waits for OSBL");
+        }
         if (s->q6_link) {
             /* OSBL starts the QDSP6 once the shared memory is set up */
             msm_q6_link_boot(s->q6_link);
@@ -1084,7 +1129,7 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * forever: WinMo stops at the HSPL's grey screen.  Started at the
          * hand-off instead, WinMo boots to its setup.
          */
-        if (s->lle) {
+        if (s->lle && !s->spl_modem_run && !msm_modem_lle_boots_osbl(s->lle)) {
             msm_modem_lle_hold(s->lle, true);
             if (!s->spl_watch) {
                 s->spl_watch = timer_new_ms(QEMU_CLOCK_VIRTUAL,
@@ -1377,6 +1422,8 @@ static void htcleo_init(MachineState *machine)
         qdev_prop_set_string(s->lle, "firmware", s->modem_fw);
         qdev_prop_set_bit(s->lle, "trace", s->modem_trace);
         qdev_realize_and_unref(s->lle, NULL, &error_fatal);
+        qdev_connect_gpio_out_named(s->lle, "apps-release", 0,
+                                    qemu_allocate_irq(htcleo_apps_release, s, 0));
     }
 
         /* Catch-all for every peripheral window we do not model, logged */
@@ -1899,6 +1946,16 @@ static void htcleo_set_nand_trace(Object *obj, bool v, Error **errp)
     HTCLEO_MACHINE(obj)->nand_trace = v;
 }
 
+static bool htcleo_get_spl_modem(Object *obj, Error **errp)
+{
+    return HTCLEO_MACHINE(obj)->spl_modem_run;
+}
+
+static void htcleo_set_spl_modem(Object *obj, bool v, Error **errp)
+{
+    HTCLEO_MACHINE(obj)->spl_modem_run = v;
+}
+
 static void htcleo_set_modem_trace(Object *obj, bool v, Error **errp)
 {
     HTCLEO_MACHINE(obj)->modem_trace = v;
@@ -1994,6 +2051,9 @@ static void htcleo_keys_release(void *opaque)
 
             if (at <= now) {
                 s->keys[k] = false;
+                if (k == HD2_KEY_POWER && s->lle) {
+                    htcleo_check_ps_hold(s);
+                }
             } else {
                 next = MIN(next, at);
             }
@@ -2114,6 +2174,11 @@ static void htcleo_machine_class_init(ObjectClass *oc, const void *data)
                                    htcleo_set_modem_trace);
     object_class_property_add_bool(oc, "nand-trace", htcleo_get_nand_trace,
                                    htcleo_set_nand_trace);
+    object_class_property_add_bool(oc, "spl-modem-run", htcleo_get_spl_modem,
+                                   htcleo_set_spl_modem);
+    object_class_property_set_description(oc, "spl-modem-run",
+        "with spl= and baseband=lle, let AMSS run while the HSPL does "
+        "instead of holding the modem core until the hand-off");
     object_class_property_set_description(oc, "nand-trace",
         "log every NAND program and erase the guest issues, with the page "
         "and the bytes: what is being written where, one line per codeword");
