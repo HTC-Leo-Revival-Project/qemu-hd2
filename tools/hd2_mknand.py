@@ -220,17 +220,31 @@ def clk14_layout(parts):
 
 
 def os_sectors_from_lk(lk):
-    """Build the OS area for a raw cLK binary (what the NBH tools produce)."""
-    count = (len(lk) + PAGE - 1) // PAGE
-    mbr = bytearray(512)
+    """Build the OS area for a raw cLK binary exactly as cLK's nbgen does.
+
+    The HSPL reads the partition the MBR describes and refuses anything else
+    ("Failed to read image data from storage partition"): nbgen rounds the
+    partition up to whole NAND blocks (64 sectors, less the two header
+    sectors), fills the CHS fields with its own formula, pads with 0xFF, and
+    the MSFLSH50 sector is 0x64 bytes of zero then 0xFF.
+    """
+    nblk = (len(lk) + 2 * PAGE + PPB * PAGE - 1) // (PPB * PAGE)
+    count = nblk * PPB - 2
+    first, last = 2, 2 + count - 1
+    mbr = bytearray(PAGE)
     mbr[0:3] = b'\xe9\xfd\xff'
-    struct.pack_into('<BBBBBBBBII', mbr, 0x1be, 0, 2, 1, 0, 0x23, 0x3f, 1, 3,
-                     2, count)
+    struct.pack_into('<BBBBBBBBII', mbr, 0x1be, 0,
+                     first % 0x40, (((first // 0x40) >> 8) << 6 & 0xff) + 1,
+                     first // 0x40 & 0xff, 0x23,
+                     last % 0x40 & 0xff, (((last // 40) >> 8) << 6 & 0xff) + 1,
+                     last // 0x40 & 0xff, first, count)
     mbr[510:512] = b'\x55\xaa'
-    secs = [bytes(mbr).ljust(PAGE, b'\x00'),
-            b'MSFLSH50'.ljust(PAGE, b'\x00')]
+    flsh = bytearray(b'\xff' * PAGE)
+    flsh[0:0x64] = bytes(0x64)
+    flsh[0:8] = b'MSFLSH50'
+    secs = [bytes(mbr), bytes(flsh)]
     for i in range(count):
-        secs.append(lk[i * PAGE:(i + 1) * PAGE].ljust(PAGE, b'\x00'))
+        secs.append(lk[i * PAGE:(i + 1) * PAGE].ljust(PAGE, b'\xff'))
     return secs, 2, count
 
 
