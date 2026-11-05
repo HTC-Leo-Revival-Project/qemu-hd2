@@ -390,6 +390,22 @@ void msm_modem_lle_reset(DeviceState *dev)
     info_report("htcleo: modem core starts AMSS at 0x%08x", s->entry);
 }
 
+void msm_modem_lle_hold(DeviceState *dev, bool hold)
+{
+    MsmModemLleState *s = MSM_MODEM_LLE(dev);
+    CPUState *cs = CPU(&s->cpu);
+
+    if (hold) {
+        s->cpu.power_state = PSCI_OFF;
+        s->cpu.env.halt_reason = HALT_PSCI;
+        cs->halted = 1;
+    } else {
+        s->cpu.power_state = PSCI_ON;
+        cs->halted = 0;
+        qemu_cpu_kick(cs);
+    }
+}
+
 ARMCPU *msm_modem_lle_cpu(DeviceState *dev)
 {
     return &MSM_MODEM_LLE(dev)->cpu;

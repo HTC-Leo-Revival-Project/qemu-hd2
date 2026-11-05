@@ -125,6 +125,7 @@ struct HtcleoMachineState {
     gsize fw_len;
     char *spl_path;             /* -M spl=<file>: run the real HSPL */
     char *keys_held;            /* -M keys=...: held down from reset       */
+    QEMUTimer *spl_watch;       /* HSPL + LLE: modem held until hand-off  */
     uint8_t *hspl;              /* the unwrapped HSPL image */
     gsize hspl_len;
     bool hspl_run;              /* the HSPL is booting (no QEMU hand-off) */
@@ -217,6 +218,7 @@ static void scorpion_add_cpregs(ARMCPU *cpu)
 /* ------------------------------------------------------------------ */
 
 static void htcleo_keys_release(void *opaque);
+static void htcleo_spl_watch(void *opaque);
 
 static void htcleo_update_keys(HtcleoMachineState *s)
 {
@@ -1073,6 +1075,23 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * run.
          */
         htcleo_hspl_boot(s, env);
+        /*
+         * With the real baseband, AMSS waits for the HSPL to finish.  Run
+         * together, AMSS dies within seconds of the HSPL starting
+         * (ERR_FATAL dpram.c:461, "dpram_rx_callback_fn != NULL" - traffic
+         * on a DPRAM port it has no receiver for, however long a head start
+         * AMSS gets) and an OS started after that waits for the modem
+         * forever: WinMo stops at the HSPL's grey screen.  Started at the
+         * hand-off instead, WinMo boots to its setup.
+         */
+        if (s->lle) {
+            msm_modem_lle_hold(s->lle, true);
+            if (!s->spl_watch) {
+                s->spl_watch = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                            htcleo_spl_watch, s);
+            }
+            timer_mod(s->spl_watch, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);
+        }
         goto done;
     }
 
@@ -1827,6 +1846,26 @@ static char *htcleo_get_modem_fw(Object *obj, Error **errp)
 static char *htcleo_get_spl(Object *obj, Error **errp)
 {
     return g_strdup(HTCLEO_MACHINE(obj)->spl_path);
+}
+
+/*
+ * HSPL + real baseband: AMSS is held until the HSPL has handed the apps core
+ * to the OS, and released then.  The apps PC is the sign: the HSPL runs at
+ * VA 0x95xxxxxx (and from low memory before its MMU is on); every OS image
+ * it starts runs from 0x11800000 up and outside that window.
+ */
+static void htcleo_spl_watch(void *opaque)
+{
+    HtcleoMachineState *s = opaque;
+    uint32_t pc = s->cpu->env.regs[15];
+
+    if (pc >= 0x11000000 && (pc < 0x95000000 || pc >= 0x96000000)) {
+        info_report("htcleo: the HSPL handed off (apps PC 0x%08x): "
+                    "the modem core starts AMSS", pc);
+        msm_modem_lle_hold(s->lle, false);
+        return;
+    }
+    timer_mod(s->spl_watch, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);
 }
 
 static void htcleo_set_spl(Object *obj, const char *v, Error **errp)

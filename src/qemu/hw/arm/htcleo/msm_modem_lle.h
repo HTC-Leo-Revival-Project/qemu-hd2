@@ -43,6 +43,8 @@
 
 /* load AMSS and start the modem core at its entry point */
 void msm_modem_lle_reset(DeviceState *dev);
+/* keep the modem core powered off (hold) or let it run AMSS */
+void msm_modem_lle_hold(DeviceState *dev, bool hold);
 ARMCPU *msm_modem_lle_cpu(DeviceState *dev);
 /* the modem core's bus, for mapping modem-private peripherals */
 MemoryRegion *msm_modem_lle_bus(DeviceState *dev);
