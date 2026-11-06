@@ -351,6 +351,18 @@ static void q6_link_receive(void *opaque, const uint8_t *buf, int size)
             q6_release(s);
             continue;
         }
+        /* the phone reset (PS_HOLD): back into reset until OSBL boots it */
+        if (buf[i] == 0x7e) {
+            if (s->trace) {
+                qemu_log("q6-link: <- held in reset\n");
+            }
+            if (s->released) {
+                s->released = false;
+                s->release_on_reset = false;
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            }
+            continue;
+        }
         int irq = line == 0 ? s->apps_irq : line == 1 ? s->modem_irq : -1;
 
         if (s->trace) {

@@ -262,6 +262,17 @@ static void htcleo_apps_release(void *opaque, int n, int level)
     qemu_cpu_kick(cs);
 }
 
+/* OSBL's "Boot adsp": the QDSP6 runs the DSP1 it has just loaded */
+static void htcleo_q6_release(void *opaque, int n, int level)
+{
+    HtcleoMachineState *s = opaque;
+
+    if (level && s->q6_link) {
+        info_report("htcleo: OSBL starts the QDSP6");
+        msm_q6_link_boot(s->q6_link);
+    }
+}
+
 static void htcleo_wifi_irq(void *opaque, int n, int level)
 {
     HtcleoMachineState *s = opaque;
@@ -1093,9 +1104,15 @@ static void htcleo_reset(MachineState *machine, ResetType type)
             acs->halted = 1;
             info_report("htcleo: the apps core waits for OSBL");
         }
-        if (s->q6_link) {
-            /* OSBL starts the QDSP6 once the shared memory is set up */
+        if (s->q6_link && !msm_modem_lle_boots_osbl(s->lle)) {
+            /*
+             * OSBL starts the QDSP6 once the shared memory is set up: here
+             * it already is.  A real OSBL does it itself, on GO2AMSS
+             * (htcleo_q6_release) -- a DSP let go now faults.
+             */
             msm_q6_link_boot(s->q6_link);
+        } else if (s->q6_link) {
+            msm_q6_link_hold(s->q6_link);
         }
         if (!s->q6_lle) {
             msm_modem_qdsp6_boot(MSM_MODEM(s->modem));
@@ -1465,6 +1482,8 @@ static void htcleo_init(MachineState *machine)
         qdev_realize_and_unref(s->lle, NULL, &error_fatal);
         qdev_connect_gpio_out_named(s->lle, "apps-release", 0,
                                     qemu_allocate_irq(htcleo_apps_release, s, 0));
+        qdev_connect_gpio_out_named(s->lle, "q6-release", 0,
+                                    qemu_allocate_irq(htcleo_q6_release, s, 0));
     }
 
         /* Catch-all for every peripheral window we do not model, logged */

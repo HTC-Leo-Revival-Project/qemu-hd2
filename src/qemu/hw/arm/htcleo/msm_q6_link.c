@@ -68,6 +68,21 @@ void msm_q6_link_boot(DeviceState *dev)
     }
 }
 
+/* the phone reset: the QDSP6 goes back into reset with it (0x7e) */
+void msm_q6_link_hold(DeviceState *dev)
+{
+    MsmQ6LinkState *s = MSM_Q6_LINK(dev);
+    uint8_t b = 0x7e;
+
+    if (s->trace) {
+        qemu_log("q6-link: -> hold the QDSP6 in reset\n");
+    }
+    s->released = false;
+    if (qemu_chr_fe_backend_open(&s->chr)) {
+        qemu_chr_fe_write_all(&s->chr, &b, 1);
+    }
+}
+
 static void q6_link_event(void *opaque, QEMUChrEvent event)
 {
     MsmQ6LinkState *s = opaque;

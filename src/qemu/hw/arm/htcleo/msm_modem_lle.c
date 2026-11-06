@@ -90,6 +90,7 @@ struct MsmModemLleState {
     char *osbl;                 /* osbl=: boot the modem through OSBL */
     char *fsbl;                 /* fsbl=: FSBL, resident under OSBL */
     qemu_irq apps_release;      /* OSBL lets the apps core out of reset */
+    qemu_irq q6_release;        /* and later the QDSP6 */
     uint32_t apps_rst;
     bool trace;
 
@@ -207,6 +208,14 @@ static MemTxResult tap_write(void *opaque, hwaddr off, uint64_t data,
             qemu_irq_pulse(s->apps_release);
         }
         s->apps_rst = data;
+    }
+    /*
+     * OSBL's "Boot adsp" (GO2AMSS, after loading 0:DSP1): the QDSP6's
+     * start address in Q6SS + 0x2C/0x30, then bit 0 of Q6SS + 0x28 lets it
+     * run.
+     */
+    if (s->osbl && a == 0xA8700028 && size == 4 && (data & 1)) {
+        qemu_irq_pulse(s->q6_release);
     }
     if (s->dump_on && a == s->dump_on && !s->dumped) {
         lle_dump_stack(s);
@@ -719,6 +728,7 @@ static void lle_realize(DeviceState *dev, Error **errp)
     s->elf = g_byte_array_new_take((guint8 *)data, len);
 
     qdev_init_gpio_out_named(dev, &s->apps_release, "apps-release", 1);
+    qdev_init_gpio_out_named(dev, &s->q6_release, "q6-release", 1);
     memory_region_init(&s->mem, OBJECT(dev), "modem-bus", UINT64_MAX);
     memory_region_init_alias(&s->ram_alias, OBJECT(dev), "modem-ram", s->ram,
                              0, memory_region_size(s->ram));
