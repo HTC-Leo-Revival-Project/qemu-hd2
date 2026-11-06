@@ -2526,10 +2526,33 @@ int main(int argc, char **argv)
     }
     note("connected to the emulator on %s", usbip);
 
-    /* the emulated gadget only answers once its driver has started */
+    /*
+     * The emulated gadget only answers once its driver has started.  On the
+     * real boot chain (SPL LLE) the HSPL and then cLK each reset the USB
+     * controller on their way up, which on a real cable is the device
+     * dropping off the bus and coming back: QEMU closes this link and
+     * listens again.  So a probe that finds the link closed is not the end:
+     * connect afresh and ask again, until the guest's own gadget answers.
+     */
+    signal(SIGPIPE, SIG_IGN);
     for (int tries = 0; tries < 900 && !stop_now; tries++) {
-        if (probe_gadget() == 0) {
+        if (b.ip >= 0 && probe_gadget() == 0) {
             break;
+        }
+        if (b.ip >= 0 && !b.dev_len) {
+            /* a dead link and a silent gadget look the same: start over on a new one */
+            char c;
+            int r = recv(b.ip, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
+                close(b.ip);
+                b.ip = -1;
+            }
+        }
+        if (b.ip < 0) {
+            b.ip = connect_usbip(usbip);
+            if (b.ip >= 0) {
+                note("reconnected to the emulator (the guest reset its USB controller)");
+            }
         }
         sleep_ms(100);
     }
