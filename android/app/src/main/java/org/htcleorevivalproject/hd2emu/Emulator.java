@@ -154,10 +154,20 @@ public class Emulator {
         running = cfg;
         File nand = paths.image(cfg.nand);
         if (!nand.isFile()) throw new IOException(ctx.getString(R.string.emu_nand_missing, cfg.nand));
+        /*
+         * SPL LLE mode is the real boot chain: FSBL -> OSBL -> AMSS on the modem
+         * core, which releases the apps core into the HSPL out of NAND.  That
+         * needs the real baseband, so it implies baseband=lle.
+         */
+        if (cfg.splLle) cfg.baseband = Config.LLE;
         boolean dsp = cfg.dspRunning();
         boolean needAmss = Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile();
         boolean needDsp = dsp && !paths.image("dsp1.elf").isFile();
-        if (needAmss || needDsp) firmwareFromNand(nand, needAmss, needDsp);
+        boolean needSbl = cfg.splLle && (!paths.image("fsbl.bin").isFile() || !paths.image("osbl.bin").isFile());
+        if (needAmss || needDsp || needSbl) firmwareFromNand(nand, needAmss, needDsp, needSbl);
+        if (cfg.splLle && (!paths.image("fsbl.bin").isFile() || !paths.image("osbl.bin").isFile())) {
+            throw new IOException(ctx.getString(R.string.emu_sbl_missing));
+        }
         if (Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile()) {
             throw new IOException(ctx.getString(R.string.emu_amss_missing));
         }
@@ -177,7 +187,10 @@ public class Emulator {
             machine += ",baseband=lle,baseband-firmware=" + paths.image("amss.elf").getAbsolutePath()
                     + ",baseband-trace=off";
         }
-        if (cfg.splLle) machine += ",spl=nand"; // the real SPL boots the OS out of NAND
+        if (cfg.splLle) {
+            /* the real chain: OSBL pulses PS_HOLD low early on, so the power key is held (see docs) */
+            machine += ",spl=nand,keys=power:1500";
+        }
         /*
          * USB passthrough: the host is not us but a bridge, which owns a host
          * controller we cannot reach -- a FunctionFS gadget on this phone's own
@@ -234,6 +247,12 @@ public class Emulator {
          * exactly like a black screen.  tools/start.sh gets away with the
          * implicit "smem.bin" because it runs from images/.
          */
+        if (cfg.splLle) {
+            args.add("-global");
+            args.add("msm-modem-lle.osbl=" + paths.image("osbl.bin").getAbsolutePath());
+            args.add("-global");
+            args.add("msm-modem-lle.fsbl=" + paths.image("fsbl.bin").getAbsolutePath());
+        }
         File smem = paths.image("smem.bin");
         if (smem.isFile()) {
             args.add("-global");
@@ -432,7 +451,7 @@ public class Emulator {
      * already holds both: take the missing ones from there, as Images -> Radio
      * firmware would.  If it has none, say where else they come from.
      */
-    private void firmwareFromNand(File nand, boolean amss, boolean dsp) throws IOException {
+    private void firmwareFromNand(File nand, boolean amss, boolean dsp, boolean sbl) throws IOException {
         note(ctx.getString(R.string.emu_taking_firmware, nand.getName()));
         Radio.Firmware fw;
         try {
@@ -443,6 +462,10 @@ public class Emulator {
         }
         if (amss) Radio.Firmware.write(paths.image("amss.elf"), fw.amss);
         if (dsp && fw.dsp != null) Radio.Firmware.write(paths.image("dsp1.elf"), fw.dsp);
+        if (sbl && fw.fsbl != null && fw.osbl != null) {
+            Radio.Firmware.write(paths.image("fsbl.bin"), fw.fsbl);
+            Radio.Firmware.write(paths.image("osbl.bin"), fw.osbl);
+        }
     }
 
     private boolean soundOn(Config cfg) {

@@ -121,6 +121,9 @@ def main():
     ap.add_argument('-o', '--output', default='amss.elf')
     ap.add_argument('--dsp', metavar='DSP_ELF',
                     help='also write the QDSP6 firmware (DSP1) ELF here')
+    ap.add_argument('--sbl', metavar='DIR',
+                    help='also write fsbl.bin and osbl.bin (what SPL LLE mode '
+                         'boots: -global msm-modem-lle.fsbl/osbl) into DIR')
     ap.add_argument('--write-nand', metavar='NAND_IMG',
                     help='also write the radio partitions into this image')
     a = ap.parse_args()
@@ -152,6 +155,12 @@ def main():
         open(a.dsp, 'wb').write(dsp)
         print(f'DSP1 ELF at payload {at + len(elf):#x}: {len(dsp)} bytes'
               f' -> {a.dsp}')
+    if a.sbl:
+        import os
+        os.makedirs(a.sbl, exist_ok=True)
+        open(os.path.join(a.sbl, 'fsbl.bin'), 'wb').write(p[0x80020:0xC0020])
+        open(os.path.join(a.sbl, 'osbl.bin'), 'wb').write(p[0xC0020:0x140020])
+        print('FSBL, OSBL -> %s' % a.sbl)
     if a.write_nand:
         print('radio partitions -> %s' % a.write_nand)
         write_nand(a.write_nand, p, at, len(elf), partitions(p))

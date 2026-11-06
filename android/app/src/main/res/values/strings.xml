@@ -150,6 +150,7 @@
     <string name="set_show_fps">Show the frame rate</string>
     <string name="set_show_fps_sum">Frames per second, over the screen</string>
     <string name="set_extra_args">Extra QEMU arguments</string>
+    <string name="emu_sbl_missing">SPL LLE mode needs the radio\'s FSBL and OSBL (fsbl.bin, osbl.bin). Take them from a stock RUU or a NAND that has a radio: Images, Radio firmware.</string>
     <string name="set_spl_lle">SPL LLE mode</string>
     <string name="set_spl_lle_sum">Boot through the phone\'s own SPL (HSPL) from NAND, the real bootchain. The SPL looks for LEOIMG.nbh on the card and goes to USB mode if there is none. Needs a NAND that has an SPL.</string>
     <string name="set_clk_regime">Answer the clock-regime commands</string>

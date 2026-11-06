@@ -281,11 +281,14 @@ final class Radio {
     static final class Firmware {
         byte[] amss;                /* the ARM9 modem's AMSS */
         byte[] dsp;                 /* the QDSP6's DSP1, or null */
+        byte[] fsbl, osbl;          /* the radio's boot loaders: SPL LLE mode runs them (or null) */
 
         /** Into the images folder as amss.elf and dsp1.elf, each replaced whole. */
         void save(File imagesDir) throws IOException {
             write(new File(imagesDir, "amss.elf"), amss);
             if (dsp != null) write(new File(imagesDir, "dsp1.elf"), dsp);
+            if (fsbl != null) write(new File(imagesDir, "fsbl.bin"), fsbl);
+            if (osbl != null) write(new File(imagesDir, "osbl.bin"), osbl);
         }
 
         static void write(File out, byte[] data) throws IOException {
@@ -319,6 +322,9 @@ final class Radio {
         if (amss == null) throw new IOException(nbhFile.getName() + ": no AMSS ELF in the payload");
         Firmware fw = new Firmware();
         fw.amss = slice(p, amss[0], amss[0] + amss[1]);
+        /* the same slices write_nand() flashes (hd2_radio.py --sbl) */
+        fw.fsbl = slice(p, 0x80020, 0xC0020);
+        fw.osbl = slice(p, 0xC0020, 0x140020);
         int dspAt = (int) (amss[0] + amss[1]);
         if (isElf(p, dspAt)) fw.dsp = slice(p, dspAt, dspAt + elfSize(p, dspAt));
         return fw;
@@ -349,6 +355,10 @@ final class Radio {
             fw.amss = readElf(f, amssPart, false);
             if (fw.amss == null) throw new IOException(image.getName() + ": no AMSS ELF in its 0:AMSS partition");
             if (dspPart != null) fw.dsp = readElf(f, dspPart, true);
+            for (Part part : parts) {
+                if ("0:FSBL".equals(part.name)) fw.fsbl = readData(f, part.block, 0x40000);
+                if ("0:OSBL".equals(part.name)) fw.osbl = readData(f, part.block, 0x80000);
+            }
             return fw;
         } finally {
             f.close();
