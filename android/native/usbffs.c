@@ -2458,6 +2458,28 @@ static void write_pidfile(void)
  * never on the UDC at once: they take the port from each other, and the host's
  * data ends up in whichever one won the last round.
  */
+/*
+ * Whether pid is a bridge.  A pidfile outlives a reboot of the phone, and by
+ * then its number belongs to something else entirely (a vendor daemon, once):
+ * only signal it when its argv[0] says usbffs.
+ */
+static bool is_bridge(long pid)
+{
+    char path[64], argv0[256];
+    size_t n;
+    FILE *f;
+
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", pid);
+    f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    n = fread(argv0, 1, sizeof(argv0) - 1, f);
+    fclose(f);
+    argv0[n] = 0;
+    return strstr(argv0, "usbffs") != NULL;
+}
+
 static void stop_the_last_one(void)
 {
     long pid;
@@ -2473,6 +2495,10 @@ static void stop_the_last_one(void)
     fclose(f);
     if (pid == (long)getpid() || kill((pid_t)pid, 0) != 0) {
         return;                     /* gone already, or it is us */
+    }
+    if (!is_bridge(pid)) {
+        note("pidfile names pid %ld, which is not a bridge (stale); leaving it alone", pid);
+        return;
     }
     note("the last bridge (pid %ld) is still running; stopping it first", pid);
     kill((pid_t)pid, SIGTERM);

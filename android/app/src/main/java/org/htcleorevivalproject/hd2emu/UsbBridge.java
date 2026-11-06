@@ -217,8 +217,8 @@ public final class UsbBridge {
     public static void stop(Paths paths) {
         final String pid = pid(paths);
         try {
-            if (pid == null) {
-                return;
+            if (pid == null || !alive(pid)) {
+                return;             /* gone, or a stale number from before a reboot */
             }
             Root.run("kill " + pid + " 2>/dev/null || true", 10000);
             for (int i = 0; i < 20 && alive(pid); i++) {
@@ -249,7 +249,13 @@ public final class UsbBridge {
     }
 
     private static boolean alive(String pid) throws IOException {
-        return Root.run("kill -0 " + pid + " 2>/dev/null && echo yes || true", 5000)
+        /*
+         * The pidfile outlives a reboot, and by then the number is some other
+         * process (once a Samsung TEE daemon): only a process that is a bridge
+         * counts, and only a bridge ever gets signalled.
+         */
+        return Root.run("kill -0 " + pid + " 2>/dev/null && grep -q usbffs /proc/" + pid
+                + "/cmdline 2>/dev/null && echo yes || true", 5000)
                 .out.trim().length() > 0;
     }
 
