@@ -206,6 +206,7 @@ static uint64_t vic_read(void *opaque, hwaddr off, unsigned size)
     case 0xE0:
         n = vic_first_pending(s, true);
         return n >= 0 ? n : 0xFFFFFFFF;
+    case 0xE4:      /* IRQ_IN_STACK: AMSS's idle loop polls it, none nest */
     case 0xE8: case 0xEC: case 0xF0: case 0xF4: case 0xF8: case 0xFC:
         return 0;
     }

@@ -232,6 +232,14 @@ static void mtmr_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     case R_DOG_BASE ... R_DOG_KICK:
         return;
+    case 0x708:
+    case 0x810:
+        /*
+         * written (0) on every pass of AMSS's idle loop, about a thousand
+         * times a second: kept, not logged -- a log line each is a system
+         * call each, and on a phone those cost more than the emulation
+         */
+        return;
     case R_IRQ_OUT ... R_IRQ_OUT + 4 * (IRQ_OUT_NUM - 1):
         if (val & 1) {
             qemu_irq_pulse(s->irq_out[(off - R_IRQ_OUT) / 4]);
