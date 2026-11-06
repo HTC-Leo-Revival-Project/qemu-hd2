@@ -119,6 +119,7 @@ arm_common_ss.add(when: 'CONFIG_HTCLEO', if_true: files(
   'htcleo/msm_regfile.c',
   'htcleo/msm_nand.c',
   'htcleo/msm_adm.c',
+  'htcleo/msm_crypto.c',
   'htcleo/msm_mdp.c',
   'htcleo/msm_mdp_ppp.c',
   'htcleo/msm_modem.c',

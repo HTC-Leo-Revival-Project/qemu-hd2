@@ -116,6 +116,7 @@ typedef struct AdmCrci {
 static bool addr_serviced(uint32_t a)
 {
     return (a >= MSM_NAND_PHYS && a < MSM_NAND_PHYS + 0x1000) ||
+           (a >= MSM_CRYPTO_PHYS && a < MSM_CRYPTO_PHYS + 0x10000) ||
            (a >= MSM_SDC1_PHYS && a < MSM_SDC4_PHYS + 0x1000) ||
            a < HTCLEO_RAM_SIZE;
 }
@@ -255,16 +256,17 @@ static void swap_buf(uint8_t *b, uint32_t len, uint32_t cmd, bool src)
 
 static void adm_copy(uint32_t cmd, hwaddr src, hwaddr dst, uint32_t len)
 {
+    uint32_t alloc = ROUND_UP(len, 4);
     g_autofree uint8_t *buf = NULL;
 
     if (!len) {
         return;
     }
-    buf = g_malloc(len);
+    buf = g_malloc0(alloc);
     dma_read(src, buf, len);
-    swap_buf(buf, len, cmd, true);
-    swap_buf(buf, len, cmd, false);
-    dma_write(dst, buf, len);
+    swap_buf(buf, alloc, cmd, true);
+    swap_buf(buf, alloc, cmd, false);
+    dma_write(dst, buf, alloc);
 }
 
 /*
@@ -330,7 +332,54 @@ static int adm_run_array(MsmAdmState *s, hwaddr a, uint32_t *stall)
             a += 16;
             break;
         }
-        case CMD_MODE_SG:
+        case CMD_MODE_SG: {
+            /*
+             * Scatter/gather: source and destination are each a list of
+             * {address, length} elements, bit 31 of the length marking the
+             * last.  The bytes of the source elements, in order, go to the
+             * destination elements, in order.  FSBL feeds the crypto engine
+             * this way: a partial block it kept back and the new data, into
+             * DATA_IN.
+             */
+            uint32_t sl = ld32(a + 4), dl = ld32(a + 8);
+            GByteArray *data = g_byte_array_new();
+            uint32_t pos = 0;
+
+            for (int e = 0; e < 256; e++, sl += 8) {
+                uint32_t ea = ld32(sl), el = ld32(sl + 4);
+                uint32_t n = el & 0xFFFFF;
+                g_autofree uint8_t *b = g_malloc(n ? n : 1);
+
+                dma_read(ea, b, n);
+                g_byte_array_append(data, b, n);
+                if (el & 0x80000000) {
+                    break;
+                }
+            }
+            /*
+             * The mover works in 32-bit beats: a tail that is not a whole
+             * word still goes as one (the crypto engine counts the bytes it
+             * keeps by its segment size), and the byte swap applies to it.
+             */
+            while (data->len & 3) {
+                g_byte_array_append(data, (const guint8 *)"", 1);
+            }
+            swap_buf(data->data, data->len, cmd, true);
+            swap_buf(data->data, data->len, cmd, false);
+            for (int e = 0; e < 256 && pos < data->len; e++, dl += 8) {
+                uint32_t ea = ld32(dl), el = ld32(dl + 4);
+                uint32_t n = MIN(ROUND_UP(el & 0xFFFFF, 4), data->len - pos);
+
+                dma_write(ea, data->data + pos, n);
+                pos += n;
+                if (el & 0x80000000) {
+                    break;
+                }
+            }
+            g_byte_array_unref(data);
+            a += 16;
+            break;
+        }
         default:
             qemu_log_mask(LOG_UNIMP, "msm-adm: unsupported cmd mode %u\n",
                           cmd & CMD_MODE_MASK);
@@ -393,7 +442,12 @@ static void adm_run(MsmAdmState *s, int dom, int chn, hwaddr a, hwaddr list,
             adm_rx_wake(s, stall);
             return;
         }
-        if (!list || (ld32(list + 4 * idx) & CMD_PTR_LP) || ++idx >= 256) {
+        /*
+         * The list ends at its LP entry.  The bound only stops a list with
+         * none from running forever: OSBL reads 63 pages at a time with
+         * five entries per codeword, 1260 in one list.
+         */
+        if (!list || (ld32(list + 4 * idx) & CMD_PTR_LP) || ++idx >= 65536) {
             break;
         }
         a = (hwaddr)(ld32(list + 4 * idx) & 0x1FFFFFFF) << 3;

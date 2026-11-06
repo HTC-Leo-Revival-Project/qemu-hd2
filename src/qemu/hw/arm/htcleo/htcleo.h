@@ -58,6 +58,7 @@
 #define MSM_GPIO1_PHYS          0xA9000000
 #define MSM_GPIO2_PHYS          0xA9100000
 #define MSM_DMOV_PHYS           0xA9700000
+#define MSM_CRYPTO_PHYS         0xA0C00000
 #define MSM_I2C_PHYS            0xA9900000
 #define MSM_UART1_PHYS          0xA9A00000
 #define MSM_UART2_PHYS          0xA9B00000

@@ -1572,6 +1572,9 @@ static void htcleo_init(MachineState *machine)
         sysbus_connect_irq(sbd, 0, sirc_in[SIRC_UART1 + i]);
     }
 
+    /* crypto engine: the radio boot loaders' SHA-1 */
+    sysbus_create_simple("msm-crypto", MSM_CRYPTO_PHYS, NULL);
+
     /* ADM data mover */
     dev = qdev_new(TYPE_MSM_ADM);
     s->adm = dev;
@@ -1587,6 +1590,17 @@ static void htcleo_init(MachineState *machine)
                                     alias);
     }
     if (s->lle) {
+        /*
+         * The modem also reaches the data mover at 0xB0400000, its private
+         * window: FSBL's SHA-1 (the segment hashes OSBL checks AMSS and the
+         * DSP image by) drives it there.
+         */
+        MemoryRegion *malias = g_new(MemoryRegion, 1);
+
+        memory_region_init_alias(malias, OBJECT(dev), "msm-adm-modem",
+                                 sysbus_mmio_get_region(sbd, 0), 0, 0x1000);
+        memory_region_add_subregion(msm_modem_lle_bus(s->lle), 0xB0400000,
+                                    malias);
         /* SD3 interrupts the apps processor, SD0 the modem */
         sysbus_connect_irq(sbd, 1 + 3, vic_in[INT_ADM_AARM]);
         sysbus_connect_irq(sbd, 1 + 0, msm_modem_lle_irq(s->lle, MIRQ_ADM0));
