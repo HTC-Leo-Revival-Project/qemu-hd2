@@ -125,6 +125,8 @@ struct HtcleoMachineState {
     gsize fw_len;
     char *spl_path;             /* -M spl=<file>: run the real HSPL */
     char *keys_held;            /* -M keys=...: held down from reset       */
+    bool spl_hold;              /* the modem is held until the hand-off */
+    I2CSlave *hspl_chip[2];     /* the HSPL-only I2C chips, hidden at hand-off */
     QEMUTimer *spl_watch;       /* HSPL + LLE: modem held until hand-off  */
     uint8_t *hspl;              /* the unwrapped HSPL image */
     gsize hspl_len;
@@ -1187,14 +1189,16 @@ static void htcleo_reset(MachineState *machine, ResetType type)
          * forever: WinMo stops at the HSPL's grey screen.  Started at the
          * hand-off instead, WinMo boots to its setup.
          */
-        if (s->lle && !s->spl_modem_run && !msm_modem_lle_boots_osbl(s->lle)) {
+        s->spl_hold = s->lle && !s->spl_modem_run && !msm_modem_lle_boots_osbl(s->lle);
+        if (s->spl_hold) {
             msm_modem_lle_hold(s->lle, true);
-            if (!s->spl_watch) {
-                s->spl_watch = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                            htcleo_spl_watch, s);
-            }
-            timer_mod(s->spl_watch, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);
         }
+        /* the watch also hides the HSPL-only I2C chips once the OS runs */
+        if (!s->spl_watch) {
+            s->spl_watch = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                        htcleo_spl_watch, s);
+        }
+        timer_mod(s->spl_watch, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);
         goto done;
     }
 
@@ -1877,8 +1881,8 @@ static void htcleo_init(MachineState *machine)
              * without them the controller NAKs the address and the HSPL sits
              * in its retry loop instead of loading the OS.
              */
-            htcleo_regdev_create(bus, 0x34, NULL, 0);
-            htcleo_regdev_create(bus, 0x5C, NULL, 0);
+            s->hspl_chip[0] = htcleo_regdev_create(bus, 0x34, NULL, 0);
+            s->hspl_chip[1] = htcleo_regdev_create(bus, 0x5C, NULL, 0);
         }
     }
 
@@ -1986,9 +1990,16 @@ static void htcleo_spl_watch(void *opaque)
     uint32_t pc = s->cpu->env.regs[15];
 
     if (pc >= 0x11000000 && (pc < 0x95000000 || pc >= 0x96000000)) {
-        info_report("htcleo: the HSPL handed off (apps PC 0x%08x): "
-                    "the modem core starts AMSS", pc);
-        msm_modem_lle_hold(s->lle, false);
+        info_report("htcleo: the HSPL handed off (apps PC 0x%08x)", pc);
+        for (int i = 0; i < 2; i++) {
+            if (s->hspl_chip[i]) {
+                htcleo_regdev_hide(s->hspl_chip[i]);
+            }
+        }
+        if (s->spl_hold) {
+            info_report("htcleo: the modem core starts AMSS");
+            msm_modem_lle_hold(s->lle, false);
+        }
         return;
     }
     timer_mod(s->spl_watch, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5);

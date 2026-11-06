@@ -41,16 +41,31 @@ struct HtcleoRegdev {
     uint8_t regs[256];
     uint8_t ptr;
     bool have_ptr;
+    bool gone;                  /* the chip is not on this board's OS bus view */
 };
 
 static int regdev_event(I2CSlave *i2c, enum i2c_event ev)
 {
     HtcleoRegdev *s = HTCLEO_REGDEV(i2c);
 
+    if (s->gone) {
+        return -1;              /* NAK: nothing there */
+    }
     if (ev == I2C_START_SEND) {
         s->have_ptr = false;
     }
     return 0;
+}
+
+/*
+ * Chips only the HSPL talks to (0x34, 0x5C) must disappear once the OS runs:
+ * the kernel's touchscreen driver probes 0x5C and 0x34 first and takes an
+ * answer there for the unsupported B8/68 controller types (BUG() in
+ * htcleo_ts_probe, "TS: NOT SUPPORTED").
+ */
+void htcleo_regdev_hide(I2CSlave *d)
+{
+    HTCLEO_REGDEV(d)->gone = true;
 }
 
 static int regdev_send(I2CSlave *i2c, uint8_t data)
@@ -230,9 +245,17 @@ void htcleo_ts_set_power(I2CSlave *d, bool on)
 {
     HtcleoTs *s = HTCLEO_TS(d);
 
-    if (on && !s->powered) {
-        /* controller signals readiness by pulling its IRQ low */
+    if (on) {
+        /*
+         * Every power-on starts the controller afresh and it answers with
+         * its ID again, even if it was already on: with the real boot chain
+         * (SPL LLE) the HSPL has switched it to report mode before the
+         * kernel probes it, and the driver then reads a touch report where
+         * it wants the ID ("TS: NOT SUPPORTED", then a NULL dereference).
+         */
         s->data_pending = false;
+        s->enabled = false;
+        s->reply = false;
         s->powered = true;
         qemu_set_irq(s->irq, 0);
         return;

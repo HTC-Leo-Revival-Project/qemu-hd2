@@ -12,6 +12,9 @@
 I2CSlave *htcleo_regdev_create(I2CBus *bus, uint8_t addr,
                                const uint8_t *init, int n);
 
+/* make a regdev NAK from now on (the HSPL-only chips, once the OS runs) */
+void htcleo_regdev_hide(I2CSlave *d);
+
 void htcleo_ts_set_power(I2CSlave *ts, bool on);
 /* the current the charger can push into the battery, 0 for none */
 void htcleo_battery_set_charge(I2CSlave *gauge, int mA);
