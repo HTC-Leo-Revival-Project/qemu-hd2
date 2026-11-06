@@ -70,6 +70,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmNandState, MSM_NAND)
 #define PAGES_PER_BLOCK         64
 #define NUM_BLOCKS              4096
 #define NAND_RAW_SIZE           ((uint64_t)NUM_BLOCKS * PAGES_PER_BLOCK * PAGE_RAW)
+#define BLOCK_RAW               ((uint64_t)PAGES_PER_BLOCK * PAGE_RAW)
 
 /*
  * FLASH_STATUS after an operation.  A real HD2 idles at 0x00C00020: bit 5
@@ -87,6 +88,14 @@ struct MsmNandState {
     qemu_irq irq_wr;
     BlockBackend *blk;
     uint8_t *mem;           /* used when no drive is attached */
+    /*
+     * The erase block last read, whole: a page goes as four codeword reads
+     * and a boot reads pages in order, and each block-layer read is a
+     * coroutine, a worker thread and an eventfd -- a dozen system calls,
+     * which on a phone cost more than the guest's work.
+     */
+    uint8_t *cache;
+    int64_t cache_blk;      /* -1: none */
 
     uint32_t regs[0x40];
     uint8_t buf[NAND_BUF_SIZE];
@@ -113,9 +122,28 @@ static bool nand_io(MsmNandState *s, uint64_t off, void *data, int len,
         return false;
     }
     if (s->blk) {
-        int r = write ? blk_pwrite(s->blk, off, len, data, 0)
-                      : blk_pread(s->blk, off, len, data, 0);
-        return r >= 0;
+        int64_t blk = off / BLOCK_RAW;
+        bool one = (off + len - 1) / BLOCK_RAW == blk;
+
+        if (write) {
+            if (s->cache_blk >= blk &&
+                s->cache_blk <= (int64_t)((off + len - 1) / BLOCK_RAW)) {
+                s->cache_blk = -1;
+            }
+            return blk_pwrite(s->blk, off, len, data, 0) >= 0;
+        }
+        if (!one) {
+            return blk_pread(s->blk, off, len, data, 0) >= 0;
+        }
+        if (s->cache_blk != blk) {
+            if (blk_pread(s->blk, blk * BLOCK_RAW, BLOCK_RAW, s->cache, 0) < 0) {
+                s->cache_blk = -1;
+                return false;
+            }
+            s->cache_blk = blk;
+        }
+        memcpy(data, s->cache + (off - blk * BLOCK_RAW), len);
+        return true;
     }
     if (write) {
         memcpy(s->mem + off, data, len);
@@ -506,6 +534,7 @@ static void nand_reset(DeviceState *dev)
     s->regs[0xAC >> 2] = 0x0000000D;    /* DEV_CMD_VLD */
     s->regs[0xF0 >> 2] = 0x000001FF;    /* EBI2_ECC_BUF_CFG */
     s->op_remaining = 0;
+    s->cache_blk = -1;
 }
 
 static void nand_realize(DeviceState *dev, Error **errp)
@@ -523,6 +552,8 @@ static void nand_realize(DeviceState *dev, Error **errp)
                        " bytes (4096 blocks x 64 pages x 2112)", NAND_RAW_SIZE);
             return;
         }
+        s->cache = g_malloc(BLOCK_RAW);
+        s->cache_blk = -1;
     } else {
         s->mem = g_malloc(NAND_RAW_SIZE);
         memset(s->mem, 0xFF, NAND_RAW_SIZE);
