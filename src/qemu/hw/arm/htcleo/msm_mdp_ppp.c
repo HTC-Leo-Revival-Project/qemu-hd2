@@ -25,9 +25,14 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/error-report.h"
 #include "system/physmem.h"
 #include "htcleo.h"
 #include "msm_mdp.h"
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 #define R(off)              (s->regs[(off) >> 2])
 
@@ -85,7 +90,17 @@ typedef struct PppImg {
     bool alpha;
     bool pseudoplanar;
     int hsub, vsub;             /* chroma subsampling */
+    int fast;                   /* PPP_UNPACK_*: how ppp_fetch_row unpacks */
+    int8_t src[4];              /* BYTES: pixel byte of G,B,R,A, -1: 0xFF */
 } PppImg;
+
+/*
+ * Every frame Android composes goes through ppp_fetch_row a pixel at a
+ * time, so the common formats get a short cut that gives the same bytes:
+ * 16-bit pixels with G, B and R all present through a table of the whole
+ * 64 Ki values, 8-bit components by moving bytes.
+ */
+enum { PPP_UNPACK_ANY, PPP_UNPACK_LUT16, PPP_UNPACK_BYTES };
 
 /*
  * src and bg CFG: comps 7:0, alpha en 8, bpp 10:9, interleave 14:13,
@@ -118,6 +133,28 @@ static void ppp_img_decode(PppImg *im, uint32_t cfg, uint32_t pack,
     if (im->pseudoplanar) {
         /* plane 0 is 8-bit luma, plane 1 two interleaved chroma bytes */
         im->bpp = 1;
+    }
+    im->fast = PPP_UNPACK_ANY;
+    if (!im->pseudoplanar) {
+        int seen = 0, bits8 = 1, total = 0;
+
+        for (i = 0; i < im->ncomp; i++) {
+            seen |= 1 << im->order[i];
+            total += im->width[im->order[i]];
+            bits8 &= im->width[im->order[i]] == 8;
+        }
+        if (im->bpp == 2 && (seen & 7) == 7 && total <= 16) {
+            im->fast = PPP_UNPACK_LUT16;
+        } else if (bits8 && im->ncomp == im->bpp && (seen & 7) == 7) {
+            im->fast = PPP_UNPACK_BYTES;
+            memset(im->src, -1, sizeof(im->src));
+            /* as ppp_unpack: a later component of the same id wins */
+            for (i = 0; i < im->ncomp; i++) {
+                if (im->order[i] != CLR_A || im->alpha) {
+                    im->src[im->order[i]] = i;
+                }
+            }
+        }
     }
 }
 
@@ -194,6 +231,78 @@ static uint32_t ppp_pack(const PppImg *im, const uint8_t *c)
     return v;
 }
 
+/* the unpacked G,B,R,A of every 16-bit value, for the last two formats */
+typedef struct PppLut16 {
+    int key;                    /* -1: empty */
+    uint8_t c[65536][4];
+} PppLut16;
+
+static int ppp_lut_key(const PppImg *im)
+{
+    int k = im->ncomp | im->alpha << 2;
+
+    for (int i = 0; i < 4; i++) {
+        k |= im->order[i] << (3 + 2 * i) | im->width[i] << (11 + 4 * i);
+    }
+    return k;
+}
+
+static const uint8_t (*ppp_lut16(const PppImg *im))[4]
+{
+    static PppLut16 *lut[2];
+    static int next;
+    int key = ppp_lut_key(im);
+
+    for (int i = 0; i < 2; i++) {
+        if (lut[i] && lut[i]->key == key) {
+            return lut[i]->c;
+        }
+    }
+    if (!lut[next]) {
+        lut[next] = g_new(PppLut16, 1);
+    }
+    for (uint32_t v = 0; v < 65536; v++) {
+        ppp_unpack(im, v, lut[next]->c[v]);
+    }
+    lut[next]->key = key;
+    next ^= 1;
+    return lut[next ^ 1]->c;
+}
+
+/*
+ * Four bytes a pixel in, G,B,R,A out: src[id] is the input byte that holds
+ * component id, or -1 for 0xFF.  False where there is no vector code.
+ */
+static bool ppp_swizzle4(const uint8_t *in, uint8_t *out, int w,
+                         const int8_t *src)
+{
+#ifdef __aarch64__
+    int idx[4], x = 0;
+
+    for (int k = 0; k < 4; k++) {
+        idx[k] = src[k] < 0 ? 4 : src[k];
+    }
+    for (; x + 8 <= w; x += 8) {
+        uint8x8x4_t i4 = vld4_u8(in + 4 * x), o4;
+        uint8x8_t ch[5] = { i4.val[0], i4.val[1], i4.val[2], i4.val[3],
+                            vdup_n_u8(0xFF) };
+
+        for (int k = 0; k < 4; k++) {
+            o4.val[k] = ch[idx[k]];
+        }
+        vst4_u8(out + 4 * x, o4);
+    }
+    for (; x < w; x++) {
+        for (int k = 0; k < 4; k++) {
+            out[4 * x + k] = src[k] < 0 ? 0xFF : in[4 * x + src[k]];
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 /* read a row of an RGB or YCbCr image as G,B,R,A */
 static void ppp_fetch_row(const PppImg *im, int x0, int y, int w,
                           uint8_t *line, uint8_t *out)
@@ -203,8 +312,43 @@ static void ppp_fetch_row(const PppImg *im, int x0, int y, int w,
     if (!im->pseudoplanar) {
         physical_memory_read(im->base0 + (hwaddr)y * im->stride0 +
                              (hwaddr)x0 * im->bpp, line, w * im->bpp);
-        for (x = 0; x < w; x++) {
-            ppp_unpack(im, ld_le(line + x * im->bpp, im->bpp), out + x * 4);
+        if (im->fast == PPP_UNPACK_LUT16) {
+            const uint8_t (*c)[4] = ppp_lut16(im);
+
+            for (x = 0; x < w; x++) {
+                memcpy(out + x * 4, c[lduw_le_p(line + x * 2)], 4);
+            }
+        } else if (im->fast == PPP_UNPACK_BYTES) {
+            const int bpp = im->bpp;
+            const int sg = im->src[CLR_G], sb = im->src[CLR_B];
+            const int sr = im->src[CLR_R], sa = im->src[CLR_A];
+
+            if (bpp == 4 && sg == 0 && sb == 1 && sr == 2 &&
+                (sa == 3 || sa < 0)) {
+                memcpy(out, line, w * 4);
+                if (sa < 0) {
+                    for (x = 0; x < w; x++) {
+                        out[x * 4 + CLR_A] = 0xFF;
+                    }
+                }
+            } else if (bpp == 4 && ppp_swizzle4(line, out, w, im->src)) {
+                /* done */
+            } else {
+                for (x = 0; x < w; x++) {
+                    const uint8_t *p = line + x * bpp;
+                    uint8_t *c = out + x * 4;
+
+                    c[CLR_G] = p[sg];
+                    c[CLR_B] = p[sb];
+                    c[CLR_R] = p[sr];
+                    c[CLR_A] = sa < 0 ? 0xFF : p[sa];
+                }
+            }
+        } else {
+            for (x = 0; x < w; x++) {
+                ppp_unpack(im, ld_le(line + x * im->bpp, im->bpp),
+                           out + x * 4);
+            }
         }
     } else {
         int cx0 = (x0 / im->hsub) * 2;
@@ -233,7 +377,46 @@ typedef struct PppBlit {
     uint32_t op, const_alpha, bgsel;
     int dx, dy, bx, by, dw;
     uint8_t *bline, *brgb, *dline;
+    /* how the blend and the pack run, worked out once per blit */
+    int fsel, bsel;             /* where the alphas come from (bsel < 0: 1 - fa) */
+    bool frev, brev;
+    uint8_t kf, kb;
+    bool pack8;                 /* 4 bytes a pixel, every present component 8 bits */
+    int8_t pidx[4];             /* byte i of the pixel holds channel pidx[i], -1: 0 */
+    bool verify;                /* check the fast path against the plain one */
 } PppBlit;
+
+static void ppp_blit_prepare(PppBlit *b)
+{
+    const PppImg *d = &b->dst;
+    int seen = 0;
+
+    b->fsel = OP_BLEND_SEL(b->op);
+    b->frev = b->op & OP_BLEND_REVERSE;
+    b->kf = b->const_alpha;
+    if (b->bgsel & BG_USE_ALPHA_SEL) {
+        b->bsel = (b->bgsel >> 1) & 3;
+        b->brev = b->bgsel & BG_ALPHA_REVERSE;
+        b->kb = b->bgsel >> 24;
+    } else {
+        b->bsel = -1;
+        b->brev = false;
+        b->kb = 0;
+    }
+    b->pack8 = d->bpp == 4 && d->ncomp >= 1 && d->ncomp <= 4 &&
+               !d->pseudoplanar;
+    for (int i = 0; b->pack8 && i < d->ncomp; i++) {
+        int id = d->order[i];
+
+        if (d->width[id] != 8 || (seen & (1 << id))) {
+            b->pack8 = false;
+        }
+        seen |= 1 << id;
+    }
+    for (int i = 0; i < 4; i++) {
+        b->pidx[i] = i < d->ncomp ? d->order[i] : -1;
+    }
+}
 
 static uint32_t ppp_alpha(int sel, const uint8_t *f, const uint8_t *b,
                           uint32_t konst)
@@ -250,44 +433,265 @@ static uint32_t ppp_alpha(int sel, const uint8_t *f, const uint8_t *b,
     return 0xFF;
 }
 
+
+/* the plain blend of pixels [from, to): what everything else must equal */
+static void ppp_blend_range(const PppBlit *b, uint8_t *srgb,
+                            const uint8_t *brgb, int from, int to)
+{
+    for (int x = from; x < to; x++) {
+        uint8_t *f = srgb + x * 4;
+        const uint8_t *g = brgb + x * 4;
+        uint32_t fa, ba;
+
+        fa = ppp_alpha(OP_BLEND_SEL(b->op), f, g, b->const_alpha);
+        if (b->op & OP_BLEND_REVERSE) {
+            fa = 0xFF - fa;
+        }
+        if (b->bgsel & BG_USE_ALPHA_SEL) {
+            ba = ppp_alpha((b->bgsel >> 1) & 3, f, g, b->bgsel >> 24);
+            if (b->bgsel & BG_ALPHA_REVERSE) {
+                ba = 0xFF - ba;
+            }
+        } else {
+            ba = 0xFF - fa;
+        }
+        for (int i = 0; i < 4; i++) {
+            f[i] = clamp8((f[i] * fa + g[i] * ba + 127) / 255);
+        }
+    }
+}
+
+static void ppp_pack_range(const PppBlit *b, const uint8_t *srgb,
+                           uint8_t *dline, int from, int to)
+{
+    for (int x = from; x < to; x++) {
+        st_le(dline + x * b->dst.bpp, b->dst.bpp,
+              ppp_pack(&b->dst, srgb + x * 4));
+    }
+}
+
+#ifdef __aarch64__
+static inline uint8x8_t ppp_alpha8(int sel, uint8x8x4_t f, uint8x8x4_t g,
+                                   uint8_t konst)
+{
+    switch (sel) {
+    case 0:
+        return f.val[CLR_A];
+    case 1:
+        return g.val[CLR_A];
+    case 2:
+        return vdup_n_u8(konst);
+    }
+    return vdup_n_u8(0xFF);
+}
+
+/*
+ * floor(x / 255) for x up to 130177 (the most a blend sums to), in single
+ * precision: (x + 0.5) / 255 never falls within 1e-3 of the next integer
+ * from below, and the rounding of the multiply is 1e-5 -- checked for
+ * every x in range, against the integer division.
+ */
+static inline uint32x4_t ppp_div255(uint32x4_t x)
+{
+    float32x4_t v = vaddq_f32(vcvtq_f32_u32(x), vdupq_n_f32(0.5f));
+
+    return vcvtq_u32_f32(vmulq_n_f32(v, 1.0f / 255.0f));
+}
+
+static inline uint8x8_t ppp_blend_ch(uint8x8_t f, uint8x8_t fa, uint8x8_t g,
+                                     uint8x8_t ba)
+{
+    const uint32x4_t k127 = vdupq_n_u32(127), k255 = vdupq_n_u32(255);
+    uint16x8_t p = vmull_u8(f, fa), q = vmull_u8(g, ba);
+    uint32x4_t lo = vaddq_u32(vaddl_u16(vget_low_u16(p), vget_low_u16(q)),
+                              k127);
+    uint32x4_t hi = vaddq_u32(vaddl_high_u16(p, q), k127);
+
+    lo = vminq_u32(ppp_div255(lo), k255);
+    hi = vminq_u32(ppp_div255(hi), k255);
+    return vmovn_u16(vcombine_u16(vmovn_u32(lo), vmovn_u32(hi)));
+}
+#endif
+
+/* blend src row (G,B,R,A) with the background row, in place */
+static void ppp_blend_row(const PppBlit *b, uint8_t *srgb,
+                          const uint8_t *brgb, int n)
+{
+    int x = 0;
+
+#ifdef __aarch64__
+    for (; x + 8 <= n; x += 8) {
+        uint8x8x4_t f = vld4_u8(srgb + 4 * x), g = vld4_u8(brgb + 4 * x);
+        uint8x8_t fa = ppp_alpha8(b->fsel, f, g, b->kf), ba;
+
+        if (b->frev) {
+            fa = vmvn_u8(fa);
+        }
+        if (b->bsel >= 0) {
+            ba = ppp_alpha8(b->bsel, f, g, b->kb);
+            if (b->brev) {
+                ba = vmvn_u8(ba);
+            }
+        } else {
+            ba = vmvn_u8(fa);
+        }
+        for (int c = 0; c < 4; c++) {
+            f.val[c] = ppp_blend_ch(f.val[c], fa, g.val[c], ba);
+        }
+        vst4_u8(srgb + 4 * x, f);
+    }
+#endif
+    ppp_blend_range(b, srgb, brgb, x, n);
+}
+
+static void ppp_pack_row(const PppBlit *b, const uint8_t *srgb,
+                         uint8_t *dline, int n)
+{
+    int x = 0;
+
+#ifdef __aarch64__
+    if (b->pack8) {
+        for (; x + 8 <= n; x += 8) {
+            uint8x8x4_t f = vld4_u8(srgb + 4 * x), o;
+            uint8x8_t ch[5] = { f.val[0], f.val[1], f.val[2], f.val[3],
+                                vdup_n_u8(0) };
+
+            for (int i = 0; i < 4; i++) {
+                o.val[i] = ch[b->pidx[i] < 0 ? 4 : b->pidx[i]];
+            }
+            vst4_u8(dline + 4 * x, o);
+        }
+    }
+#endif
+    ppp_pack_range(b, srgb, dline, x, n);
+}
+
+static void ppp_check_row(const PppBlit *b, int y, const uint8_t *src0,
+                          const uint8_t *bg0)
+{
+    static unsigned bad;
+    int n = b->dw, bpp = b->dst.bpp;
+    g_autofree uint8_t *f = g_memdup2(src0, n * 4);
+    g_autofree uint8_t *ref = g_malloc(n * bpp);
+
+    if (b->op & OP_BLEND_ON) {
+        ppp_blend_range(b, f, bg0, 0, n);
+    }
+    ppp_pack_range(b, f, ref, 0, n);
+    for (int i = 0; i < n * bpp; i++) {
+        if (ref[i] != b->dline[i]) {
+            if (bad++ < 20) {
+                error_report("msm-mdp: blit verify: row %d byte %d is %02x, "
+                             "should be %02x (op %08x bgsel %08x src %02x "
+                             "%02x %02x %02x bg %02x %02x %02x %02x)", y, i,
+                             b->dline[i], ref[i], b->op, b->bgsel,
+                             src0[(i / bpp) * 4], src0[(i / bpp) * 4 + 1],
+                             src0[(i / bpp) * 4 + 2], src0[(i / bpp) * 4 + 3],
+                             bg0 ? bg0[(i / bpp) * 4] : 0,
+                             bg0 ? bg0[(i / bpp) * 4 + 1] : 0,
+                             bg0 ? bg0[(i / bpp) * 4 + 2] : 0,
+                             bg0 ? bg0[(i / bpp) * 4 + 3] : 0);
+            }
+            return;
+        }
+    }
+}
+
+static void msm_mdp_ppp_run1(MsmMdpState *s);
+
 /* blend src row (G,B,R,A, dw pixels) with the background and store row y */
 static void ppp_store_row(PppBlit *b, int y, uint8_t *srgb)
 {
-    int x, i;
+    g_autofree uint8_t *src0 = b->verify ? g_memdup2(srgb, b->dw * 4) : NULL;
+    g_autofree uint8_t *bg0 = NULL;
 
     if (b->op & OP_BLEND_ON) {
         ppp_fetch_row(&b->bg, b->bx, b->by + y, b->dw, b->bline, b->brgb);
-        for (x = 0; x < b->dw; x++) {
-            uint8_t *f = srgb + x * 4, *g = b->brgb + x * 4;
-            uint32_t fa, ba;
-
-            fa = ppp_alpha(OP_BLEND_SEL(b->op), f, g, b->const_alpha);
-            if (b->op & OP_BLEND_REVERSE) {
-                fa = 0xFF - fa;
-            }
-            if (b->bgsel & BG_USE_ALPHA_SEL) {
-                ba = ppp_alpha((b->bgsel >> 1) & 3, f, g, b->bgsel >> 24);
-                if (b->bgsel & BG_ALPHA_REVERSE) {
-                    ba = 0xFF - ba;
-                }
-            } else {
-                ba = 0xFF - fa;
-            }
-            for (i = 0; i < 4; i++) {
-                f[i] = clamp8((f[i] * fa + g[i] * ba + 127) / 255);
-            }
+        if (b->verify) {
+            bg0 = g_memdup2(b->brgb, b->dw * 4);
         }
+        ppp_blend_row(b, srgb, b->brgb, b->dw);
     }
-    for (x = 0; x < b->dw; x++) {
-        st_le(b->dline + x * b->dst.bpp, b->dst.bpp,
-              ppp_pack(&b->dst, srgb + x * 4));
+    ppp_pack_row(b, srgb, b->dline, b->dw);
+    if (b->verify) {
+        ppp_check_row(b, y, src0, bg0);
     }
     physical_memory_write(b->dst.base0 + (hwaddr)(b->dy + y) * b->dst.stride0
                           + (hwaddr)b->dx * b->dst.bpp, b->dline,
                           b->dw * b->dst.bpp);
 }
 
+/*
+ * Which blits the guest asks for and what they cost, to see what is worth
+ * making fast: the registers that decide how a blit runs, with a count, the
+ * pixels and the nanoseconds.  msm_mdp_ppp_dump() prints the dearest and
+ * clears them.
+ */
+typedef struct PppCombo {
+    uint32_t key[7];
+    uint64_t n, px, ns;
+} PppCombo;
+static PppCombo ppp_combos[64];
+
+static void ppp_account(const uint32_t *key, uint64_t px, uint64_t ns)
+{
+    PppCombo *c = NULL;
+
+    for (int i = 0; i < 64; i++) {
+        if (ppp_combos[i].n && !memcmp(ppp_combos[i].key, key, 28)) {
+            c = &ppp_combos[i];
+            break;
+        }
+        if (!ppp_combos[i].n && !c) {
+            c = &ppp_combos[i];
+        }
+    }
+    if (c) {
+        memcpy(c->key, key, 28);
+        c->n++;
+        c->px += px;
+        c->ns += ns;
+    }
+}
+
+void msm_mdp_ppp_dump(void)
+{
+    for (int rank = 0; rank < 4; rank++) {
+        PppCombo *best = NULL;
+
+        for (int i = 0; i < 64; i++) {
+            if (ppp_combos[i].n && (!best || ppp_combos[i].ns > best->ns)) {
+                best = &ppp_combos[i];
+            }
+        }
+        if (!best) {
+            break;
+        }
+        info_report("msm-mdp:   blit op %08x src %08x/%08x dst %08x/%08x bg "
+                    "%08x bgsel %08x: %" PRIu64 "x, %" PRIu64 " px, %.1f ms",
+                    best->key[0], best->key[1], best->key[2], best->key[3],
+                    best->key[4], best->key[5], best->key[6], best->n,
+                    best->px, best->ns / 1e6);
+        best->n = 0;
+    }
+    memset(ppp_combos, 0, sizeof(ppp_combos));
+}
+
 void msm_mdp_ppp_run(MsmMdpState *s)
+{
+    int64_t t_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint32_t dbg_key[7] = { R(PPP_OP), R(PPP_SRC_CFG), R(PPP_SRC_PACK),
+                            R(PPP_DST_CFG), R(PPP_DST_PACK), R(PPP_BG_CFG),
+                            R(PPP_BG_ALPHA_SEL) };
+    uint64_t dbg_px = (uint64_t)(R(PPP_DST_ROI) & 0xfff) *
+                      ((R(PPP_DST_ROI) >> 16) & 0xfff);
+
+    msm_mdp_ppp_run1(s);
+    ppp_account(dbg_key, dbg_px,
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t_start);
+}
+
+static void msm_mdp_ppp_run1(MsmMdpState *s)
 {
     uint32_t op = R(PPP_OP);
     uint32_t sroi = R(PPP_SRC_ROI), droi = R(PPP_DST_ROI);
@@ -342,6 +746,8 @@ void msm_mdp_ppp_run(MsmMdpState *s)
         dh = MIN(dh, rh);
     }
     b.dw = dw;
+    b.verify = s->verify;
+    ppp_blit_prepare(&b);
 
     n = MAX(sw, dw);
     sline = g_malloc(n * 4 * 2);

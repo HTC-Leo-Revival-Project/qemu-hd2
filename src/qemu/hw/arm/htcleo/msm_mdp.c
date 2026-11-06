@@ -25,6 +25,8 @@
 #include "system/memory.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
+#include "qemu/error-report.h"
+#include "hw/core/qdev-properties.h"
 #include "htcleo.h"
 #include "msm_mdp.h"
 
@@ -122,6 +124,7 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     case MDP_DMA_P_START:
         s->invalidate = true;
+        s->st_dma++;
         msm_mdp_raise(s, INT_DMA_P_DONE);
         return;
     case MDP_DMA_S_START:
@@ -129,6 +132,7 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     case MDP_LCDC_EN:
         s->regs[off >> 2] = val;
+        s->redraw = true;
         if (val & 1) {
             if (!timer_pending(s->vsync)) {
                 timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -179,6 +183,67 @@ void msm_mdp_set_backlight(MsmMdpState *s, int level)
     }
 }
 
+static void mdp_build_lut565(MsmMdpState *s, unsigned br)
+{
+    if (!s->lut565) {
+        s->lut565 = g_new(uint32_t, 65536);
+    }
+    for (uint32_t p = 0; p < 65536; p++) {
+        uint8_t r = ((p >> 11) & 0x1F) << 3;
+        uint8_t g = ((p >> 5) & 0x3F) << 2;
+        uint8_t b = (p & 0x1F) << 3;
+
+        r |= r >> 5;
+        g |= g >> 6;
+        b |= b >> 5;
+        if (br < 255) {
+            r = r * br / 255;
+            g = g * br / 255;
+            b = b * br / 255;
+        }
+        s->lut565[p] = rgb_to_pixel32(r, g, b);
+    }
+    s->lut_br = br;
+    s->lut_valid = true;
+}
+
+/* the plain conversion of one pixel: what the surface must hold */
+static uint32_t mdp_ref_pixel(const uint8_t *line, int bpp, uint32_t x,
+                              uint32_t pack, unsigned br)
+{
+    uint8_t r, g, b;
+
+    if (bpp == 2) {
+        uint16_t p = line[2 * x] | (line[2 * x + 1] << 8);
+
+        r = ((p >> 11) & 0x1F) << 3;
+        g = ((p >> 5) & 0x3F) << 2;
+        b = (p & 0x1F) << 3;
+        r |= r >> 5;
+        g |= g >> 6;
+        b |= b >> 5;
+    } else if (bpp == 4) {
+        uint8_t c[3] = { 0, 0, 0 };
+
+        for (int k = 0; k < 3; k++) {
+            c[((pack >> (2 * k)) & 3) % 3] = line[4 * x + k];
+        }
+        g = c[0];
+        b = c[1];
+        r = c[2];
+    } else {
+        r = line[3 * x];
+        g = line[3 * x + 1];
+        b = line[3 * x + 2];
+    }
+    if (br < 255) {
+        r = r * br / 255;
+        g = g * br / 255;
+        b = b * br / 255;
+    }
+    return rgb_to_pixel32(r, g, b);
+}
+
 static bool mdp_gfx_update(void *opaque)
 {
     MsmMdpState *s = opaque;
@@ -196,6 +261,9 @@ static bool mdp_gfx_update(void *opaque)
     bool on = (s->regs[MDP_LCDC_EN >> 2] & 1) && base && s->panel_on &&
               s->brightness;
     unsigned br = s->brightness;
+    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    uint32_t key[6], rowbytes, y0, y1, nrows = 0;
+    bool full;
 
     if (!w || w > PANEL_W) {
         w = PANEL_W;
@@ -209,6 +277,7 @@ static bool mdp_gfx_update(void *opaque)
     if (surface_width(surf) != PANEL_W || surface_height(surf) != PANEL_H) {
         qemu_console_resize(s->con, PANEL_W, PANEL_H);
         surf = qemu_console_surface(s->con);
+        s->prev_valid = false;
     }
     dst = surface_data(surf);
     dstride = surface_stride(surf);
@@ -222,53 +291,122 @@ static bool mdp_gfx_update(void *opaque)
         }
         s->was_on = false;
         s->invalidate = false;
+        s->prev_valid = false;
         return true;
     }
     s->was_on = true;
-    line = g_malloc(stride);
+
+    rowbytes = w * bpp;
+    key[0] = w; key[1] = h; key[2] = fmt; key[3] = pack; key[4] = br;
+    key[5] = surface_stride(surf);
+    if (memcmp(key, s->prev_key, sizeof(key))) {
+        memcpy(s->prev_key, key, sizeof(key));
+        s->prev_valid = false;
+    }
+    if (s->redraw) {
+        s->redraw = false;
+        s->prev_valid = false;
+    }
+    full = !s->diff || !s->prev_valid;
+    if (s->diff && !s->prev) {
+        s->prev = g_malloc(PANEL_W * PANEL_H * 4);
+    }
+    if (bpp == 2 && (!s->lut_valid || s->lut_br != br)) {
+        mdp_build_lut565(s, br);
+    }
+
+    line = g_malloc(MAX(stride, rowbytes));
+    y0 = h;
+    y1 = 0;
     for (uint32_t y = 0; y < h; y++) {
         uint32_t *d = (uint32_t *)(dst + y * dstride);
-        address_space_read(&address_space_memory, base + y * stride,
-                           MEMTXATTRS_UNSPECIFIED, line, w * bpp);
-        for (uint32_t x = 0; x < w; x++) {
-            uint8_t r, g, b;
-            if (bpp == 2) {
-                uint16_t p = line[2 * x] | (line[2 * x + 1] << 8);
-                r = ((p >> 11) & 0x1F) << 3;
-                g = ((p >> 5) & 0x3F) << 2;
-                b = (p & 0x1F) << 3;
-                r |= r >> 5;
-                g |= g >> 6;
-                b |= b >> 5;
-            } else if (bpp == 4) {
-                /*
-                 * XRGB8888: the pack pattern names the component in each
-                 * byte, from byte 0 up (2 bits each: 0 G, 1 B, 2 R).  The
-                 * kernel's 32 bpp framebuffer is R,G,B,X with PATTERN_BGR.
-                 */
-                uint8_t c[3] = { 0, 0, 0 };
 
-                for (int k = 0; k < 3; k++) {
-                    c[((pack >> (2 * k)) & 3) % 3] = line[4 * x + k];
+        address_space_read(&address_space_memory, base + (hwaddr)y * stride,
+                           MEMTXATTRS_UNSPECIFIED, line, rowbytes);
+        if (!full && !memcmp(line, s->prev + (size_t)y * rowbytes, rowbytes)) {
+            continue;
+        }
+        if (s->diff) {
+            memcpy(s->prev + (size_t)y * rowbytes, line, rowbytes);
+        }
+        if (bpp == 2) {
+            const uint16_t *src = (const uint16_t *)line;
+
+            for (uint32_t x = 0; x < w; x++) {
+                d[x] = s->lut565[lduw_le_p(src + x)];
+            }
+        } else if (bpp == 4) {
+            /*
+             * XRGB8888: the pack pattern names the component in each
+             * byte, from byte 0 up (2 bits each: 0 G, 1 B, 2 R).  The
+             * kernel's 32 bpp framebuffer is R,G,B,X with PATTERN_BGR.
+             */
+            int where[3] = { 0, 0, 0 };
+
+            for (int k = 0; k < 3; k++) {
+                where[((pack >> (2 * k)) & 3) % 3] = k;
+            }
+            for (uint32_t x = 0; x < w; x++) {
+                const uint8_t *p = line + 4 * x;
+                uint8_t g = p[where[0]], b = p[where[1]], r = p[where[2]];
+
+                if (br < 255) {
+                    r = r * br / 255;
+                    g = g * br / 255;
+                    b = b * br / 255;
                 }
-                g = c[0];
-                b = c[1];
-                r = c[2];
-            } else {
-                r = line[3 * x];
-                g = line[3 * x + 1];
-                b = line[3 * x + 2];
+                d[x] = rgb_to_pixel32(r, g, b);
             }
-            if (br < 255) {
-                r = r * br / 255;
-                g = g * br / 255;
-                b = b * br / 255;
+        } else {
+            for (uint32_t x = 0; x < w; x++) {
+                uint8_t r = line[3 * x], g = line[3 * x + 1];
+                uint8_t b = line[3 * x + 2];
+
+                if (br < 255) {
+                    r = r * br / 255;
+                    g = g * br / 255;
+                    b = b * br / 255;
+                }
+                d[x] = rgb_to_pixel32(r, g, b);
             }
-            d[x] = rgb_to_pixel32(r, g, b);
+        }
+        y0 = MIN(y0, y);
+        y1 = y;
+        nrows++;
+    }
+    if (full) {
+        y0 = 0;
+        y1 = PANEL_H - 1;
+    }
+    if (nrows || full) {
+        qemu_console_update(s->con, 0, y0, PANEL_W, y1 - y0 + 1);
+    }
+    if (s->verify) {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint32_t *d = (const uint32_t *)(dst + y * dstride);
+
+            address_space_read(&address_space_memory,
+                               base + (hwaddr)y * stride,
+                               MEMTXATTRS_UNSPECIFIED, line, rowbytes);
+            for (uint32_t x = 0; x < w; x++) {
+                if (d[x] != mdp_ref_pixel(line, bpp, x, pack, br)) {
+                    if (s->st_bad++ < 20) {
+                        error_report("msm-mdp: verify: row %u column %u is "
+                                     "%08x, should be %08x (diff %d, "
+                                     "full %d)", y, x, d[x],
+                                     mdp_ref_pixel(line, bpp, x, pack, br),
+                                     s->diff, full);
+                    }
+                    break;
+                }
+            }
         }
     }
-    qemu_console_update(s->con, 0, 0, PANEL_W, PANEL_H);
+    s->prev_valid = s->diff;
     s->invalidate = false;
+    s->st_refresh++;
+    s->st_rows += nrows;
+    s->st_refresh_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
     return true;
 }
 
@@ -276,6 +414,7 @@ static void mdp_gfx_invalidate(void *opaque)
 {
     MsmMdpState *s = opaque;
     s->invalidate = true;
+    s->redraw = true;
 }
 
 static const GraphicHwOps mdp_gfx_ops = {
@@ -296,9 +435,31 @@ static void mdp_reset(DeviceState *dev)
     mdp_update_irq(s);
 }
 
+static void mdp_stats(void *opaque)
+{
+    MsmMdpState *s = opaque;
+    uint64_t ppp = s->ppp_ops - s->st_ppp0;
+
+    if (s->st_dma || ppp || s->st_refresh) {
+        info_report("msm-mdp: per second: %.1f frames flipped, %.1f blits, "
+                    "%.1f refreshes of %.1f rows (%.2f ms each)",
+                    s->st_dma / 2.0, ppp / 2.0, s->st_refresh / 2.0,
+                    s->st_refresh ? (double)s->st_rows / s->st_refresh : 0,
+                    s->st_refresh ?
+                    s->st_refresh_ns / 1e6 / s->st_refresh : 0);
+    }
+    msm_mdp_ppp_dump();
+    s->st_dma = s->st_refresh = s->st_rows = s->st_refresh_ns = 0;
+    s->st_ppp0 = s->ppp_ops;
+    timer_mod(s->stats, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+}
+
 static void mdp_realize(DeviceState *dev, Error **errp)
 {
     MsmMdpState *s = MSM_MDP(dev);
+
+    s->stats = timer_new_ms(QEMU_CLOCK_REALTIME, mdp_stats, s);
+    timer_mod(s->stats, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
 
     s->con = qemu_graphic_console_create(dev, 0, &mdp_gfx_ops, s);
     qemu_console_resize(s->con, PANEL_W, PANEL_H);
@@ -316,10 +477,17 @@ static void mdp_init(Object *obj)
     s->vsync = timer_new_ns(QEMU_CLOCK_VIRTUAL, mdp_vsync, s);
 }
 
+static const Property mdp_props[] = {
+    /* convert only the rows the guest changed (off: the whole frame, always) */
+    DEFINE_PROP_BOOL("diff", MsmMdpState, diff, true),
+    DEFINE_PROP_BOOL("verify", MsmMdpState, verify, false),
+};
+
 static void mdp_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    device_class_set_props(dc, mdp_props);
     dc->realize = mdp_realize;
     device_class_set_legacy_reset(dc, mdp_reset);
 }
