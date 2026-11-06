@@ -159,13 +159,19 @@ public class Emulator {
          * core, which releases the apps core into the HSPL out of NAND.  That
          * needs the real baseband, so it implies baseband=lle.
          */
-        if (cfg.splLle) cfg.baseband = Config.LLE;
+        /*
+         * Only when the NAND has a radio in it: the minimal BYON NAND is the SPL alone, and
+         * that boots the HSPL directly (spl=nand) with no modem core under it.
+         */
+        final boolean chain = cfg.splLle && Radio.hasRadio(nand);
+        if (chain) cfg.baseband = Config.LLE;
+        else if (cfg.splLle) note(ctx.getString(R.string.emu_spl_no_radio));
         boolean dsp = cfg.dspRunning();
         boolean needAmss = Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile();
         boolean needDsp = dsp && !paths.image("dsp1.elf").isFile();
-        boolean needSbl = cfg.splLle && (!paths.image("fsbl.bin").isFile() || !paths.image("osbl.bin").isFile());
+        boolean needSbl = chain && (!paths.image("fsbl.bin").isFile() || !paths.image("osbl.bin").isFile());
         if (needAmss || needDsp || needSbl) firmwareFromNand(nand, needAmss, needDsp, needSbl);
-        if (cfg.splLle && (!paths.image("fsbl.bin").isFile() || !paths.image("osbl.bin").isFile())) {
+        if (chain && (!paths.image("fsbl.bin").isFile() || !paths.image("osbl.bin").isFile())) {
             throw new IOException(ctx.getString(R.string.emu_sbl_missing));
         }
         if (Config.LLE.equals(cfg.baseband) && !paths.image("amss.elf").isFile()) {
@@ -187,7 +193,9 @@ public class Emulator {
             machine += ",baseband=lle,baseband-firmware=" + paths.image("amss.elf").getAbsolutePath()
                     + ",baseband-trace=off";
         }
-        if (cfg.splLle) {
+        if (cfg.splLle && !chain) {
+            machine += ",spl=nand";
+        } else if (cfg.splLle) {
             /* the real chain: OSBL pulses PS_HOLD low early on, so the power key is held (see docs) */
             machine += ",spl=nand,keys=power:1500";
         }
@@ -247,7 +255,7 @@ public class Emulator {
          * exactly like a black screen.  tools/start.sh gets away with the
          * implicit "smem.bin" because it runs from images/.
          */
-        if (cfg.splLle) {
+        if (chain) {
             args.add("-global");
             args.add("msm-modem-lle.osbl=" + paths.image("osbl.bin").getAbsolutePath());
             args.add("-global");

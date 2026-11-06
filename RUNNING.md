@@ -48,3 +48,9 @@
   Found with usbmon (`sudo modprobe usbmon; cat /sys/kernel/debug/usb/usbmon/2u`).
   Known gap: hd2_usb.py adb-shell times out waiting for CNXN right after a real adb server session (real adb works); MSC/tethering untested.
   Also: host QEMU needs `-global msm-modem.clk-regime-fake=on` for the YAFFS mount to not wedge (the app sets it).
+- 05:20 BYON implemented (Java): assets/spl/{spl_stock,hspl}.bin bundled; Nand.flashSpl/writeHtcConfig/edit; NandBuilder flashes SPL +
+  HTC config (WinMo build uses the RUU's own stock SPL, section 0x200); Spl.createMinimal/replace; ByonActivity (first launch once, also
+  Settings -> Bootloader): pick stock RUU (.nbh) -> nand.img, or minimal SPL-only NAND; Settings rows "Replace the SPL with HSPL" /
+  "Restore the stock SPL". Emulator uses the full FSBL/OSBL chain only if the NAND has a radio, else plain spl=nand (minimal NAND,
+  verified on host: HSPL runs from the minimal image). Host-verified: Java-built NAND from the real RUU boots WinMo (HTC splash) through
+  the real chain. RUU .exe is not unpacked in the app yet (pick the RUU_signed.nbh).

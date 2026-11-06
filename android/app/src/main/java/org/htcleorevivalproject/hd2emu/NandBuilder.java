@@ -66,6 +66,11 @@ static final Charset UTF8 = Charset.forName("UTF-8");
         public String wifiMac = "00:23:76:48:44:32";
         public String btMac = "00:23:76:48:44:33";
         public File output;
+        /**
+         * The SPL to flash into 0:APPSBL (the bundled HSPL or stock SPL, see Spl).  Null
+         * on a WINMO build means the stock SPL out of the RUU itself (its section 0x200).
+         */
+        public byte[] splImage;
     }
 
     private final Options o;
@@ -131,6 +136,12 @@ static final Charset UTF8 = Charset.forName("UTF-8");
         Nand nand = new Nand(o.output);
         try {
             nand.writeFactoryMacs(Nand.mac(o.wifiMac), Nand.mac(o.btMac));
+            if (o.splImage != null) {
+                /* SPL LLE (the real boot chain) needs the SPL and the radio's config records in the image */
+                step("Flashing the SPL");
+                nand.flashSpl(o.splImage);
+                nand.writeHtcConfig();
+            }
 
             step("Writing the OS area");
             for (int i = 0; i < os.sectors.size(); i++) {
@@ -285,6 +296,14 @@ static final Charset UTF8 = Charset.forName("UTF-8");
             try {
                 step("Writing the radio partitions");
                 Radio.install(nand, radio, log());
+
+                /* the boot chain's records, and the stock SPL out of the RUU (or the one asked for) */
+                nand.writeHtcConfig();
+                byte[] spl = o.splImage != null ? o.splImage : ruu.section(0x200);
+                if (spl != null && spl.length > 0) {
+                    step("Flashing the " + (o.splImage != null ? "chosen" : "stock") + " SPL");
+                    nand.flashSpl(spl);
+                }
 
                 long n = osSec[1] / NBH_PAGE;
                 if ((long) Nand.ROM_BLOCK * Nand.PPB + n > (long) Nand.NBLOCKS * Nand.PPB) {

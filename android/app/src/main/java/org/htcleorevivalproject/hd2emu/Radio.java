@@ -330,6 +330,22 @@ final class Radio {
         return fw;
     }
 
+    /** True if the image has the radio's partition table (0:AMSS) in its first blocks. */
+    static boolean hasRadio(File image) {
+        try {
+            RandomAccessFile f = new RandomAccessFile(image, "r");
+            try {
+                if (f.length() < (long) Nand.NBLOCKS * Nand.PPB * Nand.RAW_PAGE) return false;
+                for (Part part : partitions(readData(f, 0, 0x80000))) if ("0:AMSS".equals(part.name)) return true;
+                return false;
+            } finally {
+                f.close();
+            }
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
     /**
      * The same two ELFs out of a NAND image that has a radio in it - one a
      * stock RUU was flashed to (the Windows Mobile kind), or MAGLDR with a

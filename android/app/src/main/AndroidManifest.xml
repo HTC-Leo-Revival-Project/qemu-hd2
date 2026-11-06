@@ -45,6 +45,12 @@
             android:exported="false" />
 
         <activity
+            android:name=".ByonActivity"
+            android:label="@string/byon_title"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|navigation"
+            android:exported="false" />
+
+        <activity
             android:name=".SensorsActivity"
             android:label="@string/sensors"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|navigation"

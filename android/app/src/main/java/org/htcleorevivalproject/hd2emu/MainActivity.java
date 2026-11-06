@@ -111,6 +111,13 @@ public class MainActivity extends Activity implements ScreenView.Input {
         config.load();
         setContentView(R.layout.activity_main);
         Holo.blackBars(getWindow());
+        /* BYON: the first time there is no NAND image to run, ask for the stock RUU (once) */
+        android.content.SharedPreferences first = getSharedPreferences("htcleo", MODE_PRIVATE);
+        if (!first.getBoolean("byonAsked", false)
+                && !new java.io.File(getFilesDir(), "images/" + config.nand).isFile()) {
+            first.edit().putBoolean("byonAsked", true).apply();
+            startActivity(new Intent(this, ByonActivity.class));
+        }
 
         screen = (ScreenView) findViewById(R.id.screen);
         empty = findViewById(R.id.empty);

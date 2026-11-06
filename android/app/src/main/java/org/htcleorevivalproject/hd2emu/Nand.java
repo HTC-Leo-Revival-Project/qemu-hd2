@@ -35,8 +35,27 @@ static final Charset UTF8 = Charset.forName("UTF-8");
 
     private final RandomAccessFile f;
 
+    /** The SPL (stock or HSPL) lives in 0:APPSBL, from here (HTCLEO_SPL_BLOCK). */
+    static final int SPL_BLOCK = 0x1f1;
+    /** The radio's board record + CID (0:HTC) and boot mode (0:FOTA), which OSBL reads. */
+    static final int HTC_BLOCK = 0xe6;
+    static final int FOTA_BLOCK = 0x1d7;
+
+    /** Opens an existing image for in-place edits (no erase): used to swap the SPL. */
+    static Nand edit(File path) throws IOException {
+        if (path.length() < (long) NBLOCKS * PPB * RAW_PAGE) {
+            throw new IOException(path.getName() + " is not a whole NAND image");
+        }
+        return new Nand(path, false);
+    }
+
     Nand(File path) throws IOException {
+        this(path, true);
+    }
+
+    private Nand(File path, boolean wipe) throws IOException {
         f = new RandomAccessFile(path, "rw");
+        if (!wipe) return;
         /* erased flash is all 0xFF, written 16 blocks (2 MiB) at a time */
         f.setLength(0);
         byte[] ff = new byte[RAW_PAGE * PPB * 16];
@@ -96,6 +115,87 @@ static final Charset UTF8 = Charset.forName("UTF-8");
 
     void close() throws IOException {
         f.close();
+    }
+
+    /**
+     * Strips the R000FF container HTC wraps bootloaders in (tools/hd2_mknand.py
+     * unwrap_r000ff): a 0x20 header, then 64 KiB blocks with a 0x89-byte
+     * signature seam between them.  A flat image (a RUU's section 0x200, the
+     * bundled SPLs) comes back as it is.
+     */
+    static byte[] unwrapR000ff(byte[] d) {
+        final byte[] mark = {0, 1, 0, (byte) 0x80, 0, 0, 0, 1};
+        final int hdr = 0x20, blk = 0x10000, sig = 0x80, seam = sig + 1 + 8;
+        if (d.length < hdr || !Arrays.equals(Arrays.copyOfRange(d, 0x18, 0x20), mark)) return d;
+        int pos = hdr, plain = 0;
+        while (pos < d.length) {
+            plain += Math.min(blk, d.length - pos);
+            if (pos + blk + seam >= d.length
+                    || !Arrays.equals(Arrays.copyOfRange(d, pos + blk + sig + 1, pos + blk + sig + 9), mark)) {
+                break;
+            }
+            pos += seam;
+        }
+        byte[] out = new byte[plain];
+        int dst = 0;
+        while (dst < plain) {
+            int n = Math.min(blk, plain - dst);
+            System.arraycopy(d, pos, out, dst, n);
+            pos += n;
+            dst += n;
+        }
+        return out;
+    }
+
+    /**
+     * Flashes an SPL (stock or HSPL) where the boot ROM and the emulator's spl=nand
+     * look for it: 0:APPSBL, one 2048-byte sector per page.  Pages past the new
+     * image's end are erased, so a shorter SPL leaves nothing of the old one behind.
+     */
+    void flashSpl(byte[] image) throws IOException {
+        byte[] spl = unwrapR000ff(image);
+        int pages = (spl.length + PAGE - 1) / PAGE;
+        for (int i = 0; i < pages; i++) {
+            writePage((long) SPL_BLOCK * PPB + i, Arrays.copyOfRange(spl, i * PAGE, Math.min(spl.length, (i + 1) * PAGE)));
+        }
+        /* the old image may be longer: blank the rest of the 4 blocks the HSPL occupies */
+        for (int i = pages; i < 5 * PPB; i++) {
+            writePage((long) SPL_BLOCK * PPB + i, fill(PAGE, (byte) 0xff));
+        }
+    }
+
+    /** The first MB-sized check that the SPL a NAND holds is there at all. */
+    boolean hasSpl() throws IOException {
+        byte[] raw = new byte[RAW_PAGE];
+        f.seek((long) SPL_BLOCK * PPB * RAW_PAGE);
+        f.readFully(raw);
+        for (int i = 0; i < 512; i++) if (raw[i] != (byte) 0xff) return true;
+        return false;
+    }
+
+    /**
+     * hd2_mknand.py write_htc_config(): what OSBL reads from the radio's config
+     * partitions.  The CID is always SuperCID (11111111), so the stock SPL a RUU puts
+     * back flashes any region's ROM.  Without these records the real boot chain
+     * (SPL LLE) stalls in OSBL's serial console.
+     */
+    void writeHtcConfig() throws IOException {
+        java.nio.ByteBuffer le = java.nio.ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
+        byte[] hdr = fill(PAGE, (byte) 0xff);
+        le.putInt(0xa5b61234).putInt(1).putInt(1);
+        System.arraycopy(le.array(), 0, hdr, 0, 12);
+        byte[] rec = fill(PAGE, (byte) 0xff);
+        Arrays.fill(rec, 0, 48, (byte) 0);
+        System.arraycopy("11111111".getBytes(LATIN1), 0, rec, 0, 8);
+        System.arraycopy("62".getBytes(LATIN1), 0, rec, 8, 2);
+        System.arraycopy("35000000000000".getBytes(LATIN1), 0, rec, 16, 14);
+        byte[] fota = fill(PAGE, (byte) 0xff);
+        java.nio.ByteBuffer fb = java.nio.ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN);
+        fb.putInt(0x82508650);
+        System.arraycopy(fb.array(), 0, fota, 0, 24);
+        writePage((long) HTC_BLOCK * PPB, hdr);
+        writePage((long) HTC_BLOCK * PPB + 1, rec);
+        writePage((long) FOTA_BLOCK * PPB, fota);
     }
 
     /** The MAC addresses the kernel reads out of block 505. */

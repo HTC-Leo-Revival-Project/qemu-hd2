@@ -7,6 +7,8 @@ import android.text.InputType;
 import android.view.View;
 import android.widget.Toast;
 
+import java.io.File;
+
 /**
  * The same knobs the web UI's Config panel has, minus the ones that cannot
  * work in an app: no host GPU (Android has no OpenGL 4.5 with fragment shader
@@ -322,6 +324,25 @@ public class SettingsActivity extends HoloActivity {
                         }
                     });
         }
+        page.category(getString(R.string.set_cat_spl));
+        page.row(getString(R.string.set_byon), getString(R.string.set_byon_sum), new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(SettingsActivity.this, ByonActivity.class));
+            }
+        });
+        page.row(getString(R.string.set_spl_hspl), getString(R.string.set_spl_hspl_sum), new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                swapSpl(true);
+            }
+        });
+        page.row(getString(R.string.set_spl_stock), getString(R.string.set_spl_stock_sum), new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                swapSpl(false);
+            }
+        });
         page.switchRow(getString(R.string.set_spl_lle), getString(R.string.set_spl_lle_sum), config.splLle,
                 new Holo.OnToggle() {
                     @Override
@@ -430,5 +451,40 @@ public class SettingsActivity extends HoloActivity {
                 Toast.makeText(SettingsActivity.this, why, Toast.LENGTH_LONG).show();
             }
         });
+    }
+
+    /** BYON: puts the bundled HSPL (or the stock SPL) into the selected NAND image. */
+    private void swapSpl(final boolean hspl) {
+        final File image = new File(getFilesDir(), "images/" + config.nand);
+        if (!image.isFile()) {
+            Toast.makeText(this, getString(R.string.emu_nand_missing, config.nand), Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (EmuService.instance(this).isRunning()) {
+            Toast.makeText(this, getString(R.string.img_in_use), Toast.LENGTH_LONG).show();
+            return;
+        }
+        final Holo.Progress bar = new Holo.Progress(this, getString(R.string.set_cat_spl), getString(R.string.preparing));
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String err = null;
+                try {
+                    Spl.replace(image, hspl ? Spl.hspl(SettingsActivity.this) : Spl.stock(SettingsActivity.this));
+                } catch (Throwable e) {
+                    err = String.valueOf(e.getMessage());
+                }
+                final String why = err;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        bar.dismiss();
+                        Toast.makeText(SettingsActivity.this, why != null ? why
+                                : getString(R.string.set_spl_done, image.getName(), hspl ? "HSPL" : "stock SPL"),
+                                Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+        }, "spl-swap").start();
     }
 }
