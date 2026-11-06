@@ -92,10 +92,13 @@ public class Adb {
         final int id = nextId.getAndIncrement();
 
         send(A_OPEN, id, 0, ("shell:" + command + "\0").getBytes(UTF8));
-        Packet first = readPacket(15000);
-        if (first == null) {
-            throw new IOException("the guest did not answer");
-        }
+        Packet first;
+        do {
+            first = readPacket(15000);
+            if (first == null) {
+                throw new IOException("the guest did not answer");
+            }
+        } while (!forStream(first, id));
         if (first.getInt(0) == A_FAIL) {
             throw new IOException(new String(payload(first), UTF8).replace('\0', ' '));
         }
@@ -115,7 +118,11 @@ public class Adb {
                             break;
                         }
                         int cmd = p.getInt(0);
-                        int remote = p.getInt(8);
+                        if (!forStream(p, id)) {
+                            continue;
+                        }
+                        /* arg0 is the guest's id for this stream, arg1 is ours */
+                        int remote = p.getInt(4);
                         if (cmd == A_WRTE) {
                             byte[] data = payload(p);
                             /* ack, or the guest waits for us */
@@ -157,11 +164,18 @@ public class Adb {
             remote = p.getInt(4);
         }
 
-        /** next packet for this stream, skipping stray ones */
+        /**
+         * next packet for this stream, skipping stray ones: the guest's CLSE
+         * for a stream that is already closed on our side (the sync stream of
+         * a push, just before install opens its shell) would otherwise be
+         * taken as the answer to the next OPEN.
+         */
         Packet next(int timeout) throws IOException {
-            Packet p = readPacket(timeout);
-            if (p == null) throw new IOException("timeout");
-            return p;
+            for (;;) {
+                Packet p = readPacket(timeout);
+                if (p == null) throw new IOException("timeout");
+                if (forStream(p, id)) return p;
+            }
         }
 
         void write(byte[] d, int off, int len) throws IOException {
@@ -175,6 +189,11 @@ public class Adb {
                     append(payload(p));
                     send(A_OKAY, id, remote, null);
                     p = next(20000);
+                }
+                if (p.getInt(0) == A_CLSE) {
+                    eof = true;
+                    send(A_CLSE, id, remote, null);
+                    throw new IOException("write: the guest closed the stream");
                 }
                 if (p.getInt(0) != A_OKAY) throw new IOException("write: " + fourcc(p.getInt(0)));
                 off += n;
@@ -224,6 +243,7 @@ public class Adb {
         }
 
         void close() {
+            if (eof) return;   /* the guest closed it and we answered already */
             try { send(A_CLSE, id, remote, null); } catch (IOException ignored) { }
         }
     }
@@ -242,6 +262,15 @@ public class Adb {
         ByteBuffer b = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
         b.put(id.getBytes(UTF8)).putInt(n);
         return b.array();
+    }
+
+    /** Ends a sync session; the transfer is done whether or not adbd acks it. */
+    private static void quit(Stream st) {
+        try {
+            st.write(sync("QUIT", 0), 0, 8);
+        } catch (IOException ignored) {
+            /* adbd may just close the stream */
+        }
     }
 
     /** adb push: copies a local file to the guest. */
@@ -270,7 +299,7 @@ public class Adb {
                 int len = ByteBuffer.wrap(r, 4, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
                 throw new IOException("push failed: " + new String(st.read(len), UTF8));
             }
-            st.write(sync("QUIT", 0), 0, 8);
+            quit(st);
         } finally {
             st.close();
         }
@@ -300,7 +329,7 @@ public class Adb {
             } finally {
                 fo.close();
             }
-            st.write(sync("QUIT", 0), 0, 8);
+            quit(st);
         } finally {
             st.close();
         }
@@ -388,6 +417,18 @@ public class Adb {
             in.readFully(raw, 24, len);
         }
         return new Packet(raw);
+    }
+
+    /**
+     * Whether a packet belongs to our stream {@code id}: OKAY, WRTE and CLSE
+     * carry our id in arg1.  Anything else (CNXN, FAIL) is passed on.
+     */
+    private static boolean forStream(Packet p, int id) {
+        int cmd = p.getInt(0);
+        if (cmd != A_OKAY && cmd != A_WRTE && cmd != A_CLSE) {
+            return true;
+        }
+        return p.getInt(8) == id;
     }
 
     private static byte[] payload(Packet p) {

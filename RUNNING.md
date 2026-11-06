@@ -62,3 +62,21 @@
   HSPL shows its bootloader screen ("SPL-2.08.HSPL", "Security Unlocked") and a USB gadget; through the S25's port the PC sees
   0bb4:00ce "Qualcomm CDMA Technologies MSM" (class ff/ff/ff bulk pair); hd2_usb.py list/serial can open it. The HSPL's serial
   protocol itself was not decoded (no reply to `info 2` / `help`). Phone restored: passthrough off, nand-spl.img selected, USB HAL running.
+
+## Session 2 (2026-11-06, unattended) — next tasks
+1. USB MSC + RNDIS from the Android guest, on the host via vhci_hcd (start-usb-lle.sh): guest `setprop sys.usb.config mass_storage,adb` / `rndis,adb`.
+2. Re-test `tools/hd2_usb.py adb-shell` (byte-sum checksum fix) against the guest.
+3. usbffs.c: check multi-interface / interrupt-EP / IAD support needed for RNDIS through the S25 passthrough.
+4. WinMo sensors: boot WinMo on host, confirm the guest polls BMA150/AKM/light (I2C trace) and reacts to qom-set (rotation).
+5. In-app `Adb.install` against a guest (host harness around Adb.java).
+- Phone state at start: Wi-Fi ADB only (port changes, found with nmap 30000-49999), USB powered but in `sec_charging`
+  and NOT on this host's USB (lsusb shows nothing) -> passthrough-to-PC tests need the cable in this host.
+- 10:20 USER RULE: verify in the app on the S25 only (adb screencap + input), no headless host QEMU, no scrcpy.
+  (A host vhci_hcd run had already shown guest UMS sharing a 512 MB disk with an 8 MB md5 round trip and RNDIS
+  enumerating as 0bb4:0ffc with no host netdev; host-only, does NOT count as verification.)
+- 10:21 In-app ADB install FIXED + VERIFIED in the app (S25, CM9 guest via SPL chain): install failed with "CLSE" because
+  Adb.java did not demultiplex streams: the guest's CLSE for the finished push sync stream was taken as the answer to
+  the `pm install` OPEN. Now every stream skips OKAY/WRTE/CLSE not addressed to it (arg1); shell() acked with our own
+  id instead of the guest's (arg0); QUIT may be answered by CLSE. Clicked through: Install an APK -> hd2bench.apk ->
+  "Success", `pm path com.hd2bench` in Run a shell command -> /data/app/com.hd2bench-2.apk; Logcat shows 200 lines.
+- Phone USB cable is not in this PC (lsusb: no S25), so MSC/RNDIS through the passthrough cannot be tested now.
