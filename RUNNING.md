@@ -38,3 +38,13 @@
   On the S25 the first try booted a stub kernel NAND (nandosbl.img), not Android: that was my test image, now replaced.
 - 02:20 (clock) SPL LLE VERIFIED IN THE APP ON THE S25: nand-spl.img (CM9 + HSPL + radio chain) -> real FSBL/OSBL/HSPL -> cLK -> CM9 wallpaper, 13 fps.
   Live sensors reach QEMU (qom-get accel/mag/light show real values). Next: USB LLE passthrough on top of the SPL chain.
+- 04:55 USB LLE on top of SPL LLE VERIFIED on the S25's own USB port, PC = this host:
+  * real chain boots -> cLK fastboot: `fastboot getvar product` = HTCLEO; `tools/hd2_usb.py fastboot getvar product` (pure pyusb, no ttyUSB/iPAC) works.
+  * `fastboot continue` -> Android: PC re-enumerates as 0bb4:0c02 and `adb -s fastboot shell` gives uid=0 on NexusHD2 4.0.4; adb push/cat work.
+  Bridge fixes (android/native/usbffs.c): (1) reconnect+re-probe when QEMU drops the link while the HSPL/cLK reset the USB
+  controller (bridge used to die on SIGPIPE, which killed the whole emulator start); (2) re-exec to follow the guest's gadget switch
+  fastboot->adb (QEMU closes the link on gadget reset); (3) FFS workers survive ESHUTDOWN between ENABLE events;
+  (4) bulk wMaxPacketSize rewritten per speed (the Android gadget advertises 64 at FS, the port is pinned HS: transfers >64 B hung, adb "offline").
+  Found with usbmon (`sudo modprobe usbmon; cat /sys/kernel/debug/usb/usbmon/2u`).
+  Known gap: hd2_usb.py adb-shell times out waiting for CNXN right after a real adb server session (real adb works); MSC/tethering untested.
+  Also: host QEMU needs `-global msm-modem.clk-regime-fake=on` for the YAFFS mount to not wedge (the app sets it).

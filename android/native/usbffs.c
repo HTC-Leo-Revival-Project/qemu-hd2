@@ -1030,7 +1030,27 @@ static int ffs_descriptors(uint8_t *out, size_t max, size_t *len)
      * is exactly why the gadget is not allowed to negotiate one.
      */
     for (int copy = 0; copy < 3; copy++) {
-        memcpy(out + 24 + copy * body, b.cfg + 9, body);
+        uint8_t *d = out + 24 + copy * body;
+
+        memcpy(d, b.cfg + 9, body);
+        /*
+         * Bulk packet sizes belong to the speed: 64 full, 512 high, 1024 super.
+         * The Android gadget answered at full speed (64) while this port is
+         * pinned to high speed, and a high-speed bulk endpoint of 64 bytes is
+         * not a thing the controller copes with: transfers up to 64 bytes
+         * worked and anything longer -- adb's CNXN banner, the first packet
+         * with a payload over 64 bytes -- never completed, so the PC kept adb
+         * "offline" for good.  Rewrite them for the copy's own speed.
+         */
+        for (size_t at = 0; at + 7 <= body && d[at];) {
+            if (d[at + 1] == 5 && d[at] >= 7 && (d[at + 3] & 3) == 2) {
+                uint16_t mps = copy == 0 ? 64 : copy == 1 ? 512 : 1024;
+
+                d[at + 4] = (uint8_t)mps;
+                d[at + 5] = (uint8_t)(mps >> 8);
+            }
+            at += d[at];
+        }
     }
     *len = n;
     return 0;
@@ -1616,8 +1636,14 @@ static void *out_worker(void *arg)
         room = ring_slice(e, e->ring_head, room);
         pthread_mutex_unlock(&e->lock);
 
+        if (verbose) {
+            note("ffs: %s waiting for the host (room %u)", e->name, room);
+        }
         if (wait_for_io_timed(e->fd, POLLIN, QUIET_MS, &timed_out) != 0) {
             break;
+        }
+        if (verbose && !timed_out) {
+            note("ffs: %s readable, reading up to %u", e->name, room);
         }
         if (timed_out) {
             /*
@@ -1657,6 +1683,18 @@ static void *out_worker(void *arg)
             wake_the_loop();
         }
         pthread_mutex_unlock(&e->lock);
+        if (n < 0 && errno == ESHUTDOWN && !stop_now) {
+            /*
+             * The function is disabled (the PC unconfigured the device, or has
+             * not configured it yet): FunctionFS fails the endpoint until its
+             * next ENABLE event.  That is not the end of this worker -- the
+             * adb gadget's host sends SET_CONFIGURATION twice while it
+             * enumerates, and a worker that quit on the first one never read
+             * the host's CNXN, so adb saw the device "offline" for good.
+             */
+            sleep_ms(50);
+            continue;
+        }
         if (n < 0 && errno != EAGAIN && errno != EINTR) {
             note("ffs: %s read: %s", e->name, strerror(errno));
             break;
@@ -1690,6 +1728,8 @@ static void *in_worker(void *arg)
         e->writing = true;
         pthread_mutex_unlock(&e->lock);
 
+        int shutdown_tries = 0;
+
         while (len) {
             ssize_t n;
 
@@ -1703,6 +1743,8 @@ static void *in_worker(void *arg)
                 }
                 memmove(e->buf, e->buf + n, len - n);
                 len -= (uint32_t)n;
+            } else if (n < 0 && errno == ESHUTDOWN && !stop_now && shutdown_tries++ < 100) {
+                sleep_ms(50);        /* disabled for now: hold the data until ENABLE */
             } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
                 note("ffs: %s write: %s", e->name, strerror(errno));
                 break;
@@ -2043,12 +2085,21 @@ static void pump(void)
         uint8_t reply[HDR_SIZE];
         ssize_t got = read(b.ip, reply, sizeof(reply));
 
-        if (got <= 0) {
-            if (got < 0 && errno != EINTR && errno != EAGAIN) {
-                fail("usb/ip: the link closed");
-                stop_now = 1;
-                return;
-            }
+        if (got == 0 || (got < 0 && errno != EINTR && errno != EAGAIN)) {
+            /*
+             * QEMU drops this link when the guest resets its USB controller
+             * (cLK handing over to Linux, the guest switching its gadget
+             * from fastboot to adb): on a real cable the device falls off the
+             * bus and comes back with other descriptors.  Do the same here --
+             * main() tears the gadget down and starts over against the new
+             * one, which is how the PC sees the switch.
+             */
+            note("usb/ip: the emulator reset its USB controller (%s): re-enumerating",
+                 got ? strerror(errno) : "eof");
+            stop_now = -1;
+            return;
+        } else if (got < 0) {
+            /* interrupted, nothing to do */
         } else if ((size_t)got >= HDR_SIZE) {
             uint32_t cmd = get32(reply);
 
@@ -2575,6 +2626,12 @@ int main(int argc, char **argv)
 
     serve();
     teardown();
+    if (stop_now == -1) {
+        /* a fresh process image gives fresh state for the next gadget; same pid, same pidfile */
+        note("restarting to follow the guest's new USB gadget");
+        execv("/proc/self/exe", argv);
+        fail("exec: %s", strerror(errno));
+    }
     if (pidfile[0]) {
         unlink(pidfile);
     }

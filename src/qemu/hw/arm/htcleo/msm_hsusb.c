@@ -511,6 +511,13 @@ static int hsusb_lle_poll(void *opaque, int ep, bool in,
          * not filled yet would take the prime away and the gadget, which
          * never primes twice, would leave the request unanswered for good.
          */
+        if (ep == 4 || ep == 3) {
+            static int dbg;
+            if ((dbg++ % 2000) == 0) {
+                qemu_log_mask(LOG_TRACE, "msm-hsusb: poll ep %d %s stat %08x prime? td %08x epctrl %08x\n",
+                              ep, in ? "in" : "out", s->stat, ld32(qh_addr(s, bit) + 8), s->epctrl[ep]);
+            }
+        }
         if (!(s->stat & (1u << bit)) ||
             ld32(qh_addr(s, bit) + 8) == TD_TERMINATE) {
             return USBIP_NOPE;

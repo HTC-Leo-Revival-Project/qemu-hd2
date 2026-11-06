@@ -105,9 +105,11 @@ A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE = 0x4E584E43, 0x4E45504F, 0x59414B4F, 0x4
 
 
 def adb_send(eout, cmd, a0, a1, data=b''):
-    eout.write(struct.pack('<6I', cmd, a0, a1, len(data), zlib.crc32(data) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF) + data, TIMEOUT)
+    # header and payload are two transfers: the guest's f_adb queues a 24-byte read for the
+    # header and then one for the payload length, so one 24+N transfer would overflow the first
+    eout.write(struct.pack('<6I', cmd, a0, a1, len(data), zlib.crc32(data) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF), TIMEOUT)
     if data:
-        pass
+        eout.write(data, TIMEOUT)
 
 
 def adb_recv(ein, timeout):
@@ -123,7 +125,7 @@ def cmd_adb_shell(dev, args):
         sys.exit('no adb interface (ff/42/01): is Android up? (lsusb / hd2_usb.py list)')
     intf, ein, eout = p
     claim(dev, intf)
-    adb_send(eout, A_CNXN, 0x01000000, 4096, b'host::\0')
+    adb_send(eout, A_CNXN, 0x01000000, 4096, b'host::features=shell_v2,cmd\0')
     cmd, _, _, data = adb_recv(ein, 10000)
     if cmd != A_CNXN:
         sys.exit('adb: expected CNXN, got %08x (an AUTH device needs the real adb)' % cmd)
@@ -190,8 +192,8 @@ def main():
     ap.add_argument('--pid', type=lambda x: int(x, 16))
     sub = ap.add_subparsers(dest='cmd', required=True)
     sub.add_parser('list')
-    f = sub.add_parser('fastboot'); f.add_argument('words', nargs='+')
-    a = sub.add_parser('adb-shell'); a.add_argument('words', nargs='*')
+    f = sub.add_parser('fastboot'); f.add_argument('words', nargs=argparse.REMAINDER)
+    a = sub.add_parser('adb-shell'); a.add_argument('words', nargs=argparse.REMAINDER)
     s = sub.add_parser('serial'); s.add_argument('-t', type=float, default=3); s.add_argument('hex', nargs='?')
     args = ap.parse_args()
     dev = find(args)
