@@ -36,3 +36,5 @@
   (the kernel TS driver took them for the unsupported B8/68 touch types -> BUG). Also `hd2_radio.py --sbl DIR`
   writes fsbl.bin/osbl.bin; app extracts them (Radio.Firmware) and passes them for SPL LLE.
   On the S25 the first try booted a stub kernel NAND (nandosbl.img), not Android: that was my test image, now replaced.
+- 02:20 (clock) SPL LLE VERIFIED IN THE APP ON THE S25: nand-spl.img (CM9 + HSPL + radio chain) -> real FSBL/OSBL/HSPL -> cLK -> CM9 wallpaper, 13 fps.
+  Live sensors reach QEMU (qom-get accel/mag/light show real values). Next: USB LLE passthrough on top of the SPL chain.
