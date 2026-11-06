@@ -25,6 +25,7 @@ def main():
     secs, start, count = m.extract_nbh_os(a.nbh)
     nand = m.Nand(a.output)
     m.write_factory_macs(nand, m.parse_mac(a.wifi_mac), m.parse_mac(a.bt_mac))
+    m.write_htc_config(nand)
     for i, s in enumerate(secs):
         nand.write_page(m.ROM_BLOCK * m.PPB + i, s)
     nand.close()

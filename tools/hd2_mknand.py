@@ -47,7 +47,10 @@ BLK = PAGE * PPB            # 128 KiB
 
 # ---------------------------------------------------------------- raw NAND
 class Nand:
-    def __init__(self, path):
+    def __init__(self, path, erase=True):
+        if not erase:
+            self.f = open(path, 'r+b')
+            return
         self.f = open(path, 'w+b')
         # erased flash: all 0xFF (written block by block to keep it sparse-ish)
         ff = b'\xff' * (RAW_PAGE * PPB)
@@ -102,6 +105,29 @@ def write_factory_macs(nand, wifi, bt):
     p6[0:6] = bt[::-1]
     nand.write_page(MAC_BLOCK * PPB, bytes(p0))
     nand.write_page(MAC_BLOCK * PPB + 6, bytes(p6))
+
+
+HTC_BLOCK = 0xe6            # radio partition 0:HTC: board record, CID
+FOTA_BLOCK = 0x1d7          # radio partition 0:FOTA: boot mode
+SUPERCID = b'11111111'
+
+
+def write_htc_config(nand):
+    """The radio's config records OSBL reads: the 0:HTC block header (board
+    LEO), the CID record (always SuperCID, so the stock SPL a RUU puts back
+    flashes any region's ROM) and the 0:FOTA record (boot mode 0, normal)."""
+    hdr = bytearray(b'\xff' * PAGE)
+    hdr[0:12] = struct.pack('<3I', 0xa5b61234, 1, 1)
+    rec = bytearray(b'\xff' * PAGE)
+    rec[0:48] = bytes(48)
+    rec[0:8] = SUPERCID
+    rec[8:16] = b'62'.ljust(8, b'\0')
+    rec[16:32] = b'35000000000000'.ljust(16, b'\0')
+    fota = bytearray(b'\xff' * PAGE)
+    fota[0:24] = struct.pack('<6I', 0x82508650, 0, 0, 0, 0, 0)
+    nand.write_page(HTC_BLOCK * PPB, bytes(hdr))
+    nand.write_page(HTC_BLOCK * PPB + 1, bytes(rec))
+    nand.write_page(FOTA_BLOCK * PPB, bytes(fota))
 
 
 # ---------------------------------------------------------------- cLK / ROM header
@@ -570,6 +596,7 @@ def main():
 
     nand = Nand(a.output)
     write_factory_macs(nand, parse_mac(a.wifi_mac), parse_mac(a.bt_mac))
+    write_htc_config(nand)
 
     # 0. HSPL: one 2048-byte sector per page, the layout the boot ROM reads
     if a.spl:

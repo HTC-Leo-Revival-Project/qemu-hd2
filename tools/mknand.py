@@ -500,6 +500,8 @@ def main():
 
     nand = Nand(a.output)
     write_factory_macs(nand, parse_mac(a.wifi_mac), parse_mac(a.bt_mac))
+    from hd2_mknand import write_htc_config
+    write_htc_config(nand)
 
     # 1. OS area (what HSPL flashes)
     for i, s in enumerate(secs):

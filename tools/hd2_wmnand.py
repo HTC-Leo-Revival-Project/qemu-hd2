@@ -28,7 +28,8 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hd2_mknand import Nand, PAGE, PPB, RAW_PAGE, NBLOCKS, ROM_BLOCK  # noqa
+from hd2_mknand import (Nand, PAGE, PPB, RAW_PAGE, NBLOCKS, ROM_BLOCK,  # noqa
+                        write_htc_config)
 import hd2_radio  # noqa
 
 NBH_PAGE = PAGE + 8
@@ -77,6 +78,10 @@ def main():
             f.seek((ROM_BLOCK * PPB + i) * RAW_PAGE)
             f.write(Nand.encode(data, info))
     print('  OS        block %d  %d pages' % (ROM_BLOCK, n))
+    nand = Nand(a.o, erase=False)
+    write_htc_config(nand)
+    nand.close()
+    print('  0:HTC     block 0xe6  CID 11111111 (SuperCID)')
 
 
 if __name__ == '__main__':

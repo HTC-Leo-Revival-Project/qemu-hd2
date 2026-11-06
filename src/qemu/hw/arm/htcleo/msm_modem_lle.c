@@ -379,7 +379,7 @@ static void lle_osbl_htc_config(MsmModemLleState *s)
     static const struct { uint32_t off; const char *str; } strs[] = {
         { 0xEF220, "2.15.50.14" },      /* radio */
         { 0xEF230, "15.42.50.11U" },
-        { 0xEF270, "HTC__032" },        /* CID */
+        { 0xEF270, "11111111" },        /* CID: SuperCID, any RUU flashes */
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(words); i++) {
