@@ -176,6 +176,7 @@ public class Emulator {
             machine += ",baseband=lle,baseband-firmware=" + paths.image("amss.elf").getAbsolutePath()
                     + ",baseband-trace=off";
         }
+        if (cfg.splLle) machine += ",spl=nand"; // the real SPL boots the OS out of NAND
         /*
          * USB passthrough: the host is not us but a bridge, which owns a host
          * controller we cannot reach -- a FunctionFS gadget on this phone's own

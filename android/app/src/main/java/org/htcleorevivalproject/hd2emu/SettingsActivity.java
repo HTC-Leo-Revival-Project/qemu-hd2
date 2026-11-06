@@ -322,6 +322,14 @@ public class SettingsActivity extends HoloActivity {
                         }
                     });
         }
+        page.switchRow(getString(R.string.set_spl_lle), getString(R.string.set_spl_lle_sum), config.splLle,
+                new Holo.OnToggle() {
+                    @Override
+                    public void onToggle(boolean on) {
+                        config.splLle = on;
+                        save();
+                    }
+                });
         page.switchRow(getString(R.string.set_show_fps), getString(R.string.set_show_fps_sum), config.showFps,
                 new Holo.OnToggle() {
                     @Override

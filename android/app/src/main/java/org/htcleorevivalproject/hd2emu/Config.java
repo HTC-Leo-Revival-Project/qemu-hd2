@@ -35,6 +35,13 @@ public class Config {
      * and takes the phone's USB away while the emulator runs; see UsbBridge.
      */
     public boolean usbPassthrough = false;
+    /**
+     * SPL LLE mode: run the phone's own SPL (HSPL) out of NAND as the first
+     * bootloader (machine property spl=nand) instead of QEMU placing the OS
+     * itself.  Needs a NAND with an SPL in it (see Nand/NandBuilder); the SPL
+     * falls back to its USB mode by itself when no LEOIMG.nbh is on the card.
+     */
+    public boolean splLle = false;
     public int dspShift = -1;
     /**
      * The guest's clock: -1 follows the host's real time, 0..N are the icount
@@ -104,6 +111,7 @@ public class Config {
         amssLog = prefs.getBoolean("amssLog", amssLog);
         clkRegimeFake = prefs.getBoolean("clkRegimeFake", clkRegimeFake);
         usbPassthrough = prefs.getBoolean("usbPassthrough", usbPassthrough);
+        splLle = prefs.getBoolean("splLle", splLle);
         dspShift = prefs.getInt("dspShift", dspShift);
         icountShift = prefs.getInt("icountShift", icountShift);
         gpuThreads = prefs.getInt("gpuThreads", gpuThreads);
@@ -129,6 +137,7 @@ public class Config {
                 .putBoolean("amssLog", amssLog)
                 .putBoolean("clkRegimeFake", clkRegimeFake)
                 .putBoolean("usbPassthrough", usbPassthrough)
+                .putBoolean("splLle", splLle)
                 .putInt("dspShift", dspShift)
                 .putInt("icountShift", icountShift)
                 .putInt("gpuThreads", gpuThreads)
