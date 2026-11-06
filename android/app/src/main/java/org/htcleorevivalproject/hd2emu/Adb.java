@@ -139,6 +139,188 @@ public class Adb {
         reader.start();
     }
 
+    /* ------------------------------------------------- exec, push, pull, install */
+
+    /** One open adb service stream, used synchronously (no reader thread). */
+    private final class Stream {
+        final int id = nextId.getAndIncrement();
+        int remote;
+        byte[] buf = new byte[0];
+        int pos;
+        boolean eof;
+
+        Stream(String service) throws IOException {
+            send(A_OPEN, id, 0, (service + "\0").getBytes(UTF8));
+            Packet p = next(15000);
+            if (p == null) throw new IOException("the guest did not answer");
+            if (p.getInt(0) != A_OKAY) throw new IOException(service + ": " + fourcc(p.getInt(0)));
+            remote = p.getInt(4);
+        }
+
+        /** next packet for this stream, skipping stray ones */
+        Packet next(int timeout) throws IOException {
+            Packet p = readPacket(timeout);
+            if (p == null) throw new IOException("timeout");
+            return p;
+        }
+
+        void write(byte[] d, int off, int len) throws IOException {
+            while (len > 0) {
+                int n = Math.min(len, MAX_DATA);
+                byte[] c = new byte[n];
+                System.arraycopy(d, off, c, 0, n);
+                send(A_WRTE, id, remote, c);
+                Packet p = next(20000);
+                while (p.getInt(0) == A_WRTE) { /* peer data while we send: keep it */
+                    append(payload(p));
+                    send(A_OKAY, id, remote, null);
+                    p = next(20000);
+                }
+                if (p.getInt(0) != A_OKAY) throw new IOException("write: " + fourcc(p.getInt(0)));
+                off += n;
+                len -= n;
+            }
+        }
+
+        private void append(byte[] more) {
+            byte[] nb = new byte[buf.length - pos + more.length];
+            System.arraycopy(buf, pos, nb, 0, buf.length - pos);
+            System.arraycopy(more, 0, nb, buf.length - pos, more.length);
+            buf = nb;
+            pos = 0;
+        }
+
+        /** fill the buffer with at least n bytes; false at end of stream */
+        boolean fill(int n) throws IOException {
+            while (buf.length - pos < n) {
+                if (eof) return false;
+                Packet p = next(30000);
+                int cmd = p.getInt(0);
+                if (cmd == A_WRTE) {
+                    append(payload(p));
+                    send(A_OKAY, id, remote, null);
+                } else if (cmd == A_CLSE) {
+                    eof = true;
+                    send(A_CLSE, id, remote, null);
+                }
+            }
+            return true;
+        }
+
+        byte[] read(int n) throws IOException {
+            if (!fill(n)) throw new IOException("short read");
+            byte[] r = new byte[n];
+            System.arraycopy(buf, pos, r, 0, n);
+            pos += n;
+            return r;
+        }
+
+        byte[] readAll() throws IOException {
+            while (fill(buf.length - pos + 1)) { /* until EOF */ }
+            byte[] r = new byte[buf.length - pos];
+            System.arraycopy(buf, pos, r, 0, r.length);
+            pos = buf.length;
+            return r;
+        }
+
+        void close() {
+            try { send(A_CLSE, id, remote, null); } catch (IOException ignored) { }
+        }
+    }
+
+    /** Runs a command and returns what it printed (stdout and stderr together). */
+    public String exec(String command) throws IOException {
+        Stream st = new Stream("shell:" + command);
+        try {
+            return new String(st.readAll(), UTF8);
+        } finally {
+            st.close();
+        }
+    }
+
+    private static byte[] sync(String id, int n) {
+        ByteBuffer b = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+        b.put(id.getBytes(UTF8)).putInt(n);
+        return b.array();
+    }
+
+    /** adb push: copies a local file to the guest. */
+    public void push(java.io.File local, String remote) throws IOException {
+        Stream st = new Stream("sync:");
+        try {
+            String spec = remote + ",33188";
+            byte[] sb = spec.getBytes(UTF8);
+            st.write(sync("SEND", sb.length), 0, 8);
+            st.write(sb, 0, sb.length);
+            java.io.FileInputStream fi = new java.io.FileInputStream(local);
+            try {
+                byte[] chunk = new byte[16384];
+                int n;
+                while ((n = fi.read(chunk)) > 0) {
+                    st.write(sync("DATA", n), 0, 8);
+                    st.write(chunk, 0, n);
+                }
+            } finally {
+                fi.close();
+            }
+            st.write(sync("DONE", (int) (local.lastModified() / 1000)), 0, 8);
+            byte[] r = st.read(8);
+            String tag = new String(r, 0, 4, UTF8);
+            if (!tag.equals("OKAY")) {
+                int len = ByteBuffer.wrap(r, 4, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+                throw new IOException("push failed: " + new String(st.read(len), UTF8));
+            }
+            st.write(sync("QUIT", 0), 0, 8);
+        } finally {
+            st.close();
+        }
+    }
+
+    /** adb pull: copies a guest file to a local one. */
+    public void pull(String remote, java.io.File local) throws IOException {
+        Stream st = new Stream("sync:");
+        try {
+            byte[] rb = remote.getBytes(UTF8);
+            st.write(sync("RECV", rb.length), 0, 8);
+            st.write(rb, 0, rb.length);
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(local);
+            try {
+                for (;;) {
+                    byte[] h = st.read(8);
+                    String tag = new String(h, 0, 4, UTF8);
+                    int len = ByteBuffer.wrap(h, 4, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+                    if (tag.equals("DATA")) {
+                        fo.write(st.read(len));
+                    } else if (tag.equals("DONE")) {
+                        break;
+                    } else {
+                        throw new IOException("pull failed: " + new String(st.read(len), UTF8));
+                    }
+                }
+            } finally {
+                fo.close();
+            }
+            st.write(sync("QUIT", 0), 0, 8);
+        } finally {
+            st.close();
+        }
+    }
+
+    /** adb install: pushes the apk to /data/local/tmp and has pm install it. */
+    public String install(java.io.File apk) throws IOException {
+        String tmp = "/data/local/tmp/" + apk.getName().replaceAll("[^A-Za-z0-9._-]", "_");
+        push(apk, tmp);
+        String r = exec("pm install -r '" + tmp + "'");
+        exec("rm '" + tmp + "'");
+        return r;
+    }
+
+    /** `adb devices` for this bridge: the guest's serial, or null. */
+    public String serial() throws IOException {
+        String s = exec("getprop ro.serialno").trim();
+        return s.isEmpty() ? null : s;
+    }
+
     public void close() {
         if (closed) {
             return;

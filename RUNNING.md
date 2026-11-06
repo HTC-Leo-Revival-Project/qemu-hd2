@@ -28,3 +28,5 @@
   App: HostSensors.java feeds Android SensorManager accel/mag/light -> qom-set at <=20 Hz while the emulator runs. Compiles.
   UNVERIFIED: guest-side readout (WinMo/Android) and on-phone run — the app's bundled QEMU for the phone must be
   rebuilt with these props (android/native build) before the phone shows live data; not done.
+- 03:00 (out of priority order, parked): FatImage.java (SD editor engine, host-tested + fsck.vfat clean) and Adb exec/push/pull/install
+  (compiles, untested vs. a guest). Native arm64 QEMU rebuilt with sensor props. NO SD-editor UI yet. Back to SPL -> USB first.
