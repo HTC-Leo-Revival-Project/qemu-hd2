@@ -315,6 +315,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(HtcleoMicrop, HTCLEO_MICROP)
 #define MICROP_WCMD_BL_EN           0x26
 #define MICROP_WCMD_READ_ADC_VALUE_REQ 0x60
 #define MICROP_RCMD_ADC_VALUE       0x62
+/*
+ * The BMA150's own registers, which the microP reaches over SPI for the host:
+ * 0x73 writes [reg, value], 0x74 [reg] asks for one, 0x75 reads [reg, value]
+ * back.  Windows Mobile's G-sensor driver uses only these (it reads the
+ * acceleration out of registers 0x02..0x07); Linux uses 0x76 + 0x77..0x7A.
+ */
+#define MICROP_WCMD_GSENSOR_REG     0x73
+#define MICROP_WCMD_GSENSOR_REG_REQ 0x74
+#define MICROP_RCMD_GSENSOR_REG     0x75
 #define MICROP_RCMD_GSENSOR_X       0x77
 #define MICROP_RCMD_GSENSOR_Y       0x78
 #define MICROP_RCMD_GSENSOR_Z       0x79
@@ -331,6 +340,8 @@ struct HtcleoMicrop {
     int rpos;
     uint8_t reg[256][8];        /* last data written per command */
     int16_t gsensor[3];
+    uint8_t bma_reg[0x16];      /* BMA150 register file (0x00..0x15) */
+    uint8_t bma_addr;           /* register asked for with 0x74 */
     int32_t accel_mg[3];
     int32_t light_lux;
     uint16_t light_adc;
@@ -348,6 +359,31 @@ static void microp_update_backlight(HtcleoMicrop *s)
     qemu_set_irq(s->backlight, s->bl_en ? 175 + s->bl_level * 80 / 9 : 0);
 }
 
+/* One BMA150 register, the acceleration ones out of the live values. */
+static uint8_t bma150_read(HtcleoMicrop *s, uint8_t addr)
+{
+    if (addr >= 0x02 && addr <= 0x07) {
+        /* gsensor[] is the 10-bit reading left-justified in 16 bits */
+        int v10 = s->gsensor[(addr - 0x02) / 2] >> 6;
+        return (addr & 1) ? (v10 >> 2) & 0xFF          /* MSB: bits 9..2 */
+                          : ((v10 & 3) << 6) | 1;      /* LSB, new_data */
+    }
+    if (addr == 0x08) {
+        return 0x40;                                   /* temperature */
+    }
+    return addr < sizeof(s->bma_reg) ? s->bma_reg[addr] : 0;
+}
+
+static void bma150_write(HtcleoMicrop *s, uint8_t addr, uint8_t val)
+{
+    if (addr == 0x0A && (val & 0x02)) {                /* soft reset */
+        val &= ~0x02;
+    }
+    if (addr >= 0x0A && addr < sizeof(s->bma_reg)) {   /* 0..9 are read-only */
+        s->bma_reg[addr] = val;
+    }
+}
+
 static int microp_event(I2CSlave *i2c, enum i2c_event ev)
 {
     HtcleoMicrop *s = HTCLEO_MICROP(i2c);
@@ -358,6 +394,10 @@ static int microp_event(I2CSlave *i2c, enum i2c_event ev)
         s->wlen = 0;
         break;
     case I2C_START_RECV:
+        if (s->cmd == MICROP_RCMD_GSENSOR_REG) {
+            qemu_log_mask(LOG_TRACE, "htcleo-microp: bma150 reg 0x%02x = 0x%02x\n",
+                          s->bma_addr, bma150_read(s, s->bma_addr));
+        }
         s->rpos = 0;
         break;
     case I2C_FINISH:
@@ -366,6 +406,11 @@ static int microp_event(I2CSlave *i2c, enum i2c_event ev)
             qemu_log_mask(LOG_TRACE, "htcleo-microp: cmd 0x%02x len %d "
                           "data %02x %02x\n", s->cmd, s->wlen, s->wbuf[0],
                           s->wlen > 1 ? s->wbuf[1] : 0);
+            if (s->cmd == MICROP_WCMD_GSENSOR_REG && s->wlen >= 2) {
+                bma150_write(s, s->wbuf[0], s->wbuf[1]);
+            } else if (s->cmd == MICROP_WCMD_GSENSOR_REG_REQ) {
+                s->bma_addr = s->wbuf[0];
+            }
             if (s->cmd == MICROP_WCMD_BL_EN) {
                 s->bl_en = s->wbuf[0] & 1;
                 microp_update_backlight(s);
@@ -404,6 +449,9 @@ static uint8_t microp_recv(I2CSlave *i2c)
         return i == 0 ? 0x0A : 0x05;     /* firmware 0x0A05 */
     case MICROP_RCMD_ADC_VALUE:
         return i == 0 ? s->light_adc >> 8 : s->light_adc & 0xFF;
+    case MICROP_RCMD_GSENSOR_REG:
+        /* [address, value], then the registers after it (burst) */
+        return i == 0 ? s->bma_addr : bma150_read(s, s->bma_addr + i - 1);
     case MICROP_RCMD_GSENSOR_X:
     case MICROP_RCMD_GSENSOR_Y:
     case MICROP_RCMD_GSENSOR_Z: {
@@ -452,7 +500,7 @@ static void microp_set_accel(Object *obj, const char *val, Error **errp)
         v[i] = MIN(2000, MAX(-2000, v[i]));
         s->accel_mg[i] = v[i];
         /* BMA150: 10 bit, 256 LSB/g, left-justified in 16 bits */
-        s->gsensor[i] = (int16_t)((v[i] * 256 / 1000) * 64);
+        s->gsensor[i] = (int16_t)(MIN(511, MAX(-512, v[i] * 256 / 1000)) * 64);
     }
 }
 
@@ -493,6 +541,11 @@ static void microp_init(Object *obj)
     s->gsensor[0] = 0;
     s->gsensor[1] = 0;
     s->gsensor[2] = 256 << 6;
+    /* BMA150 power-on values: chip id 2, 2 g range / 1500 Hz, spi4 */
+    s->bma_reg[0x00] = 0x02;
+    s->bma_reg[0x01] = 0x12;
+    s->bma_reg[0x14] = 0x0E;
+    s->bma_reg[0x15] = 0x80;
     qdev_init_gpio_out_named(DEVICE(obj), &s->backlight, "backlight", 1);
 }
 

@@ -80,3 +80,9 @@
   id instead of the guest's (arg0); QUIT may be answered by CLSE. Clicked through: Install an APK -> hd2bench.apk ->
   "Success", `pm path com.hd2bench` in Run a shell command -> /data/app/com.hd2bench-2.apk; Logcat shows 200 lines.
 - Phone USB cable is not in this PC (lsusb: no S25), so MSC/RNDIS through the passthrough cannot be tested now.
+- 10:28 WinMo sensors: in the app (nand-ruu-osbl.img, real chain, Sense up in 58 s) WinMo never used the Linux G-sensor path
+  (microP 0x76 + 0x77..0x7A). It talks to the BMA150 registers through the microP: 0x74 [reg] request, 0x75 read
+  [reg,value], 0x73 [reg,value] write. The model answered 0x75 with zeros. Added a BMA150 register file (0x00..0x15:
+  chip id 2, live acc in 0x02..0x07 from the same `accel` prop, 2 g clamp) and a trace line per 0x75 read
+  ("htcleo-microp: bma150 reg"). Phone build installed; WinMo boot shows its driver init: reads 0x0a/0x14, writes
+  0x14=0x08, 0x0a=0x08/0x09. Waiting for the user's Teeter test; Teeter's polling should show reg 0x02..0x07 reads.
