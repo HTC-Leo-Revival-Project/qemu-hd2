@@ -1,6 +1,9 @@
 package org.htcleorevivalproject.hd2emu;
 
 import android.content.Context;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+import android.system.Os;
 import android.util.Log;
 
 import org.json.JSONException;
@@ -53,6 +56,8 @@ public class Emulator {
     private volatile String cable = "usb";
 
     private Process arm, hexagon;
+    /* the DRAM both QEMUs share, in memory; null: the file in runDir */
+    private ParcelFileDescriptor dramMem;
     private Qmp qmp, q6qmp;
     private volatile VncClient vnc, q6vnc;
     private PcmPlayer audio;
@@ -302,18 +307,32 @@ public class Emulator {
              */
             File dram = paths.dram();
             dram.delete();
-            try {
-                RandomAccessFile f = new RandomAccessFile(dram, "rw");
+            /*
+             * A file on /data puts every page the guest touches through the
+             * page cache and writes it back to flash.  A memfd keeps it in
+             * memory: both QEMUs get it as their stdin and map their own
+             * /proc/self/fd/0 (another process's /proc/<pid>/fd is not ours
+             * to open).  A new one each start is RAM that starts out empty.
+             */
+            /*
+             * Not yet: SELinux lets no one, the app included, reopen a memfd
+             * through /proc/self/fd, so it has to be handed over as an fd.
+             */
+            dramMem = null;
+            if (dramMem == null) {
                 try {
-                    f.setLength(1L << 30);
-                } finally {
-                    f.close();
+                    RandomAccessFile f = new RandomAccessFile(dram, "rw");
+                    try {
+                        f.setLength(1L << 30);
+                    } finally {
+                        f.close();
+                    }
+                } catch (FileNotFoundException e) {
+                    throw new IOException("cannot create " + dram + ": " + e.getMessage());
                 }
-            } catch (FileNotFoundException e) {
-                throw new IOException("cannot create " + dram + ": " + e.getMessage());
             }
             args.add("-object");
-            args.add("memory-backend-file,id=htcleo.ram,size=1G,mem-path=" + dram.getAbsolutePath() + ",share=on");
+            args.add("memory-backend-file,id=htcleo.ram,size=1G,mem-path=" + dramPath() + ",share=on");
             args.add("-machine");
             args.add("memory-backend=htcleo.ram,qdsp6=lle,qdsp6-link=q6link");
             args.add("-chardev");
@@ -350,7 +369,7 @@ public class Emulator {
             q6args.add("shift=" + q6Shift(cfg));
             q6args.add("-object");
             q6args.add("memory-backend-file,id=htcleo.ram,size=1G,mem-path="
-                    + paths.dram().getAbsolutePath() + ",share=on");
+                    + dramPath() + ",share=on");
             q6args.add("-machine");
             q6args.add("memory-backend=htcleo.ram");
             q6args.add("-chardev");
@@ -521,7 +540,38 @@ public class Emulator {
             env.put("ADRENO_GLES_PBUFFER", "1");
         }
         env.remove("LD_LIBRARY_PATH");
+        if (dramMem != null) {
+            pb.redirectInput(new File("/proc/self/fd/" + dramMem.getFd()));
+        }
         return pb.start();
+    }
+
+    /** 1 GiB of shared memory for the DRAM, or null where there is no memfd. */
+    private static ParcelFileDescriptor newDramMemfd() {
+        if (Build.VERSION.SDK_INT < 30) return null;
+        try {
+            java.io.FileDescriptor fd = Os.memfd_create("htcleo.ram", 0);
+            Os.ftruncate(fd, 1L << 30);
+            ParcelFileDescriptor p = ParcelFileDescriptor.dup(fd);
+            Os.close(fd);
+            return p;
+        } catch (Exception e) {
+            Log.w(TAG, "no memfd for the DRAM, using a file: " + e);
+            return null;
+        }
+    }
+
+    private String dramPath() {
+        return dramMem != null ? "/proc/self/fd/0" : paths.dram().getAbsolutePath();
+    }
+
+    private void closeDramMem() {
+        if (dramMem == null) return;
+        try {
+            dramMem.close();
+        } catch (IOException ignored) {
+        }
+        dramMem = null;
     }
 
     /** Notices when QEMU goes away by itself. */
@@ -661,6 +711,7 @@ public class Emulator {
             }
         }
         arm = hexagon = null;
+        closeDramMem();
         running = null;
         cleanSockets();
     }

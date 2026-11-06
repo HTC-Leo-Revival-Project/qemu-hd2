@@ -27,11 +27,11 @@ SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Android/Sdk}}"
 NDK_VERSION="27.3.13750724"
 NDK="${ANDROID_NDK_HOME:-$SDK/ndk/$NDK_VERSION}"
 LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
-# The emulator binary itself targets Android 9.  The app installs and runs on
-# Android 4.0.4 (minSdk 15) - the settings, the log viewer and the NAND builder
-# all work there - but QEMU needs API 28: that is where bionic starts
-# declaring <iconv.h>, which glib insists on, and it is a sane floor anyway.
-API=28
+# Android 14 and up, like the app (minSdk 34).  From API 29 bionic has ELF
+# TLS: below it the compiler emulates thread-locals with a function call per
+# access, and QEMU reads current_cpu and friends often enough for that to be
+# several percent of a phone's emulation time.
+API=34
 JOBS="$(nproc 2>/dev/null || echo 4)"
 
 # QEMU 11 has no 32-bit host backend left - tcg/ ships aarch64, x86_64,

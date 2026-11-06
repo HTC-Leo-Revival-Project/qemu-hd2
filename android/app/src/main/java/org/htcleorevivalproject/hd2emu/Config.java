@@ -39,9 +39,11 @@ public class Config {
     /**
      * The guest's clock: -1 follows the host's real time, 0..N are the icount
      * shifts (2^N ns per instruction, so the clock advances with the guest's
-     * own work instead of with the wall clock).
+     * own work instead of with the wall clock).  -1 by default: icount runs
+     * both guest cores on one host thread, real time gives each its own, and
+     * on a phone (S25) that is far faster.
      */
-    public int icountShift = 3;
+    public int icountShift = -1;
     public int gpuThreads = 0;            // 0 = QEMU's own choice
     public int glesBarrier = 1;           // GPU sync: 0 none, 1 where draws overlap, 2 every draw
     public float volume = 1.0f;
