@@ -125,6 +125,13 @@ static const uint8_t pm_rt_reg[PM_GROUPS] = {
  * the power key, a cable or the alarm it switches the phone off again.
  */
 #define SRC_KPD_PWR_ON  PM_SRC(1, 0x01)
+/*
+ * PS_HOLD is the PMIC's watchdog input: a phone that let it go and was
+ * restarted by the PMIC reports "PM_WDOG_TOUT_RT_ST" (bit 1 of 0x40).
+ * Without it the only power-on reason left is a cable, and the boot
+ * loaders take the restart for off-mode charging.
+ */
+#define SRC_WDOG_TOUT   PM_SRC(1, 0x02)
 
 static int pm_group_of(const uint8_t *tbl, uint8_t a)
 {
@@ -176,6 +183,12 @@ void msm_ssbi_pmic_set_power_key(DeviceState *dev, bool pressed)
     pm7540_set_src(s, SRC_PWR_KEY_ON, pressed);
     pm7540_set_src(s, SRC_PWR_KEY_OFF, !pressed);
     pm7540_set_src(s, SRC_KPD_PWR_ON, pressed);
+}
+
+/* after reset: this power-on is the PMIC's restart, not a key or cable */
+void msm_ssbi_pmic_set_wdog_restart(DeviceState *dev)
+{
+    pm7540_set_src(MSM_SSBI(dev), SRC_WDOG_TOUT, true);
 }
 
 /* RTC seconds now */

@@ -130,6 +130,8 @@ struct HtcleoMachineState {
     gsize hspl_len;
     bool hspl_run;              /* the HSPL is booting (no QEMU hand-off) */
     bool spl_modem_run;         /* spl-modem=run: AMSS runs under the HSPL */
+    bool ps_hold_up;            /* PS_HOLD raised since power-on/restart */
+    bool pmic_restart;          /* PMIC restarting after PS_HOLD dropped */
 
     /* RAM console tap */
     Chardev *ramcon_chr;
@@ -334,7 +336,7 @@ static void htcleo_set_vbus(HtcleoMachineState *s, bool notify)
 static void htcleo_check_ps_hold(HtcleoMachineState *s)
 {
     if (msm_gpio_get_output(s->gpio, HTCLEO_GPIO_PS_HOLD) == 0 &&
-        !s->keys[HD2_KEY_POWER]) {
+        !s->keys[HD2_KEY_POWER] && !s->pmic_restart) {
         qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD released: power off\n");
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
     }
@@ -367,12 +369,42 @@ static void htcleo_gpio_out(void *opaque, int pin, int level)
         htcleo_ts_set_power(s->ts, msm_gpio_get_output(s->gpio, pin) == 1);
     }
     if (pin == HTCLEO_GPIO_PS_HOLD) {
-        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD -> %d (cpu %d pc 0x%08x)\n",
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "htcleo: PS_HOLD -> %d (cpu %d pc 0x%08x lr 0x%08x)\n",
                       level, current_cpu ? current_cpu->cpu_index : -1,
                       current_cpu ? (uint32_t)ARM_CPU(current_cpu)->env.regs[15]
+                                  : 0,
+                      current_cpu ? (uint32_t)ARM_CPU(current_cpu)->env.regs[14]
                                   : 0);
+        /* the stack, for who asked: the GPIO setter's lr is itself */
+        if (current_cpu && level == 0) {
+            uint32_t st[16];
+            uint32_t sp = ARM_CPU(current_cpu)->env.regs[13];
+
+            if (!cpu_memory_rw_debug(current_cpu, sp, st, sizeof(st), false)) {
+                qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD stack @%08x:", sp);
+                for (int i = 0; i < 16; i++) {
+                    qemu_log_mask(LOG_GUEST_ERROR, " %08x", le32_to_cpu(st[i]));
+                }
+                qemu_log_mask(LOG_GUEST_ERROR, "\n");
+            }
+        }
     }
-    if (pin == HTCLEO_GPIO_PS_HOLD && level == 0) {
+    /*
+     * Once the radio has raised PS_HOLD, letting it go again is how the
+     * HD2 reboots (the HSPL's reset, with "REST" left at 0x8105c; Linux's
+     * htcleo_reset): the PMIC restarts the phone and keeps it powered
+     * until OSBL raises PS_HOLD again.  Power-off goes through the modem.
+     */
+    if (pin == HTCLEO_GPIO_PS_HOLD && level == 1) {
+        s->ps_hold_up = true;
+        s->pmic_restart = false;
+    } else if (pin == HTCLEO_GPIO_PS_HOLD && s->lle && s->ps_hold_up) {
+        qemu_log_mask(LOG_GUEST_ERROR, "htcleo: PS_HOLD dropped: restart\n");
+        s->ps_hold_up = false;
+        s->pmic_restart = true;
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    } else if (pin == HTCLEO_GPIO_PS_HOLD) {
         htcleo_check_ps_hold(s);
     }
 }
@@ -1082,10 +1114,19 @@ static void htcleo_reset(MachineState *machine, ResetType type)
      * until the bootloader is up - and then lets go, since the HSPL takes a
      * VolDown still down at its update prompt as "cancel".
      */
-    memcpy(s->keys, s->keys_reset, sizeof(s->keys));
+    s->ps_hold_up = false;
+    /* a restart by the PMIC is not a person at the keys */
+    if (s->pmic_restart) {
+        memset(s->keys, 0, sizeof(s->keys));
+        if (s->lle) {
+            msm_ssbi_pmic_set_wdog_restart(msm_modem_lle_pmic(s->lle));
+        }
+    } else {
+        memcpy(s->keys, s->keys_reset, sizeof(s->keys));
+    }
     htcleo_update_keys(s);
     s->keys_t0 = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-    for (int k = 0; k < HD2_NKEYS; k++) {
+    for (int k = 0; k < HD2_NKEYS && !s->pmic_restart; k++) {
         if (s->keys_reset[k] && s->keys_hold_ms[k]) {
             if (!s->keys_timer) {
                 s->keys_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,

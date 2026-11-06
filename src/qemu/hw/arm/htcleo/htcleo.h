@@ -191,12 +191,14 @@ void msm_csr_set_modem(DeviceState *csr, DeviceState *modem);
 #define TYPE_MSM_GSTMR      "msm-gstmr"
 #define TYPE_MSM_Q6_LINK    "msm-q6-link"
 void msm_q6_link_boot(DeviceState *dev);
+void msm_q6_link_hold(DeviceState *dev);
 #define TYPE_MSM_WSTMR      "msm-wstmr"
 #define TYPE_MSM_SSBI       "msm-ssbi"
 #define TYPE_MSM_UIM        "msm-uim"
 #define MSM_SSBI_NUM        6   /* SSBI controllers, see msm_ssbi.c */
 void msm_ssbi_pmic_set_vbus(DeviceState *dev, bool present);
 void msm_ssbi_pmic_set_power_key(DeviceState *dev, bool pressed);
+void msm_ssbi_pmic_set_wdog_restart(DeviceState *dev);
 #define TYPE_HTCLEO_MICROP  "htcleo-microp"
 #define TYPE_HTCLEO_TS      "htcleo-ts"
 #define TYPE_HTCLEO_AKM     "htcleo-akm8973"
