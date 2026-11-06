@@ -1373,6 +1373,7 @@ typedef struct AdrenoGles {
      * no host GPU at all.
      */
     uint64_t n_tex_fail, n_prog_fail, n_nogpu, n_dummy;
+    uint64_t n_barrier;      /* storage barriers issued (gles-barrier) */
     bool cpu_newer;          /* the CPU changed s->gmem */
     bool gpu_newer;          /* the GPU has drawn since the last copy back */
     /*
@@ -2275,6 +2276,7 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         if (need) {
             gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT_);
             gls->pending = false;
+            gls->n_barrier++;
         }
         if (!gls->pending) {
             gls->px0 = g->clip_x0;
@@ -2333,8 +2335,9 @@ void adreno_gles_draw(MsmAdrenoState *s, const AdrenoGlDraw *g)
         info_report("msm-adreno:   %" PRIu64 " draws: %" PRIu64 " could not "
                     "make a texture, %" PRIu64 " could not build a program, "
                     "%" PRIu64 " had no host GPU, %" PRIu64 " fetched the "
-                    "dummy", gls->ndraw, gls->n_tex_fail, gls->n_prog_fail,
-                    gls->n_nogpu, gls->n_dummy);
+                    "dummy, %" PRIu64 " barriers", gls->ndraw,
+                    gls->n_tex_fail, gls->n_prog_fail, gls->n_nogpu,
+                    gls->n_dummy, gls->n_barrier);
     }
 }
 
