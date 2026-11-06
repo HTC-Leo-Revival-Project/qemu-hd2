@@ -193,11 +193,19 @@ public class Emulator {
             machine += ",baseband=lle,baseband-firmware=" + paths.image("amss.elf").getAbsolutePath()
                     + ",baseband-trace=off";
         }
+        /*
+         * SPL mode with nothing to boot: no OS in the NAND and no LEOIMG.nbh on the card.  The
+         * real SPL then has nowhere to go, so it is sent to its USB mode the way a person would:
+         * Volume Down held at power-on gives the bootloader screen and a USB gadget the PC (or the
+         * USB passthrough) can talk to.
+         */
+        final boolean usbMode = cfg.splLle && !Nand.hasOs(nand) && !cardHasNbh(cfg);
+        if (usbMode) note(ctx.getString(R.string.emu_spl_usb_mode));
         if (cfg.splLle && !chain) {
-            machine += ",spl=nand";
+            machine += ",spl=nand" + (usbMode ? ",keys=voldown:4000" : "");
         } else if (cfg.splLle) {
             /* the real chain: OSBL pulses PS_HOLD low early on, so the power key is held (see docs) */
-            machine += ",spl=nand,keys=power:1500";
+            machine += ",spl=nand,keys=power:1500" + (usbMode ? ",,voldown:4000" : "");
         }
         /*
          * USB passthrough: the host is not us but a bridge, which owns a host
@@ -473,6 +481,26 @@ public class Emulator {
         if (sbl && fw.fsbl != null && fw.osbl != null) {
             Radio.Firmware.write(paths.image("fsbl.bin"), fw.fsbl);
             Radio.Firmware.write(paths.image("osbl.bin"), fw.osbl);
+        }
+    }
+
+    /** True if the microSD image has a LEOIMG.nbh in its root, which the SPL would flash. */
+    private boolean cardHasNbh(Config cfg) {
+        if (cfg.sdcard == null || cfg.sdcard.isEmpty()) return false;
+        File sd = paths.image(cfg.sdcard);
+        if (!sd.isFile()) return false;
+        try {
+            FatImage fat = FatImage.open(sd);
+            try {
+                for (FatImage.Entry e : fat.list("/")) {
+                    if (!e.dir && "LEOIMG.nbh".equalsIgnoreCase(e.name)) return true;
+                }
+                return false;
+            } finally {
+                fat.close();
+            }
+        } catch (IOException e) {
+            return false;
         }
     }
 

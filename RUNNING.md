@@ -58,3 +58,7 @@
   and in-app ADB (Adb.exec/push/pull/install + AdbActivity: shell, logcat, push, pull, install). Adb verified against the phone's guest
   through `adb forward`: exec, 300 KB push, pull round trip OK. Bug fixed: the packet check field is a byte SUM, not CRC32 (adbd dropped
   every packet with a payload; same bug was in tools/hd2_usb.py adb-shell). Menu: SD card editor, ADB in the main menu.
+- 05:30 SPL USB mode: with no OS in the NAND and no LEOIMG.nbh on the card the app holds Volume Down (keys=...voldown:4000) so the real
+  HSPL shows its bootloader screen ("SPL-2.08.HSPL", "Security Unlocked") and a USB gadget; through the S25's port the PC sees
+  0bb4:00ce "Qualcomm CDMA Technologies MSM" (class ff/ff/ff bulk pair); hd2_usb.py list/serial can open it. The HSPL's serial
+  protocol itself was not decoded (no reply to `info 2` / `help`). Phone restored: passthrough off, nand-spl.img selected, USB HAL running.

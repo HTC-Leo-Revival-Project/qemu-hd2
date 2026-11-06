@@ -164,6 +164,25 @@ static final Charset UTF8 = Charset.forName("UTF-8");
         }
     }
 
+    /** True if the OS area (from block 0x212) holds anything: an image that was flashed with an OS. */
+    static boolean hasOs(File image) {
+        try {
+            RandomAccessFile r = new RandomAccessFile(image, "r");
+            try {
+                if (r.length() < (long) NBLOCKS * PPB * RAW_PAGE) return false;
+                byte[] raw = new byte[RAW_PAGE];
+                r.seek((long) ROM_BLOCK * PPB * RAW_PAGE);
+                r.readFully(raw);
+                for (int i = 0; i < 512; i++) if (raw[i] != (byte) 0xff) return true;
+                return false;
+            } finally {
+                r.close();
+            }
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     /** The first MB-sized check that the SPL a NAND holds is there at all. */
     boolean hasSpl() throws IOException {
         byte[] raw = new byte[RAW_PAGE];
