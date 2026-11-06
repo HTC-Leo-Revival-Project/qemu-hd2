@@ -49,6 +49,8 @@ public class MainActivity extends Activity implements ScreenView.Input {
     private static final int MENU_ABOUT = 9;
     private static final int MENU_IMAGES = 10;
     private static final int MENU_ROOT = 11;
+    private static final int MENU_SDED = 12;
+    private static final int MENU_ADB = 13;
 
     /**
      * The HD2's keys, left to right: the volume rocker on its side, the five
@@ -444,6 +446,8 @@ public class MainActivity extends Activity implements ScreenView.Input {
         menu.add(0, MENU_LOGS, 5, R.string.menu_logs);
         menu.add(0, MENU_IMAGES, 6, R.string.menu_images);
         menu.add(0, MENU_NAND, 7, R.string.menu_nand);
+        menu.add(0, MENU_SDED, 7, R.string.menu_sd_editor);
+        menu.add(0, MENU_ADB, 7, R.string.menu_adb);
         menu.add(0, MENU_ROOT, 8, R.string.menu_root);
         menu.add(0, MENU_SETTINGS, 9, R.string.menu_settings);
         menu.add(0, MENU_ABOUT, 10, R.string.menu_about);
@@ -471,6 +475,8 @@ public class MainActivity extends Activity implements ScreenView.Input {
             case MENU_LOGS: startActivity(new Intent(this, LogsActivity.class)); return true;
             case MENU_NAND: startActivity(new Intent(this, NandActivity.class)); return true;
             case MENU_IMAGES: startActivity(new Intent(this, ImagesActivity.class)); return true;
+            case MENU_ADB: startActivity(new Intent(this, AdbActivity.class)); return true;
+            case MENU_SDED: startActivity(new Intent(this, SdEditorActivity.class)); return true;
             case MENU_ROOT: startActivity(new Intent(this, RootActivity.class)); return true;
             case MENU_SETTINGS: startActivity(new Intent(this, SettingsActivity.class)); return true;
             case MENU_ABOUT:

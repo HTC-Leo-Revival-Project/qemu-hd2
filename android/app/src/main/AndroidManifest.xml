@@ -45,6 +45,18 @@
             android:exported="false" />
 
         <activity
+            android:name=".AdbActivity"
+            android:label="@string/adb_title"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|navigation"
+            android:exported="false" />
+
+        <activity
+            android:name=".SdEditorActivity"
+            android:label="@string/sd_title"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|navigation"
+            android:exported="false" />
+
+        <activity
             android:name=".ByonActivity"
             android:label="@string/byon_title"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|navigation"

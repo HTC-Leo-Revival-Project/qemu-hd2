@@ -31,7 +31,7 @@ public class Adb {
     private static final int A_CLSE = 0x45534c43;      /* CLSE */
     private static final int A_WRTE = 0x45545257;      /* WRTE */
     private static final int A_FAIL = 0x4c494146;      /* FAIL */
-    private static final int CNXN_VERSION = 0x01000000;
+    private static final int CNXN_VERSION = 0x01000001;   /* what the real adb sends */
     private static final int MAX_DATA = 4096;
 
     /** What the caller hears about: text out of the guest, and where we are. */
@@ -66,7 +66,7 @@ public class Adb {
         s.connect(new InetSocketAddress("127.0.0.1", port), timeoutMs);
         s.setTcpNoDelay(true);
         Adb a = new Adb(s, port);
-        a.send(A_CNXN, CNXN_VERSION, CNXN_VERSION | MAX_DATA, null);
+        a.send(A_CNXN, CNXN_VERSION, MAX_DATA, "host::\0".getBytes(UTF8));
         return a;
     }
 
@@ -403,10 +403,13 @@ public class Adb {
                    (char) ((cmd >> 16) & 0xff) + (char) ((cmd >> 24) & 0xff);
     }
 
+    /** The data_check field: the plain sum of the payload bytes (not a CRC), as adbd verifies it. */
     private static int crc32(byte[] data) {
-        java.util.zip.CRC32 c = new java.util.zip.CRC32();
+        int sum = 0;
 
-        c.update(data, 0, data.length);
-        return (int) c.getValue();
+        for (byte b : data) {
+            sum += b & 0xff;
+        }
+        return sum;
     }
 }

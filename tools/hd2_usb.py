@@ -107,7 +107,7 @@ A_CNXN, A_OPEN, A_OKAY, A_CLSE, A_WRTE = 0x4E584E43, 0x4E45504F, 0x59414B4F, 0x4
 def adb_send(eout, cmd, a0, a1, data=b''):
     # header and payload are two transfers: the guest's f_adb queues a 24-byte read for the
     # header and then one for the payload length, so one 24+N transfer would overflow the first
-    eout.write(struct.pack('<6I', cmd, a0, a1, len(data), zlib.crc32(data) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF), TIMEOUT)
+    eout.write(struct.pack('<6I', cmd, a0, a1, len(data), sum(data) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF), TIMEOUT)
     if data:
         eout.write(data, TIMEOUT)
 

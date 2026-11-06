@@ -54,3 +54,7 @@
   "Restore the stock SPL". Emulator uses the full FSBL/OSBL chain only if the NAND has a radio, else plain spl=nand (minimal NAND,
   verified on host: HSPL runs from the minimal image). Host-verified: Java-built NAND from the real RUU boots WinMo (HTC splash) through
   the real chain. RUU .exe is not unpacked in the app yet (pick the RUU_signed.nbh).
+- 05:50 SD-card editor (FatImage + SdEditorActivity: create/open image, browse, add/export/rename/move/delete/mkdir; FatImage host-tested, fsck.vfat clean)
+  and in-app ADB (Adb.exec/push/pull/install + AdbActivity: shell, logcat, push, pull, install). Adb verified against the phone's guest
+  through `adb forward`: exec, 300 KB push, pull round trip OK. Bug fixed: the packet check field is a byte SUM, not CRC32 (adbd dropped
+  every packet with a payload; same bug was in tools/hd2_usb.py adb-shell). Menu: SD card editor, ADB in the main menu.
