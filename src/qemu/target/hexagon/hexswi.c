@@ -70,6 +70,64 @@ static const char *event_name[] = {
     [HEX_EVENT_INTF] = "HEX_EVENT_INTF"
 };
 
+/*
+ * The last exceptions the DSP took, for the log when one of them turns out
+ * fatal: a double exception is where QuRT's own handler faulted, and what
+ * led up to it is not in the one line it prints.  Traps (QuRT's system
+ * calls) and interrupts are left out; there are thousands a second.
+ */
+typedef struct HexExcRec {
+    uint32_t thread, event, cause, pc, badva0, badva1, ssr, elr;
+} HexExcRec;
+#define HEX_EXC_HIST 32
+static HexExcRec hex_exc_hist[HEX_EXC_HIST];
+static unsigned hex_exc_n;
+
+static void hex_exc_record(CPUState *cs, CPUHexagonState *env)
+{
+    HexExcRec *r = &hex_exc_hist[hex_exc_n++ % HEX_EXC_HIST];
+
+    r->thread = env->threadId;
+    r->event = cs->exception_index;
+    r->cause = env->cause_code;
+    r->pc = env->gpr[HEX_REG_PC];
+    r->badva0 = env->t_sreg[HEX_SREG_BADVA0];
+    r->badva1 = env->t_sreg[HEX_SREG_BADVA1];
+    r->ssr = env->t_sreg[HEX_SREG_SSR];
+    r->elr = env->t_sreg[HEX_SREG_ELR];
+}
+
+static void hex_exc_dump(CPUHexagonState *env)
+{
+    static unsigned dumps;
+    unsigned first, n;
+
+    if (dumps++ >= 4) {
+        return;
+    }
+    n = MIN(hex_exc_n, HEX_EXC_HIST);
+    first = hex_exc_n - n;
+    qemu_log_mask(LOG_GUEST_ERROR, "hexagon: the last %u exceptions, oldest "
+                  "first (%u in all):\n", n, hex_exc_n);
+    for (unsigned i = 0; i < n; i++) {
+        const HexExcRec *r = &hex_exc_hist[(first + i) % HEX_EXC_HIST];
+
+        qemu_log_mask(LOG_GUEST_ERROR, "  thread %u event 0x%02x cause 0x%03x "
+                      "pc %08x elr %08x ssr %08x badva0 %08x badva1 %08x\n",
+                      r->thread, r->event, r->cause, r->pc, r->elr, r->ssr,
+                      r->badva0, r->badva1);
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "hexagon: thread %u registers:",
+                  (unsigned)env->threadId);
+    for (int i = 0; i < 32; i++) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s r%d=%08x", i % 8 ? "" : "\n  ", i,
+                      env->gpr[i]);
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "\n  pc=%08x ssr=%08x elr=%08x\n",
+                  env->gpr[HEX_REG_PC], env->t_sreg[HEX_SREG_SSR],
+                  env->t_sreg[HEX_SREG_ELR]);
+}
+
 void hexagon_cpu_do_interrupt(CPUState *cs)
 
 {
@@ -77,6 +135,28 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
     uint32_t ssr;
 
     BQL_LOCK_GUARD();
+
+    /*
+     * Entered with no event pending, which happens after almost every
+     * exception the DSP takes (the cause code is still the last one's).  There
+     * is nothing to deliver, and going on would meet SSR:EX, still set from
+     * the exception just taken, and make a fatal double exception of it.
+     */
+    if (cs->exception_index == HEX_EVENT_NONE) {
+        static unsigned spurious;
+
+        if (spurious < 8 || spurious % 65536 == 0) {
+            qemu_log_mask(LOG_UNIMP,
+                          "hexagon: thread %u: do_interrupt with no event "
+                          "pending (cause 0x%x, pc %08x, SSR.EX %d), %u so "
+                          "far\n", (unsigned)env->threadId, env->cause_code,
+                          env->gpr[HEX_REG_PC],
+                          GET_SSR_FIELD(SSR_EX, env->t_sreg[HEX_SREG_SSR]),
+                          spurious);
+        }
+        spurious++;
+        return;
+    }
 
     qemu_log_mask(CPU_LOG_INT,
                   "\t%s: event 0x%02x:%s, cause 0x%" PRIx32 "(%" PRIu32 ")"
@@ -90,6 +170,12 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
                   env->t_sreg[HEX_SREG_ELR], env->t_sreg[HEX_SREG_BADVA1]);
 
     env->llsc_addr = ~0;
+
+    if (cs->exception_index != HEX_EVENT_TRAP0 &&
+        cs->exception_index != HEX_EVENT_TRAP1 &&
+        cs->exception_index < HEX_EVENT_INT0) {
+        hex_exc_record(cs, env);
+    }
 
     ssr = env->t_sreg[HEX_SREG_SSR];
     if (GET_SSR_FIELD(SSR_EX, ssr) == 1) {
@@ -105,17 +191,18 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
             hexagon_globalreg_write(cpu->globalregs, HEX_SREG_DIAG,
                                     env->cause_code, env->threadId);
         }
+        hex_exc_dump(env);
         env->cause_code = HEX_CAUSE_DOUBLE_EXCEPT;
         cs->exception_index = HEX_EVENT_PRECISE;
     }
 
     switch (cs->exception_index) {
     case HEX_EVENT_TRAP0:
-        if (env->cause_code == 0) {
-            qemu_log_mask(LOG_UNIMP,
-                          "trap0 is unhandled, no semihosting available\n");
-        }
-
+        /*
+         * No semihosting: the trap goes to the guest's own vector, which is
+         * how QuRT takes its system calls -- thousands a second while the
+         * DSP decodes audio, so not a thing to log each time.
+         */
         hexagon_ssr_set_cause(env, env->cause_code);
         set_addresses(env, 4, cs->exception_index);
         break;

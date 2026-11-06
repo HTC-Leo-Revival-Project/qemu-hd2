@@ -62,6 +62,21 @@ typedef struct Q6AudifDma {
     bool running;
 } Q6AudifDma;
 
+/*
+ * Playback health, one line every two seconds of wall clock when channel 0
+ * has played anything: how fast the DSP's clock ran against real time (the
+ * DMA is paced by it, so below 1.0 the sound comes out stretched), and how
+ * many periods were silent or stale (the same bytes as that spot in the ring
+ * held the last time round, i.e. the DSP had not refilled it).
+ */
+typedef struct Q6AudifStats {
+    int64_t real0, virt0;       /* at the start of the window */
+    uint32_t periods, silent, stale;
+    int64_t last_real, max_gap; /* between two period timers, wall clock */
+    uint8_t *snap;              /* the ring as last played */
+    uint32_t snap_len;
+} Q6AudifStats;
+
 struct Q6AudifState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -74,7 +89,36 @@ struct Q6AudifState {
     bool speaker;               /* the host hears the mono loudspeaker */
     char *dump;                 /* raw 48 kHz S16 stereo of DMA channel 0 */
     FILE *dump_f;
+    Q6AudifStats st;
 };
+
+static void audif_stats_tick(Q6AudifState *s)
+{
+    Q6AudifStats *st = &s->st;
+    int64_t real = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t virt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!st->real0) {
+        st->real0 = real;
+        st->virt0 = virt;
+    } else if (real - st->real0 >= 2 * NANOSECONDS_PER_SECOND) {
+        double r = (double)(real - st->real0), v = (double)(virt - st->virt0);
+
+        qemu_log_mask(LOG_GUEST_ERROR, "q6-audif: %.1fs: DSP clock %.2fx real "
+                      "time, %u periods (%u silent, %u stale), longest gap "
+                      "between periods %.1f ms\n", r / 1e9, v / r,
+                      st->periods, st->silent, st->stale,
+                      st->max_gap / 1e6);
+        st->real0 = real;
+        st->virt0 = virt;
+        st->periods = st->silent = st->stale = 0;
+        st->max_gap = 0;
+    }
+    if (st->last_real) {
+        st->max_gap = MAX(st->max_gap, real - st->last_real);
+    }
+    st->last_real = real;
+}
 
 static uint32_t dreg(Q6AudifState *s, int k, int r)
 {
@@ -154,6 +198,32 @@ static void audif_period_k(Q6AudifState *s, int k)
         if (first < period) {
             physical_memory_read(base, buf + first * 4,
                                  (period - first) * 4);
+        }
+        {
+            Q6AudifStats *st = &s->st;
+            bool zero = true;
+
+            for (uint32_t i = 0; i < period * 4; i += 8) {
+                if (*(uint64_t *)(buf + i)) {
+                    zero = false;
+                    break;
+                }
+            }
+            if (st->snap_len != len) {
+                g_free(st->snap);
+                st->snap = g_malloc0(len * 4);
+                st->snap_len = len;
+            }
+            st->periods++;
+            st->silent += zero;
+            if (!zero && first == period &&
+                !memcmp(st->snap + d->pos * 4, buf, period * 4)) {
+                st->stale++;
+            }
+            if (first == period) {
+                memcpy(st->snap + d->pos * 4, buf, period * 4);
+            }
+            audif_stats_tick(s);
         }
         if (s->dump_f) {
             fwrite(buf, 4, period, s->dump_f);
