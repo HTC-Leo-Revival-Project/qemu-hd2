@@ -1862,7 +1862,12 @@ static void htcleo_init(MachineState *machine)
         s->gauge = i2c_slave_create_simple(bus, TYPE_HTCLEO_GAUGE, 0x26);
         object_property_add_alias(OBJECT(machine), "battery-capacity",
                                   OBJECT(s->gauge), "capacity");
+        object_property_add_alias(OBJECT(machine), "accel",
+                                  OBJECT(microp), "accel");
+        object_property_add_alias(OBJECT(machine), "light",
+                                  OBJECT(microp), "light");
         dev = DEVICE(i2c_slave_create_simple(bus, TYPE_HTCLEO_AKM, 0x1C));
+        object_property_add_alias(OBJECT(machine), "mag", OBJECT(dev), "mag");
         qdev_connect_gpio_out_named(dev, "irq", 0,
                                     qemu_allocate_irq(htcleo_akm_irq, s, 0));
         if (s->hspl_run) {

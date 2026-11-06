@@ -69,6 +69,7 @@ public class Emulator {
      */
     private PcmPlayer q6audio;
     private Thread sensors, bootKeys;
+    private HostSensors hostSensors;
     /** Whether the USB passthrough bridge is ours to stop; see {@link #killAll()}. */
     private volatile boolean bridgeRunning;
     /** Whether anyone is looking at the screen; see {@link #setVideo}. */
@@ -395,6 +396,9 @@ public class Emulator {
 
         watch();
         startSensors();
+        /* the host phone's own sensors into the guest's chips (see HostSensors) */
+        hostSensors = new HostSensors(ctx, qmp);
+        hostSensors.start();
         /*
          * The cLK menu wants a key press to pick BOOT FROM NAND, which is what
          * the keys below send.  With USB passthrough on, leave it alone instead:
@@ -670,6 +674,7 @@ public class Emulator {
     private void killAll() {
         if (bootKeys != null) bootKeys.interrupt();
         if (sensors != null) sensors.interrupt();
+        if (hostSensors != null) { hostSensors.stop(); hostSensors = null; }
         /* the bridge first: it gives the UDC back and restarts the USB HAL, and
          * the emulator should not be yanking the USB out from under it */
         if (bridgeRunning) {

@@ -23,3 +23,8 @@
 - Phone ADB reachable again (10.0.0.28, wifi). Host root: `sudo /bin/sh -c '...'`.
 - NOT done yet: USB pyusb path, sensors live mapping, BYON, SD editor, in-app ADB review. Each is a multi-hour item;
   continuing in the order above.
+- 02:10 Sensors HLE: QEMU props `accel` (milli-g), `mag` (uT), `light` (lux) on /machine, wired to BMA150 (microP),
+  AKM8973, microP light ADC (htcleo_i2cdev.c, htcleo.c). Verified qom-set/get on host QEMU build.
+  App: HostSensors.java feeds Android SensorManager accel/mag/light -> qom-set at <=20 Hz while the emulator runs. Compiles.
+  UNVERIFIED: guest-side readout (WinMo/Android) and on-phone run — the app's bundled QEMU for the phone must be
+  rebuilt with these props (android/native build) before the phone shows live data; not done.

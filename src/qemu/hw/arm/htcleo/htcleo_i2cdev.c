@@ -18,6 +18,7 @@
  * This code is licensed under the GNU GPL v2 or later.
  */
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -307,6 +308,8 @@ struct HtcleoMicrop {
     int rpos;
     uint8_t reg[256][8];        /* last data written per command */
     int16_t gsensor[3];
+    int32_t accel_mg[3];
+    int32_t light_lux;
     uint16_t light_adc;
     bool bl_en;
     uint8_t bl_level;           /* 0..9 */
@@ -399,9 +402,68 @@ static uint8_t microp_recv(I2CSlave *i2c)
     }
 }
 
+/*
+ * Live host sensors (HLE): the app feeds the phone's real accelerometer and
+ * light sensor in with qom-set /machine accel "X,Y,Z" (milli-g, device frame:
+ * +Z out of the screen, 1000 = 1 g) and qom-set /machine light LUX.
+ */
+static char *microp_get_accel(Object *obj, Error **errp)
+{
+    HtcleoMicrop *s = HTCLEO_MICROP(obj);
+
+    return g_strdup_printf("%d,%d,%d", (int)s->accel_mg[0],
+                           (int)s->accel_mg[1], (int)s->accel_mg[2]);
+}
+
+static void microp_set_accel(Object *obj, const char *val, Error **errp)
+{
+    HtcleoMicrop *s = HTCLEO_MICROP(obj);
+    int v[3];
+    int i;
+
+    if (sscanf(val, "%d,%d,%d", &v[0], &v[1], &v[2]) != 3) {
+        error_setg(errp, "accel wants X,Y,Z in milli-g");
+        return;
+    }
+    for (i = 0; i < 3; i++) {
+        v[i] = MIN(2000, MAX(-2000, v[i]));
+        s->accel_mg[i] = v[i];
+        /* BMA150: 10 bit, 256 LSB/g, left-justified in 16 bits */
+        s->gsensor[i] = (int16_t)((v[i] * 256 / 1000) * 64);
+    }
+}
+
+static void microp_get_light(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    HtcleoMicrop *s = HTCLEO_MICROP(obj);
+    int64_t lux = s->light_lux;
+
+    visit_type_int(v, name, &lux, errp);
+}
+
+static void microp_set_light(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    HtcleoMicrop *s = HTCLEO_MICROP(obj);
+    int64_t lux;
+
+    if (!visit_type_int(v, name, &lux, errp)) {
+        return;
+    }
+    lux = MIN(30000, MAX(0, lux));
+    s->light_lux = lux;
+    /* the ADC reads 0..0x3FF on a roughly logarithmic scale of lux */
+    s->light_adc = lux ? MIN(0x3FF, 0x40 + 0x70 * (63 - clz64(lux))) : 0;
+}
+
 static void microp_init(Object *obj)
 {
     HtcleoMicrop *s = HTCLEO_MICROP(obj);
+
+    object_property_add_str(obj, "accel", microp_get_accel, microp_set_accel);
+    object_property_add(obj, "light", "int", microp_get_light,
+                        microp_set_light, NULL, NULL);
 
     s->light_adc = 0x0100;
     /* phone lying flat, screen up: ~1 g on Z (BMA150 10-bit, 256 LSB/g) */
@@ -643,6 +705,7 @@ struct HtcleoAkm {
     uint8_t regs[256];
     uint8_t ptr;
     bool have_ptr;
+    int32_t mag_ut[3];          /* host magnetometer, microtesla */
 };
 
 static void akm_done(void *opaque)
@@ -651,10 +714,13 @@ static void akm_done(void *opaque)
 
     s->regs[AKM_ST] = 1;
     s->regs[AKM_TMPS] = 0x90;
-    /* about 0.3 G north and down, mid-scale is 0x80 */
-    s->regs[AKM_H1X] = 0x98;
-    s->regs[AKM_H1X + 1] = 0x80;
-    s->regs[AKM_H1X + 2] = 0x60;
+    /* mid-scale is 0x80, about 0.3 uT per LSB; the default is ~30 uT north
+     * and down until the app feeds the host's magnetometer in (mag) */
+    for (int i = 0; i < 3; i++) {
+        int v = 0x80 + s->mag_ut[i] * 10 / 3;
+
+        s->regs[AKM_H1X + i] = MIN(0xFF, MAX(0, v));
+    }
     s->regs[AKM_MS1] = AKM_MODE_POWERDOWN;
     qemu_set_irq(s->irq, 1);
 }
@@ -710,11 +776,38 @@ static void akm_reset(DeviceState *dev)
     qemu_set_irq(s->irq, 0);
 }
 
+/* qom-set /machine mag "X,Y,Z" in microtesla (device frame) */
+static char *akm_get_mag(Object *obj, Error **errp)
+{
+    HtcleoAkm *s = HTCLEO_AKM(obj);
+
+    return g_strdup_printf("%d,%d,%d", (int)s->mag_ut[0], (int)s->mag_ut[1],
+                           (int)s->mag_ut[2]);
+}
+
+static void akm_set_mag(Object *obj, const char *val, Error **errp)
+{
+    HtcleoAkm *s = HTCLEO_AKM(obj);
+    int v[3];
+
+    if (sscanf(val, "%d,%d,%d", &v[0], &v[1], &v[2]) != 3) {
+        error_setg(errp, "mag wants X,Y,Z in microtesla");
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        s->mag_ut[i] = MIN(400, MAX(-400, v[i]));
+    }
+}
+
 static void akm_init(Object *obj)
 {
     HtcleoAkm *s = HTCLEO_AKM(obj);
 
     s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, akm_done, s);
+    s->mag_ut[0] = 6;
+    s->mag_ut[1] = 0;
+    s->mag_ut[2] = -40;
+    object_property_add_str(obj, "mag", akm_get_mag, akm_set_mag);
     qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
 }
 
